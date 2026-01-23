@@ -19,7 +19,11 @@ PROJECT GOALS
 DEPENDENCIES
 
 Core:
-- Python 3.10 or newer
+- Python 3.13.2
+- Pytorch Build 2.10.0
+- Cuda 12.6
+- scikit-learn 1.8.0
+- Pandas 3.0.0
 
 Game Input / Control:
 - ViGEmBus (REQUIRED)
