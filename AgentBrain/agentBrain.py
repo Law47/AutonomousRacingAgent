@@ -4,6 +4,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 from torch.utils.data import TensorDataset
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
 # Define model
 class NeuralNetwork(nn.Module):
@@ -35,6 +36,8 @@ def train(dataloader, model, loss_fn, optimizer):
 
         # Backpropagation
         loss.backward()
+        # Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         optimizer.zero_grad()
 
@@ -60,9 +63,18 @@ print(f"Using {device} device")
 
 model = NeuralNetwork().to(device)
 loss_fn = nn.MSELoss()
-optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
 X_Data, y_Data = dataRetriever.retrieveData()
+
+# Normalize input features
+scaler_X = StandardScaler()
+X_Data = scaler_X.fit_transform(X_Data)
+
+# Normalize output targets
+scaler_y = StandardScaler()
+y_Data = scaler_y.fit_transform(y_Data)
+
 X_train, X_test, y_train, y_test = train_test_split(X_Data, y_Data)
 
 print(f"Got X:{X_train.shape} y:{y_train.shape} samples for training")
@@ -92,5 +104,14 @@ for t in range(epochs):
     test(test_dataloader, model, loss_fn)
 print("Done!")
 
+import pickle
+
 torch.save(model.state_dict(), "model.pth")
 print("Saved PyTorch Model State to model.pth")
+
+# Save scalers for inference
+with open("scaler_X.pkl", "wb") as f:
+    pickle.dump(scaler_X, f)
+with open("scaler_y.pkl", "wb") as f:
+    pickle.dump(scaler_y, f)
+print("Saved scalers for inference")
