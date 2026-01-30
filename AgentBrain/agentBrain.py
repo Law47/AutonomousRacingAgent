@@ -1,4 +1,4 @@
-import AgentBrain.csvReader as csvReader
+import AgentBrain.dataReciever as dataReciever
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
@@ -65,7 +65,7 @@ model = NeuralNetwork().to(device)
 loss_fn = nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-X_Data, y_Data = csvReader.retrieveTrainingData()
+X_Data, y_Data = dataReciever.retrieveTrainingData()
 
 # Normalize input features
 scaler_X = StandardScaler()
