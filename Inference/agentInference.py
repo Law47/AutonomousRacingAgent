@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from acPhysics import ACPhysics
+from input import AssettoController
 import ctypes
 import mmap
 import time
@@ -58,6 +59,9 @@ print("Connected to Assetto Corsa shared memory.")
 print("Reading telemetry...\n")
 last_packet = -1
 
+#Setup Controller
+controller = AssettoController()
+
 while True:
     # Read fresh data from shared memory each iteration
     physics = ACPhysics.from_buffer_copy(mm)
@@ -70,12 +74,21 @@ while True:
         X = physicsPacketToTensor(physics)
         y = model(X).flatten()
 
-        # printing model outputs
+        # gas_output = float(torch.clamp(y[0], 0, 1))
+        # brake_output = float(torch.clamp(y[0], 0, 1))
+        # steer_output = float(torch.clamp(y[0], -1, 1))
+
+        gas_output = float(y[0].item())
+        brake_output = float(y[0].item())
+        steer_output = float(y[0].item())
+
         print(
-            f"Gas: {y[0]:.2f} | "
-            f"Brake: {y[1]:.2f} | "
-            f"Steer: {y[2]:.2f}"
+            f"Gas: {gas_output:.2f} | "
+            f"Brake: {brake_output:.2f} | "
+            f"Steer: {steer_output:.2f}"
         )
+
+        controller.send_inputs(steering=steer_output, throttle=gas_output, brake=brake_output)
 
         # print(
         #     f"Speed: {physics.speedKmh:6.1f} km/h | "
