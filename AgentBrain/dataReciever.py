@@ -12,6 +12,24 @@ xDataColumnsToDrop = ["PacketID", "SessionID", "LapID", "PacketDatetime", "Gas",
 
 yDataColumns = ["Gas", "Brake", "Steer"]
 
+# Global storage for latest telemetry
+_latest_telemetry = None
+_telemetry_lock = threading.Lock()
+
+def get_latest_telemetry():
+    """Get the latest received telemetry data as tuple (X features, y targets)"""
+    global _latest_telemetry
+    with _telemetry_lock:
+        if _latest_telemetry is None:
+            return None, None
+        return _latest_telemetry
+
+def set_latest_telemetry(X, y):
+    """Store latest telemetry data"""
+    global _latest_telemetry
+    with _telemetry_lock:
+        _latest_telemetry = (X, y)
+
 def retrieveTrainingData():
     df = pd.DataFrame()
 
@@ -45,7 +63,10 @@ def handle_client(conn, address):
                 df = pd.read_csv(StringIO(text))
                 yDf = df[yDataColumns]
                 xDf = df.drop(columns=xDataColumnsToDrop)
-                print(f"Got Packet")
+                
+                # Store latest telemetry
+                set_latest_telemetry(xDf.values, yDf.values)
+                print(f"Got Packet from {address}")
 
     except Exception as e:
         print(f"Connection handler error for {address}: {e}")
