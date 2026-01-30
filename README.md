@@ -16,10 +16,13 @@ PROJECT GOALS
   - Inference and control
 
 
+NOTE: The project's model.pth files use CUDA so please install with the CUDA version of pytorch
+
 DEPENDENCIES
 
 Core:
 - Python 3.13.2
+- Numpy 2.1.0
 - Pytorch Build 2.10.0
 - Cuda 12.6
 - scikit-learn 1.8.0
@@ -49,11 +52,13 @@ Steps:
 2. Clone the Repository
 
 Command:
-git clone https://github.com/yourusername/autonomousracingagent.git
-cd autonomousracingagent
+`git clone https://github.com/yourusername/autonomousracingagent.git`
+`cd autonomousracingagent`
 
 
 3. Install Python Dependencies
 
 Command:
-pip install -r requirements.txt
+`pip install -r requirements.txt`
+
+- If your machine has a cuda-compatible GPU then it is highly recommended to run `pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126` first before installing the requirements
