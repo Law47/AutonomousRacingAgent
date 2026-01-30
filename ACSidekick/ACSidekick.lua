@@ -3,6 +3,21 @@
 UIElements = require(".app/lua/ui_elements")
 TelemetryCollector = require(".app/lua/telemetry_collector")
 Util = require(".app/lua/util")
+-- Load LuaSocket (Assetto Corsa's Lua may return `true` instead of a table).
+local _sockmod = require("socket")
+if type(_sockmod) == "table" then
+  Socket = _sockmod
+else
+  Socket = {}
+  if type(connect) == "function" then Socket.connect = connect end
+  if type(bind) == "function" then Socket.bind = bind end
+  if type(source) == "function" then Socket.source = source end
+  if type(sink) == "function" then Socket.sink = sink end
+  if type(socket) == "table" then
+    Socket.core = socket
+    if type(socket.tcp) == "function" then Socket.tcp = socket.tcp end
+  end
+end
 
 initalized = false
 guiInitalized = false
@@ -75,7 +90,7 @@ function script.onWindowUpdate(dt)
       if not playerCar then return end
       packet = CreatePacket(0, 0, 0, "'" .. os.date("%m/%d/%Y %X", os.time()) .. string.format(":%d", (time - math.floor(time))*1000) .. "'", playerCar)
 
-      createCSVFile(packet)
+      -- createCSVFile(packet)
     end
   end
 
@@ -131,11 +146,13 @@ function script.update(dt)
 
       uploadPacketStep = time + uploadPacketInterval
 
-      if not csvFile then
-        createCSVFile(packet)
-      end
+      -- if not csvFile then
+      --   createCSVFile(packet)
+      -- end
 
-      addToCSVFile(packet)
+      -- addToCSVFile(packet)
+
+      sendPacketToSocket(packet)
 
       packetsSent = packetsSent + 1
     end
@@ -242,6 +259,41 @@ function addToCSVFile(packet)
   csvFile:close()
 end
 
+socketSetup = false
+tcp_socket = nil
+
+function setupSocketConnection()
+  if socketSetup then return end
+
+  local ip = "127.0.0.1"
+  local port = 8000
+
+  local _tcp_socket, error_msg = Socket.connect(ip, port)
+
+  if not _tcp_socket then
+      ac.log("Failed to connect to Python server: " .. error_msg)
+      return
+  else
+      ac.log("Connected to Python server")
+      socketSetup = true
+      tcp_socket = _tcp_socket
+  end
+
+end
+
+function sendPacketToSocket(packet)
+  if not socketSetup then setupSocketConnection() return end
+
+  local packetSendData = GetCSVBody(packet)
+  local success, send_err = tcp_socket:send(packetSendData .. "\n")
+
+  if not success then
+        print("Failed to send data: " .. send_err)
+  else
+      print("Data sent: " .. packetSendData)
+  end
+end
+
 function getActiveWindow()
   local windows = ac.getAppWindows()
   for _, window in pairs(windows) do
@@ -249,4 +301,10 @@ function getActiveWindow()
       AppInfo = window
     end
   end
+end
+
+function shutdown(dt)
+  ac.load("app is shutting down")
+
+  if tcp_socket then tcp_socket:close() end
 end
