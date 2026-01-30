@@ -284,13 +284,15 @@ end
 function sendPacketToSocket(packet)
   if not socketSetup then setupSocketConnection() return end
 
+  local packetHeaders = GetCSVHeaders(packet)
   local packetSendData = GetCSVBody(packet)
-  local success, send_err = tcp_socket:send(packetSendData .. "\n")
+  local success, send_err = tcp_socket:send(packetHeaders .. "\n" .. packetSendData .. "\n")
 
   if not success then
-        print("Failed to send data: " .. send_err)
+    ac.log("Failed to send data: " .. send_err)
+    socketSetup = false
   else
-      print("Data sent: " .. packetSendData)
+    ac.log("Data sent: " .. packetSendData)
   end
 end
 
