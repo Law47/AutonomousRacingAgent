@@ -52,13 +52,13 @@ Steps:
 2. Clone the Repository
 
 Command:
-`git clone https://github.com/yourusername/autonomousracingagent.git`
-`cd autonomousracingagent`
+- `git clone https://github.com/yourusername/autonomousracingagent.git`
+- `cd autonomousracingagent`
 
 
 3. Install Python Dependencies
 
 Command:
-`pip install -r requirements.txt`
+- `pip install -r requirements.txt`
 
 - If your machine has a cuda-compatible GPU then it is highly recommended to run `pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126` first before installing the requirements
