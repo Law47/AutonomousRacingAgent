@@ -17,9 +17,8 @@ def runEnv(env):
         episode_over = terminated or truncated
 
     print(f"Episode finished! Total reward: {total_reward}")
-    env.close()
 
-env = gym.make("CartPole-v1", render_mode="human")
+env = gym.make("CartPole-v1")
 runEnv(env)
 
 obsEnv = TimeAwareObservation(env)
