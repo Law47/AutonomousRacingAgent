@@ -13,6 +13,8 @@ def runEnv(env):
         
         observation, reward, terminated, truncated, info = env.step(action)
         
+        print(f"Action taken: {action}, New observation: {observation}, Reward: {reward}, Terminated: {terminated}, Truncated: {truncated}")
+        
         total_reward += reward
         episode_over = terminated or truncated
 
