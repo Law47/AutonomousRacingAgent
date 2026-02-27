@@ -5,6 +5,7 @@ from omegaconf import OmegaConf
 import torch
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(filename='log.log', encoding='utf-8', level=logging.INFO, format='%(levelname)s:%(asctime)s:%(message)s')
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Description of your program.")
@@ -38,6 +39,10 @@ def main():
         work_dir = os.path.abspath(work_dir) + os.sep
         os.makedirs(work_dir, exist_ok=True)
     config.work_dir = work_dir
+
+
+    logger.info(f"Config: {OmegaConf.to_yaml(config)}")
+    logger.info(f"Work Dir: {work_dir}")
     
 if __name__ == "__main__":
     main()
