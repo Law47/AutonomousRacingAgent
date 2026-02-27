@@ -8,6 +8,9 @@ from discor.utils import disable_gradients, soft_update, update_params, \
     assert_action
 
 
+import logging
+logger = logging.getLogger(__name__)
+
 class SAC(Algorithm):
 
     def __init__(self, state_dim, action_dim, device, gamma=0.99, nstep=1,
@@ -54,24 +57,25 @@ class SAC(Algorithm):
         self._alpha_optim = Adam([self._log_alpha], lr=entropy_lr)
 
         self._target_update_coef = target_update_coef
+        self.update_entropy = True
 
     def explore(self, state):
         state = torch.tensor(
             state[None, ...].copy(), dtype=torch.float, device=self._device)
         with torch.no_grad():
-            action, _, _ = self._policy_net(state)
+            action, entropies, _ = self._policy_net(state)
         action = action.cpu().numpy()[0]
         assert_action(action)
-        return action
+        return action, entropies
 
     def exploit(self, state):
         state = torch.tensor(
             state[None, ...].copy(), dtype=torch.float, device=self._device)
         with torch.no_grad():
-            _, _, action = self._policy_net(state)
+            _, entropies, action = self._policy_net(state)
         action = action.cpu().numpy()[0]
         assert_action(action)
-        return action
+        return action, entropies
 
     def update_target_networks(self):
         soft_update(
@@ -79,8 +83,9 @@ class SAC(Algorithm):
 
     def update_online_networks(self, batch, writer):
         self._learning_steps += 1
-        self.update_policy_and_entropy(batch, writer)
+        stats = self.update_policy_and_entropy(batch, writer)
         self.update_q_functions(batch, writer)
+        return stats
 
     def update_policy_and_entropy(self, batch, writer):
         states, actions, rewards, next_states, dones = batch
@@ -90,8 +95,11 @@ class SAC(Algorithm):
         update_params(self._policy_optim, policy_loss)
 
         # Update the entropy coefficient.
-        entropy_loss = self.calc_entropy_loss(entropies)
-        update_params(self._alpha_optim, entropy_loss)
+        entropy_loss = 0.
+        if self.update_entropy:
+            entropy_loss = self.calc_entropy_loss(entropies)
+            update_params(self._alpha_optim, entropy_loss)
+            entropy_loss = entropy_loss.detach().item()
         self._alpha = self._log_alpha.detach().exp()
 
         if self._learning_steps % self._log_interval == 0:
@@ -99,7 +107,7 @@ class SAC(Algorithm):
                 'loss/policy', policy_loss.detach().item(),
                 self._learning_steps)
             writer.add_scalar(
-                'loss/entropy', entropy_loss.detach().item(),
+                'loss/entropy', entropy_loss,
                 self._learning_steps)
             writer.add_scalar(
                 'stats/alpha', self._alpha.item(),
@@ -107,6 +115,10 @@ class SAC(Algorithm):
             writer.add_scalar(
                 'stats/entropy', entropies.detach().mean().item(),
                 self._learning_steps)
+
+            return {"policy_loss": policy_loss.detach().item(),
+                    "entropy_loss": entropy_loss,
+                    "alpha": self._alpha.item(), "entropy": entropies.detach().mean().item()}
 
     def calc_policy_loss(self, states):
         # Resample actions to calculate expectations of Q.
@@ -198,3 +210,8 @@ class SAC(Algorithm):
         self._policy_net.save(os.path.join(save_dir, 'policy_net.pth'))
         self._online_q_net.save(os.path.join(save_dir, 'online_q_net.pth'))
         self._target_q_net.save(os.path.join(save_dir, 'target_q_net.pth'))
+
+    def load_models(self, load_dir):
+        self._policy_net.load(os.path.join(load_dir, 'policy_net.pth'))
+        self._online_q_net.load(os.path.join(load_dir, 'online_q_net.pth'))
+        self._target_q_net.load(os.path.join(load_dir, 'target_q_net.pth'))

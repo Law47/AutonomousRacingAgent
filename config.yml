@@ -1,4 +1,18 @@
 work_dir: null  # default to null
+seed: 42
+
+# wandb
+disable_wandb: False
+wandb_entity: null  # user
+wandb_project: sac
+wandb_silent: False
+exp_name: null
+task_title: null
+save_csv: True
+save_video: False
+save_agent: False
+action_dim: null  # placeholder
+steps: null # placeholder
 
 Agent:
   num_steps: 8_000_000
@@ -9,8 +23,6 @@ Agent:
   update_interval: 1
   start_steps: 2000
   log_interval: 10
-  eval_interval: 0
-  num_eval_episodes: 1
   checkpoint_freq: 200_000
 
 SAC:

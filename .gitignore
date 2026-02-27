@@ -1,3 +1,5 @@
 .ACAgent/
 DevNotes.md
 **__pycache__/
+Outputs/
+.vscode/
