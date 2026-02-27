@@ -29,6 +29,8 @@ class Agent:
         self.wandb_logger = wandb_logger
         self.logger = logger
 
+        self._start_time = time.time()
+
         # Algorithm.
         self._algo = algo
 
@@ -57,6 +59,7 @@ class Agent:
         if not os.path.exists(self._summary_dir):
             os.makedirs(self._summary_dir)
 
+        self.episodes_stats = []
         self._steps = 0
         self._episodes = 0
         self._train_return = RunningMeanStats(log_interval)
@@ -139,7 +142,7 @@ class Agent:
                 update_model_perf.append(time.perf_counter() - start_profile)
 
                 # get observations
-                next_state, reward, terminated, info = self._env.step(action=None)  # action is already applied
+                next_state, reward, done, info = self._env.step(action=None)  # action is already applied
                 step_perf.append(time.perf_counter() - step_start_time)
                 step_start_time = time.perf_counter()
 
@@ -150,12 +153,11 @@ class Agent:
                 else:
                     masked_done = done
 
-                if terminated:
+                if done:
                     rb_done = True
                 else:
                     rb_done = False
 
-                self.logger.info(f"{state}, {action}, {reward}")
                 self._replay_buffer.append(
                     state, action, reward, next_state, masked_done,
                     episode_done=rb_done)
@@ -180,27 +182,15 @@ class Agent:
             self._writer.add_scalar(
                 'reward/train', self._train_return.get(), self._steps)
 
-        print(f'Episode: {self._episodes:<4}  '
-              f'Episode steps: {episode_steps:<4}  '
-              f'Return: {episode_return:<5.1f}')
+        print(f'Episode: {self._episodes}  '
+              f'Episode steps: {episode_steps}  '
+              f'Return: {episode_return}')
 
         ep_time = time.time() - ep_start_time
         ep_stats['total_steps'] = self._steps
         ep_stats['episode'] = self._episodes
         ep_stats['ep_reward'] = episode_return
         ep_stats['ep_steps'] = episode_steps
-        ep_stats.update(env_ep_stats if isinstance(env_ep_stats, dict) else {})
-
-        if env_ep_stats["BestLap"] < self.best_lap_time:
-            self.logger.info(f"new best lap time {env_ep_stats['BestLap']}")
-            self.best_lap_time = env_ep_stats["BestLap"]
-            self.save(os.path.join(self._model_dir, 'best_lap_time'), save_buffer=False)
-
-        if env_ep_stats["ep_reward"] > self.best_reward:
-            self.logger.info(f"new best reward {env_ep_stats['ep_reward']}")
-            self.best_reward = env_ep_stats["ep_reward"]
-            self.save(os.path.join(self._model_dir, 'best_reward'), save_buffer=False)
-
         eval_metrics = self.common_metrics()
         eval_metrics.update(ep_stats)
         if train_stats:
@@ -225,6 +215,15 @@ class Agent:
         self.episodes_stats.append(eval_metrics)
         pd.DataFrame(self.episodes_stats).to_csv(os.path.join(self._log_dir, 'summary.csv'), index=None)
         self.logger.info(f'Episode done. Took {ep_time:.2f}s.  Steps per episode: {episode_steps}. Buffer size: {len(self._replay_buffer)} fps: {episode_steps/ep_time:.2f}')
+
+    def common_metrics(self):
+        """Return a dictionary of current metrics."""
+        return dict(
+            step=self._steps,
+            episode=self._episodes,
+            buffer_size=len(self._replay_buffer),
+            total_time=time.time() - self._start_time,
+        )
 
     def evaluate(self):
         total_return = 0.0

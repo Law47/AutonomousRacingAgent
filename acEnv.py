@@ -341,8 +341,6 @@ class ACEnv(Env, gym_utils.EzPickle):
         terminated = False
         if self.state["tyresOut"] != None:
             terminated = self.state["tyresOut"] > 2
-            if terminated:
-                self.logger.info(f"Terminating")
 
         truncated = False
 
@@ -399,7 +397,7 @@ class ACEnv(Env, gym_utils.EzPickle):
     def getReward(self) -> np.ndarray:
         if self.state["tyresOut"] != None:
             if self.state["tyresOut"] > 2:
-                return -1
+                return np.array([-1], dtype=np.float32)
         
         if self.state["speed"] != None:
             speedReward = 3.6 * self.state["speed"] / 300
