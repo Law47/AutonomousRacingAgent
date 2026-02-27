@@ -1,9 +1,12 @@
-import os, sys, argparse, logging, copy, time
+import os, sys, argparse, logging, copy, time, signal
 from datetime import datetime
 from pathlib import Path
 from omegaconf import OmegaConf
 import torch
 import keyboard
+
+# Set wandb to offline mode before importing
+os.environ['WANDB_MODE'] = 'offline'
 
 from acEnv import ACEnv
 
@@ -14,6 +17,33 @@ from Model.discor.agent import Agent
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "Common"))
 import Common.logging_config as logging_config
 from Common.logger import Logger
+
+# Global agent for signal handler
+global_agent = None
+global_logger = None
+
+def signal_handler(sig, frame):
+    """Handle Ctrl+C gracefully"""
+    global global_agent, global_logger
+    if global_logger:
+        global_logger.info("\n\n=== TRAINING INTERRUPTED ===")
+        global_logger.info("Saving checkpoint...")
+    if global_agent:
+        try:
+            # Use the proper agent.save() method
+            import os
+            log_dir = global_agent._log_dir if hasattr(global_agent, '_log_dir') else 'Outputs'
+            checkpoint_path = os.path.join(log_dir, "checkpoint_interrupted")
+            global_agent.save(checkpoint_path, save_buffer=False)
+            if global_logger:
+                global_logger.info("Checkpoint saved to {}".format(checkpoint_path))
+        except Exception as e:
+            if global_logger:
+                global_logger.error("Error saving checkpoint: {}".format(e))
+    if global_logger:
+        global_logger.info("Training stopped. You can resume with: python run.py --load_path <checkpoint_path>")
+        global_logger.info("="*40)
+    sys.exit(0)
 
 def wait_for_start():
     """Wait for user to press spacebar before starting training"""
@@ -34,6 +64,10 @@ def wait_for_start():
             return
 
 def main():
+    global global_agent, global_logger
+    
+    # Register signal handler for Ctrl+C
+    signal.signal(signal.SIGINT, signal_handler)
     #region parseArgs into config
     parser = argparse.ArgumentParser(description="Description of your program.")
     parser.add_argument("--inference", default=False, type=bool, help="Run inference instead of training")
@@ -44,7 +78,10 @@ def main():
     parser.add_argument("overrides", nargs=argparse.REMAINDER, help="Any key=value arguments to override config values")
     
     args = parser.parse_args()
-    args.load_path = os.path.abspath(args.load_path) + os.sep if args.load_path is not None else None
+    if args.load_path is not None:
+        args.load_path = os.path.abspath(args.load_path)  # Don't add trailing separator
+    else:
+        args.load_path = None
     
     # Load config.yml arguments first
     config = OmegaConf.load(args.config)
@@ -82,8 +119,10 @@ def main():
     logger.info(f"Work Dir: {work_dir}")
     #endregion
     
-    device = torch.device("cuda")
-    assert device.type == "cuda", "Only cuda is supported"
+    global_logger = logger
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
 
     env = ACEnv(config, logger)
     logger.info(f"Environment Initalized")
@@ -122,10 +161,25 @@ def main():
     agent = Agent(env=env, test_env=env, algo=algo, log_dir=config.work_dir,
                   device=device, seed=config.seed, **config.Agent, wandb_logger=wandb_logger, logger=logger)
     
+    # Load checkpoint if provided
+    if args.load_path:
+        try:
+            logger.info(f"Loading models from {args.load_path}")
+            agent._algo.load_models(args.load_path)
+            logger.info("Models loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading models: {e}")
+            logger.warning("Starting from scratch instead")
+    
+    global_agent = agent
 
     # Start training
-    agent.run()
-    logger.info("Done Training")
+    try:
+        agent.run()
+        logger.info("Done Training")
+    except KeyboardInterrupt:
+        logger.info("Training interrupted by user")
+        signal_handler(None, None)
     
 if __name__ == "__main__":
     main()

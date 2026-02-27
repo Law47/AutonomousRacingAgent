@@ -9,12 +9,14 @@ import ctypes
 from ctypes import c_int32, c_float, c_wchar
 import mmap
 import time
+import os
+import socket
 import keyboard
 import vgamepad as vg
 from sharedMemoryStructs import SPageFilePhysics, SPageFileGraphic
 
 TOP_SPEED_MS = 80
-MAX_EPISODE_STEPS = 100000
+MAX_EPISODE_STEPS = 5000  # ~200 seconds at 25Hz, prevents hour-long episodes
 
 class ACEnv(Env, gym_utils.EzPickle):
     observation_info = {
@@ -185,18 +187,20 @@ class ACEnv(Env, gym_utils.EzPickle):
         self._max_episode_steps = MAX_EPISODE_STEPS
         self.is_metaworld = False
 
-        self.action_dim = 3
-        self.action_space = Box(low=np.array([-1.0, -1.0, -1.0]), high=np.array([1.0, 1.0, 1.0]))
+        self.action_dim = 2
+        # Action space: [throttle_brake, steer]
+        # throttle_brake: -1 (full brake) to +1 (full gas)
+        # steer: -1 (full left) to +1 (full right)
+        self.action_space = Box(low=np.array([-1.0, -1.0]), high=np.array([1.0, 1.0]), dtype=np.float32)
         
         self.logger.info(f"Action Dimensions: {self.action_dim}")
         self.logger.info(f"Action Space: {self.action_space}")
 
-        # self.state_dim = len(self.observation_inputs)
-        self.state_dim = 53
+        self.state_dim = len(self.observation_inputs)
         self.observation_space = Box(low=-np.inf, high=np.inf, shape=(self.state_dim,), dtype=np.float32)
 
-        self.logger.info(f"Observation Dimensions {self.state_dim}")
-        self.logger.info(f"Observation Space {self.observation_space}")
+        self.logger.info("Observation Dimensions {}".format(self.state_dim))
+        self.logger.info("Observation Space {}".format(self.observation_space))
 
         #Shared Memory Reading Maps
         self.physicsMMAP = None
@@ -209,6 +213,30 @@ class ACEnv(Env, gym_utils.EzPickle):
 
         self.state = {}
         self.state["packetID"] = 0
+        
+        # Track last applied actions for reward calculation
+        self._last_gas = 0.0
+        self._last_brake = 0.0
+        self._last_steer = 0.0
+        
+        # Track previous normalizedCarPosition for progress reward
+        self._prev_norm_pos = None
+        
+        # Track stuck detection (no movement for 3+ seconds)
+        # CRITICAL: Track from RESET position, not absolute position
+        # This prevents reset regression (car going backwards on track)
+        self._position_after_reset = None
+        self._stuck_start_time = None
+        self._stuck_threshold = 2.0  # meters - movement threshold (increased to allow reset settling)
+        self._stuck_timeout = 5.0  # seconds - increased to 5s to allow time after reset
+        
+        # Track low-speed stuck detection (stuck against wall but moving slightly)
+        self._low_speed_start_time = None
+        self._low_speed_threshold = 5.0  # km/h - if below this for too long, stuck
+        self._low_speed_timeout = 10.0  # seconds - stuck if slow for this long
+        
+        # Track previous speed for consistency bonus
+        self._prev_speed = 0.0
         
         # Initialize virtual Xbox 360 controller
         self.gamepad = vg.VX360Gamepad()
@@ -283,14 +311,19 @@ class ACEnv(Env, gym_utils.EzPickle):
             raise
 
     def getObservation(self) -> np.ndarray:
-        self.physics = SPageFilePhysics.from_buffer_copy(self.physicsMMAP)
-        self.graphics = SPageFileGraphic.from_buffer_copy(self.graphicsMMAP)
+        try:
+            self.physics = SPageFilePhysics.from_buffer_copy(self.physicsMMAP)
+            self.graphics = SPageFileGraphic.from_buffer_copy(self.graphicsMMAP)
+        except Exception as e:
+            self.logger.error("Failed to read shared memory: {}".format(e))
+            # Return last known observation or zeros
+            return np.zeros(self.state_dim, dtype=np.float32)
 
         # Extract simple physics fields directly (no suffix indexing needed)
         self.state["packetID"] = self.physics.packetId
         self.state["tyresOut"] = self.physics.numberOfTyresOut
         self.state["speed"] = self.physics.speedKmh
-
+        
         # Build normalized observation array
         observation = []
         field_mapping = {
@@ -316,7 +349,7 @@ class ACEnv(Env, gym_utils.EzPickle):
                 self.logger.warning(f"Could not extract {input_name}: {e}")
                 observation.append(0.0)
         
-        return np.array(observation, dtype=np.float32)[1:]
+        return np.array(observation, dtype=np.float32)
     
     def getInfo(self) -> dict:
         return self.state
@@ -328,38 +361,139 @@ class ACEnv(Env, gym_utils.EzPickle):
             self.connect()
             return self.step(action)
 
+        # Apply the action (controller input) to the game
+        if action is not None:
+            self.set_actions(action)
+
+        # Wait for next physics packet with timeout
         lastPacketID = self.state["packetID"]
         nextPacketFound = False
+        wait_count = 0
+        max_wait = 100  # Max ~4 seconds at 25Hz
 
-        while not nextPacketFound:
+        while not nextPacketFound and wait_count < max_wait:
             observations = self.getObservation()
             nextPacketFound = lastPacketID != self.state["packetID"]
+            wait_count += 1
+            if wait_count >= max_wait:
+                self.logger.warning("Timeout waiting for next physics packet")
+                break
 
         info = self.getInfo()
         reward = self.getReward()
         
+        # DEBUG: Press 'P' to print reward breakdown
+        if keyboard.is_pressed('p'):
+            print("\n" + "="*60)
+            print("REWARD BREAKDOWN:")
+            print("="*60)
+            if hasattr(self, '_last_reward_breakdown'):
+                for key, value in self._last_reward_breakdown.items():
+                    print(f"{key:30s}: {value:+8.2f}")
+                print("-"*60)
+                print(f"{'TOTAL REWARD':30s}: {reward[0]:+8.2f}")
+            print("="*60 + "\n")
+            time.sleep(0.5)  # Debounce
+        
+        # Termination conditions
         terminated = False
-        if self.state["tyresOut"] != None:
-            terminated = self.state["tyresOut"] > 2
+        tyres_out = self.state.get("tyresOut", 0) or 0
+        
+        # Check for extreme slip termination first (set in reward calc)
+        if self._extreme_slip_detected:
+            terminated = True
+            self.logger.info("Episode terminated: extreme slip detected (unrecoverable loss of control)")
+        # Severe off-track = all 4 tires off (episode ends)
+        elif tyres_out >= 4:
+            terminated = True
+            self.logger.info("Episode terminated: all 4 tires off track")
+        
+        # Also terminate if 3 tires off (significant off-track)
+        elif tyres_out >= 3:
+            terminated = True
+            self.logger.info("Episode terminated: {} tires off track".format(tyres_out))
+        
+        # ========== STUCK DETECTION (FIXED FOR RESET REGRESSION) ==========
+        # Terminate if car hasn't moved from RESET POSITION in the timeout period
+        # KEY: Track distance from position after reset, not from previous step
+        # This prevents reset regression where car goes backwards on track
+        try:
+            current_pos = self.graphics.carCoordinates  # [x, y, z]
+            current_time = time.time()
+            
+            if self._position_after_reset is None:
+                # First step after reset - store this position as reference
+                self._position_after_reset = current_pos[:]
+                self._stuck_start_time = current_time
+            else:
+                # Calculate distance from RESET position (not from previous step)
+                distance = np.linalg.norm(np.array(current_pos) - np.array(self._position_after_reset))
+                
+                if distance > self._stuck_threshold:
+                    # Car has moved enough from reset position - not stuck
+                    # Keep tracking from original reset position
+                    pass
+                else:
+                    # Car hasn't moved much from reset position
+                    stuck_time = current_time - self._stuck_start_time
+                    if stuck_time > self._stuck_timeout:
+                        # Car stuck for too long
+                        terminated = True
+                        self.logger.info("Episode terminated: car stuck (distance={:.2f}m in {:.2f}s from reset position)".format(distance, stuck_time))
+        except Exception as e:
+            self.logger.warning("Stuck detection error: {}".format(e))
+        
+        # ========== LOW-SPEED STUCK DETECTION ==========
+        # Catch cases where car is stuck against wall but moving slightly
+        # (e.g., pressing against barrier, wheels spinning)
+        try:
+            current_speed = self.state.get("speed", 0.0) or 0.0
+            current_time = time.time()
+            
+            if current_speed < self._low_speed_threshold:
+                # Car is going very slow
+                if self._low_speed_start_time is None:
+                    self._low_speed_start_time = current_time
+                else:
+                    # Check how long car has been slow
+                    slow_duration = current_time - self._low_speed_start_time
+                    if slow_duration > self._low_speed_timeout:
+                        terminated = True
+                        self.logger.info("Episode terminated: car stuck at low speed (speed={:.1f} km/h for {:.1f}s)".format(current_speed, slow_duration))
+            else:
+                # Car is moving at good speed, reset timer
+                self._low_speed_start_time = None
+        except Exception as e:
+            self.logger.warning("Low-speed stuck detection error: {}".format(e))
 
         truncated = False
 
-        return observations, reward, terminated, info
+        return observations, reward, terminated, truncated, info
 
     #Applies action into asseto corsa
-    #ActionSpace:<gas, brake, steer> 
-    #ActionSpaceRanges: <0 - 1, 0 - 1, -1 - 1>
+    #ActionSpace: [throttle_brake, steer]
+    #  throttle_brake: -1 (full brake) to +1 (full gas)  
+    #  steer: -1 (full left) to +1 (full right)
     def set_actions(self, action: np.ndarray) -> None:
         
-        # Extract actions: [gas, brake, steer]
-        gas = float(np.clip(action[0], 0.0, 1.0))
-        brake = float(np.clip(action[1], 0.0, 1.0))
-        steer = float(np.clip(action[2], -1.0, 1.0))
+        # Split combined throttle/brake axis
+        throttle_brake = float(np.clip(action[0], -1.0, 1.0))
+        steer = float(np.clip(action[1], -1.0, 1.0))
+        
+        # Convert to separate gas/brake for the controller
+        if throttle_brake >= 0:
+            gas = throttle_brake
+            brake = 0.0
+        else:
+            gas = 0.0
+            brake = -throttle_brake
+        
+        # Store last applied actions for reward calculation
+        self._last_gas = gas
+        self._last_brake = brake
+        self._last_steer = steer
         
         # Map to virtual Xbox 360 controller
-        # Gas -> Right trigger (0.0 to 1.0)
-        # Brake -> Left trigger (0.0 to 1.0)
-        # Steer -> Left joystick X-axis (-1.0 to 1.0)
         self.gamepad.left_joystick_float(x_value_float=steer, y_value_float=0.0)
         self.gamepad.right_trigger_float(value_float=gas)
         self.gamepad.left_trigger_float(value_float=brake)
@@ -367,44 +501,212 @@ class ACEnv(Env, gym_utils.EzPickle):
         # Submit the input state to ViGEmBus
         self.gamepad.update()
 
-    #Resets the game state (ctrl + r) + enter (when settings up make sure to already hover drive in the pit menu)
+    #Resets the game state via AC plugin (requires acgym plugin or compatible)
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> np.ndarray:
-        self.logger.info(f"Reseting")
+        self.logger.info("Reseting")
         super().reset(seed=seed)
         
-        # Simulate Ctrl+R to reset Assetto Corsa
-        self.logger.info("Sending Ctrl+R to reset game")
-        keyboard.press('ctrl')
-        time.sleep(0.05)
-        keyboard.press('r')
-        time.sleep(0.05)
-        keyboard.release('r')
-        time.sleep(0.05)
-        keyboard.release('ctrl')
-        time.sleep(0.2)
-        # Press Enter
-        self.logger.info("Sending Enter to confirm reset")
-        keyboard.press('enter')
-        time.sleep(0.05)
-        keyboard.release('enter')
-        time.sleep(0.5)
+        # Set controller to neutral during reset
+        self.gamepad.left_joystick_float(x_value_float=0.0, y_value_float=0.0)
+        self.gamepad.right_trigger_float(value_float=0.0)
+        self.gamepad.left_trigger_float(value_float=0.0)
+        self.gamepad.update()
+        
+        # Try to send reset via socket to AC plugin on port 2347 with retry
+        reset_success = False
+        max_retries = 3
+        
+        for attempt in range(max_retries):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(2)
+                    s.connect(('localhost', 2347))
+                    s.sendall('reset'.encode())
+                    self.logger.info("Reset command sent to AC plugin server (attempt {}/{})".format(attempt+1, max_retries))
+                    reset_success = True
+                    time.sleep(1.0)  # Wait for reset to complete
+                    break
+            except Exception as e:
+                self.logger.warning("Reset attempt {}/{} failed: {}".format(attempt+1, max_retries, str(e)))
+                if attempt < max_retries - 1:
+                    time.sleep(0.3)  # Brief pause before retry
+        
+        if not reset_success:
+            self.logger.error("FAILED to reach AC reset server. Make sure rl_reset_server app is enabled in AC!")
+            time.sleep(1.0)
+        
+        # Reset tracking state
+        self._last_gas = 0.0
+        self._last_brake = 0.0
+        self._last_steer = 0.0
+        
+        # Reset stuck detection - track position FROM THIS RESET
+        # This prevents reset regression (car going backwards on track)
+        self._position_after_reset = None  # Will be set on first step after reset
+        self._stuck_start_time = None
+        
+        # Reset low-speed stuck detection
+        self._low_speed_start_time = None
+        
+        # Reset speed tracking
+        self._prev_speed = 0.0
         
         observation = self.getObservation()
-        info = self.getInfo()
-
+        self._prev_norm_pos = self.graphics.normalizedCarPosition
         return observation
     
     def getReward(self) -> np.ndarray:
-        if self.state["tyresOut"] != None:
-            if self.state["tyresOut"] > 2:
-                return np.array([-1], dtype=np.float32)
+        """Reward function for RL training
         
-        if self.state["speed"] != None:
-            speedReward = 3.6 * self.state["speed"] / 300
-            return np.array([speedReward], dtype=np.float32)
+        Reward components:
+        1. FORWARD PROGRESS (DOMINANT SIGNAL) - major rewards for track progress
+        2. Speed bonus (increases continuously with speed)
+        3. Off-track penalty (significant deterrent)
+        4. Standing still penalty (CATASTROPHIC - forces action)
+        5. Steering without movement penalty (prevents wheel-spinning behavior)
+        6. Slip penalty (prevents loss of control)
+        7. Pit lane penalty
+        
+        KEY DESIGN: Balance progress signal with quality-of-driving signals.
+        """
+        
+        # Store breakdown for debug printing
+        breakdown = {}
+        
+        # Initialize extreme slip flag (will be set during slip calculation)
+        self._extreme_slip_detected = False
+        
+        reward = 0.0
+        tyres_out = self.state.get("tyresOut", 0) or 0
+        
+        # ========== OFF-TRACK DETECTION (SIGNIFICANT PENALTY) ==========
+        # DESIGN: Off-track is bad but still recoverable
+        off_track_penalty = 0.0
+        if tyres_out >= 3:
+            # Increased penalty - strongly discourages off-track driving
+            off_track_penalty = 5.0 * tyres_out  # -15 for 3 tires, -20 for all 4
+            reward -= off_track_penalty
+            if tyres_out >= 4:
+                self.logger.debug("[REWARD] ALL TIRES OFF! Penalty: {}".format(off_track_penalty))
+        breakdown['Off-track penalty'] = -off_track_penalty
+        
+        # ========== TRACK PROGRESS (PRIMARY SIGNAL) ==========
+        norm_pos = self.graphics.normalizedCarPosition
+        progress_reward = 0.0
+        
+        # Validate norm_pos is a valid number
+        if norm_pos is None or not isinstance(norm_pos, (int, float)) or np.isnan(norm_pos) or np.isinf(norm_pos):
+            self.logger.warning("Invalid normalizedCarPosition: {}".format(norm_pos))
+            norm_pos = self._prev_norm_pos if self._prev_norm_pos is not None else 0.0
+        
+        if self._prev_norm_pos is not None:
+            # Calculate progress around track
+            progress = norm_pos - self._prev_norm_pos
+            
+            # Handle lap wrap-around
+            if progress < -0.5:  # Wrapped around (crossing line 0->1)
+                progress += 1.0
+                progress_reward = 50.0  # MAJOR milestone - completing a lap section
+                self.logger.debug("[REWARD] Lap progress complete! +50")
+            elif progress > 0.5:  # Went backwards significantly
+                progress -= 1.0
+            
+            # Progress reward: moving forward is VERY important
+            # Reduced to allow other signals to matter (efficiency, speed, line quality)
+            # 0.01 progress = +2 reward
+            # 0.1 progress = +20 reward
+            progress_reward += progress * 200.0  # Reduced from 1000 to 200
+            reward += progress_reward
+        
+        breakdown['Progress reward'] = progress_reward
+        self._prev_norm_pos = norm_pos
+        
+        # ========== SPEED REWARD ==========
+        # Simple linear reward based on speed (km/h)
+        # In racing, faster = better, so reward should scale with speed
+        speed = self.state.get("speed", 0.0) or 0.0
+        speed_reward = 0.0
+        
+        if speed > 5:  # Moving
+            # Linear reward: 50 km/h = 0.5, 100 km/h = 1.0, 200 km/h = 2.0
+            speed_reward = speed / 100.0
+        else:  # Standing still = CATASTROPHIC
+            speed_reward = -100.0  # Absolutely catastrophic inaction penalty
+        
+        self._prev_speed = speed  # Store for next frame
+        reward += speed_reward
+        breakdown['Speed reward'] = speed_reward
+        
+        # ========== BRAKING WITHOUT MOVING PENALTY ==========
+        # If agent is braking but not moving, it's wasting time (should accelerate)
+        # This prevents the "hold brake" behavior and forces acceleration attempts
+        braking_penalty = 0.0
+        if speed < 10 and self._last_brake > 0.3:
+            # Braking while not moving = wasting time, force acceleration
+            braking_penalty = 10.0 * self._last_brake  # Harsh penalty for brake holding
+            reward -= braking_penalty
+        breakdown['Braking w/o movement'] = -braking_penalty
+        
+        # ========== SLIP ANGLE & WHEELSPIN PENALTY ==========
+        # Penalize car for losing traction (high slip) or wheelspin (spinning wheels vs forward motion)
+        # This prevents learning unstable/drifting driving behaviors
+        slip_penalty = 0.0
+        try:
+            # Get wheel slip values (0-1 scale, higher = more slip)
+            wheel_slips = [
+                abs(self.state.get('wheelSlipFL', 0.0) or 0.0),
+                abs(self.state.get('wheelSlipFR', 0.0) or 0.0),
+                abs(self.state.get('wheelSlipRL', 0.0) or 0.0),
+                abs(self.state.get('wheelSlipRR', 0.0) or 0.0),
+            ]
+            max_wheel_slip = max(wheel_slips) if wheel_slips else 0.0
+            
+            # EXTREME slip = terminate episode (unrecoverable loss of control)
+            if max_wheel_slip > 0.8:
+                self._extreme_slip_detected = True
+                slip_penalty = 50.0
+            # Penalize excessive slip (>0.2 = significant loss of traction)
+            elif max_wheel_slip > 0.2:
+                slip_penalty = 10.0 * (max_wheel_slip - 0.2)  # scales with severity
+            
+            reward -= slip_penalty
+        except Exception as e:
+            self.logger.debug(f"Slip penalty calculation error: {e}")
+        
+        breakdown['Slip penalty'] = -slip_penalty
+        
+        # ========== REMOVED: Smooth driving penalties ==========
+        # REASON: These discouraged the agent from taking any action.
+        # The agent would rather hold brakes (no input changes = no penalties)
+        # than risk acceleration or steering changes.
+        # Let the agent learn smoothness naturally from lap times and off-track penalties.
+        
+        # ========== PIT LANE PENALTY ==========
+        pit_penalty = 0.0
+        if self.graphics.isInPit:
+            pit_penalty = 1.0
+            reward -= pit_penalty
+        breakdown['Pit lane penalty'] = -pit_penalty
+        
+        # Safety: Clip reward to prevent NaN/inf
+        if np.isnan(reward) or np.isinf(reward):
+            self.logger.error("Invalid reward detected: {}, setting to -10".format(reward))
+            reward = -10.0
+        
+        # Store breakdown for debug printing (press 'P' during training)
+        self._last_reward_breakdown = breakdown
+        
+        return np.array([reward], dtype=np.float32)
     
-        return np.array([0], dtype=np.float32)
-    
-    # On exit
+    # On exit - cleanup resources
     def close(self):
+        try:
+            # Set controller to neutral before closing
+            self.gamepad.left_joystick_float(x_value_float=0.0, y_value_float=0.0)
+            self.gamepad.right_trigger_float(value_float=0.0)
+            self.gamepad.left_trigger_float(value_float=0.0)
+            self.gamepad.update()
+            self.logger.info("ACEnv closed, controller set to neutral")
+        except Exception as e:
+            self.logger.warning("Error during close: {}".format(e))
         return

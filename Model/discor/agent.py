@@ -142,7 +142,8 @@ class Agent:
                 update_model_perf.append(time.perf_counter() - start_profile)
 
                 # get observations
-                next_state, reward, done, info = self._env.step(action=None)  # action is already applied
+                next_state, reward, done, truncated, info = self._env.step(action=None)  # action is already applied
+                done = done or truncated
                 step_perf.append(time.perf_counter() - step_start_time)
                 step_start_time = time.perf_counter()
 
@@ -238,8 +239,9 @@ class Agent:
                 success = 0.0
 
             while (not done):
-                action = self._algo.exploit(state)
-                next_state, reward, done, info = self._test_env.step(action)
+                action, _ = self._algo.exploit(state)
+                next_state, reward, done, truncated, info = self._test_env.step(action)
+                done = done or truncated
                 episode_return += reward
                 state = next_state
 
