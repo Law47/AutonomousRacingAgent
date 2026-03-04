@@ -33,7 +33,6 @@ NOTE: The project's model.pth files use CUDA so please install with the CUDA ver
   Virtual Gamepad Emulation Bus used to emulate an Xbox 360 controller with extremely low latency
   https://github.com/nefarius/ViGEmBus/releases
 - vgamepad (Python interface for sending inputs through ViGEmBus)
-- For training, bind Ctrl + R in content manager to restart race
 
 ##### Simulator:
 - Assetto Corsa (PC)

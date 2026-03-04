@@ -10,10 +10,11 @@ from ctypes import c_int32, c_float, c_wchar
 import mmap
 import time
 import os
-import socket
 import keyboard
 import vgamepad as vg
 from sharedMemoryStructs import SPageFilePhysics, SPageFileGraphic
+from curriculum_scheduler import CurriculumScheduler
+from racing_line_manager import RacingLineManager
 
 TOP_SPEED_MS = 80
 MAX_EPISODE_STEPS = 5000  # ~200 seconds at 25Hz, prevents hour-long episodes
@@ -238,6 +239,12 @@ class ACEnv(Env, gym_utils.EzPickle):
         # Track previous speed for consistency bonus
         self._prev_speed = 0.0
         
+        # Initialize curriculum learning
+        self.curriculum_scheduler = CurriculumScheduler(config, logger)
+        
+        # Initialize racing line manager
+        self.racing_line_manager = RacingLineManager(config, logger)
+        
         # Initialize virtual Xbox 360 controller
         self.gamepad = vg.VX360Gamepad()
         self.logger.info("Virtual Xbox 360 controller initialized")
@@ -251,6 +258,20 @@ class ACEnv(Env, gym_utils.EzPickle):
             self.logger.info("Controller set to neutral state")
         except Exception as e:
             self.logger.warning(f"Could not initialize controller state: {e}")
+        
+        # Initialize reset toggle file (ensure it starts at "0")
+        try:
+            home = os.path.expanduser("~")
+            toggle_file = os.path.join(home, "ac_reset_toggle.txt")
+            if not os.path.exists(toggle_file):
+                with open(toggle_file, 'w') as f:
+                    f.write('0')
+                self.logger.info(f"Initialized reset toggle file: {toggle_file}")
+        except Exception as e:
+            self.logger.warning(f"Could not initialize toggle file: {e}")
+        
+        # Debug key debounce
+        self._p_key_pressed = False
         
         self.connect()
 
@@ -314,6 +335,10 @@ class ACEnv(Env, gym_utils.EzPickle):
         try:
             self.physics = SPageFilePhysics.from_buffer_copy(self.physicsMMAP)
             self.graphics = SPageFileGraphic.from_buffer_copy(self.graphicsMMAP)
+            
+            # Update racing line from Lua plugin cache if available
+            if self.racing_line_manager.enabled:
+                self.racing_line_manager.update_racing_line_from_lua_cache()
         except Exception as e:
             self.logger.error("Failed to read shared memory: {}".format(e))
             # Return last known observation or zeros
@@ -361,6 +386,9 @@ class ACEnv(Env, gym_utils.EzPickle):
             self.connect()
             return self.step(action)
 
+        # Track curriculum progress
+        self.curriculum_scheduler.step()
+
         # Apply the action (controller input) to the game
         if action is not None:
             self.set_actions(action)
@@ -382,18 +410,21 @@ class ACEnv(Env, gym_utils.EzPickle):
         info = self.getInfo()
         reward = self.getReward()
         
-        # DEBUG: Press 'P' to print reward breakdown
+        # DEBUG: Press 'P' to print reward breakdown (with debounce to prevent freezing)
         if keyboard.is_pressed('p'):
-            print("\n" + "="*60)
-            print("REWARD BREAKDOWN:")
-            print("="*60)
-            if hasattr(self, '_last_reward_breakdown'):
-                for key, value in self._last_reward_breakdown.items():
-                    print(f"{key:30s}: {value:+8.2f}")
-                print("-"*60)
-                print(f"{'TOTAL REWARD':30s}: {reward[0]:+8.2f}")
-            print("="*60 + "\n")
-            time.sleep(0.5)  # Debounce
+            if not self._p_key_pressed:  # Only trigger on key press (transition)
+                self._p_key_pressed = True
+                print("\n" + "="*60)
+                print("REWARD BREAKDOWN:")
+                print("="*60)
+                if hasattr(self, '_last_reward_breakdown'):
+                    for key, value in self._last_reward_breakdown.items():
+                        print(f"{key:30s}: {value:+8.2f}")
+                    print("-"*60)
+                    print(f"{'TOTAL REWARD':30s}: {reward[0]:+8.2f}")
+                print("="*60 + "\n")
+        else:
+            self._p_key_pressed = False  # Reset when key is released
         
         # Termination conditions
         terminated = False
@@ -506,34 +537,90 @@ class ACEnv(Env, gym_utils.EzPickle):
         self.logger.info("Reseting")
         super().reset(seed=seed)
         
+        # Track curriculum progress at episode reset
+        self.curriculum_scheduler.reset_episode()
+        
         # Set controller to neutral during reset
         self.gamepad.left_joystick_float(x_value_float=0.0, y_value_float=0.0)
         self.gamepad.right_trigger_float(value_float=0.0)
         self.gamepad.left_trigger_float(value_float=0.0)
         self.gamepad.update()
         
-        # Try to send reset via socket to AC plugin on port 2347 with retry
+        # Send reset command to AC via CSP Lua script using toggle file
+        # The Lua script (CSP_Reset/rl_reset.lua) monitors this file for "1" flag
         reset_success = False
         max_retries = 3
         
+        home = os.path.expanduser("~")
+        toggle_file = os.path.join(home, "ac_reset_toggle.txt")
+        
         for attempt in range(max_retries):
             try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(2)
-                    s.connect(('localhost', 2347))
-                    s.sendall('reset'.encode())
-                    self.logger.info("Reset command sent to AC plugin server (attempt {}/{})".format(attempt+1, max_retries))
-                    reset_success = True
-                    time.sleep(1.0)  # Wait for reset to complete
+                # Write "1" to toggle file to request reset
+                with open(toggle_file, 'w') as f:
+                    f.write('1')
+                    f.flush()  # Ensure written to disk
+                
+                if attempt == 0:
+                    self.logger.info(f"Reset toggle file: {toggle_file}")
+                self.logger.info(f"Reset requested (attempt {attempt+1}/{max_retries})")
+                
+                # Wait for Lua script to acknowledge by writing "0" back
+                wait_start = time.time()
+                last_state = None
+                while time.time() - wait_start < 3.0:
+                    time.sleep(0.05)  # Poll every 50ms
+                    
+                    try:
+                        with open(toggle_file, 'r') as f:
+                            state = f.read().strip()
+                        
+                        if state != last_state:
+                            last_state = state
+                            if attempt == 0:  # Log state changes on first attempt
+                                self.logger.debug(f"Toggle state: '{state}'")
+                        
+                        if state == '0':
+                            self.logger.info("✓ Reset confirmed by Lua script")
+                            reset_success = True
+                            break
+                    except IOError:
+                        # File may be in use, retry
+                        pass
+                
+                if reset_success:
                     break
+                elif attempt == max_retries - 1:
+                    # Last attempt - provide diagnosis
+                    try:
+                        with open(toggle_file, 'r') as f:
+                            final_state = f.read().strip()
+                        self.logger.error(f"Reset timed out. Toggle file state: '{final_state}'")
+                        self.logger.error(f"Expected '0' but got '{final_state}' - Lua script may not be running")
+                    except:
+                        self.logger.error("Reset timed out. Could not read toggle file")
+                else:
+                    time.sleep(0.5)  # Pause before retry
             except Exception as e:
-                self.logger.warning("Reset attempt {}/{} failed: {}".format(attempt+1, max_retries, str(e)))
+                self.logger.warning(f"Reset attempt {attempt+1}/{max_retries} failed: {e}")
                 if attempt < max_retries - 1:
-                    time.sleep(0.3)  # Brief pause before retry
+                    time.sleep(0.5)
         
         if not reset_success:
-            self.logger.error("FAILED to reach AC reset server. Make sure rl_reset_server app is enabled in AC!")
+            self.logger.error("═" * 60)
+            self.logger.error("RESET FAILED - CSP Lua Script Not Responding")
+            self.logger.error("═" * 60)
+            self.logger.error("SOLUTION:")
+            self.logger.error("  1. Open Content Manager")
+            self.logger.error("  2. Go to: Settings → Custom Shaders Patch → Python Apps")
+            self.logger.error("     (or Content → Lua Apps in newer CM versions)")
+            self.logger.error("  3. Find 'rl_reset' script and make sure it's ENABLED")
+            self.logger.error("  4. Restart your AC session")
+            self.logger.error(f"  5. Verify toggle file exists: {toggle_file}")
+            self.logger.error("═" * 60)
             time.sleep(1.0)
+        else:
+            time.sleep(0.5)  # Extra wait for racing line loading
         
         # Reset tracking state
         self._last_gas = 0.0
@@ -565,7 +652,8 @@ class ACEnv(Env, gym_utils.EzPickle):
         4. Standing still penalty (CATASTROPHIC - forces action)
         5. Steering without movement penalty (prevents wheel-spinning behavior)
         6. Slip penalty (prevents loss of control)
-        7. Pit lane penalty
+        7. Racing line distance penalty (curriculum learning - decays over time)
+        8. Pit lane penalty
         
         KEY DESIGN: Balance progress signal with quality-of-driving signals.
         """
@@ -630,12 +718,32 @@ class ACEnv(Env, gym_utils.EzPickle):
         if speed > 5:  # Moving
             # Linear reward: 50 km/h = 0.5, 100 km/h = 1.0, 200 km/h = 2.0
             speed_reward = speed / 100.0
-        else:  # Standing still = CATASTROPHIC
-            speed_reward = -100.0  # Absolutely catastrophic inaction penalty
+        else:  # Standing still - but check if trying to accelerate
+            # KEY FIX: Make inaction penalty conditional on gas input
+            # If NOT pressing gas: catastrophic penalty (forces exploration of gas)
+            # If pressing gas: much lighter penalty (encourage holding it)
+            if self._last_gas < 0.3:
+                # Not trying to accelerate = wasting time
+                speed_reward = -100.0  # Catastrophic penalty for inaction
+            else:
+                # Trying to accelerate (gas >= 0.3) but not moving yet
+                # Much lighter penalty - encourage the agent to keep pressing gas
+                speed_reward = -30.0  # Reduced from -100
         
         self._prev_speed = speed  # Store for next frame
         reward += speed_reward
         breakdown['Speed reward'] = speed_reward
+        
+        # ========== THROTTLE BONUS (ENCOURAGES EXPLORATION) ==========
+        # Early in training, agent needs incentive to discover that pressing gas reduces -100 penalty
+        # Without this, agent learns "hold brake = stable -100" is safer than exploring
+        throttle_bonus = 0.0
+        if speed < 5 and self._last_gas > 0.3:
+            # Reward for trying to accelerate (even if not moving yet)
+            # This creates a clear path: "gas reduces penalty from -100"
+            throttle_bonus = 8.0 * self._last_gas  # Up to +8 bonus for full throttle
+            reward += throttle_bonus
+        breakdown['Throttle bonus'] = throttle_bonus
         
         # ========== BRAKING WITHOUT MOVING PENALTY ==========
         # If agent is braking but not moving, it's wasting time (should accelerate)
@@ -646,6 +754,65 @@ class ACEnv(Env, gym_utils.EzPickle):
             braking_penalty = 10.0 * self._last_brake  # Harsh penalty for brake holding
             reward -= braking_penalty
         breakdown['Braking w/o movement'] = -braking_penalty
+        
+        # ========== RACING LINE DISTANCE PENALTY (CURRICULUM LEARNING) ==========
+        # Penalize distance from racing line, with reward decaying over training
+        # DESIGN: Heavy guidance early, gradually removed as policy improves
+        racing_line_penalty = 0.0
+        racing_line_distance = 0.0  # Track for debug output
+        try:
+            rl_cfg = self.config.get('racing_line', {})
+            if rl_cfg.get('enable', True):
+                # Get current racing line weight from curriculum
+                rl_weight = self.curriculum_scheduler.get_racing_line_weight()
+                
+                # Diagnostic: Log status once at start
+                if not hasattr(self, '_logged_rl_diagnostic'):
+                    self.logger.info(f"[RACING_LINE_DIAGNOSTIC]")
+                    self.logger.info(f"  Racing line enabled: True")
+                    self.logger.info(f"  Racing line loaded: {self.racing_line_manager.racing_line_loaded}")
+                    self.logger.info(f"  Curriculum weight (should be ~1.0 at start): {rl_weight:.2f}")
+                    self.logger.info(f"  Config check: enable={rl_cfg.get('enable', True)}")
+                    if self.racing_line_manager.racing_line_loaded:
+                        self.logger.info(f"  Racing line points: {len(self.racing_line_manager.racing_line_points)}")
+                    self._logged_rl_diagnostic = True
+                
+                if rl_weight > 0.0 and self.racing_line_manager.racing_line_loaded:
+                    car_pos = (self.graphics.carCoordinates[0], 
+                              self.graphics.carCoordinates[1], 
+                              self.graphics.carCoordinates[2])
+                    
+                    racing_line_distance = self.racing_line_manager.distance_to_racing_line(car_pos)
+                    
+                    # Convert distance to normalized penalty (0 to 1)
+                    # Maximum penalty at RL threshold distance
+                    rl_threshold = self.racing_line_manager.line_distance_threshold
+                    normalized_distance = min(racing_line_distance / rl_threshold, 1.0)
+                    
+                    # Apply curriculum weight - starts high, decays to 0
+                    line_weight = self.racing_line_manager.line_distance_weight
+                    racing_line_penalty = line_weight * normalized_distance * rl_weight
+                    reward -= racing_line_penalty
+                    
+                    # Periodic diagnostic: log actual distance every 100 frames
+                    if not hasattr(self, '_rl_debug_counter'):
+                        self._rl_debug_counter = 0
+                    self._rl_debug_counter += 1
+                    if self._rl_debug_counter % 100 == 0:
+                        self.logger.debug(f"[RL_DISTANCE] Distance to line: {racing_line_distance:.2f}m, "
+                                        f"Penalty: {racing_line_penalty:.2f}, Weight: {rl_weight:.2f}")
+                elif not self.racing_line_manager.racing_line_loaded:
+                    # Log why racing line is not active
+                    if not hasattr(self, '_logged_rl_missing'):
+                        self.logger.warning(f"[RACING_LINE] Not loaded yet - waiting for Lua cache file")
+                        self.logger.warning(f"  Cache file path: {os.path.expanduser('~')}/ac_racing_line_cache.bin")
+                        self.logger.warning(f"  Ensure CSP_Reset script is ENABLED in Content Manager")
+                        self._logged_rl_missing = True
+        except Exception as e:
+            self.logger.debug(f"Racing line penalty calculation error: {e}")
+        
+        breakdown['Racing line penalty'] = -racing_line_penalty
+        breakdown['Racing line distance'] = racing_line_distance  # Add distance to breakdown
         
         # ========== SLIP ANGLE & WHEELSPIN PENALTY ==========
         # Penalize car for losing traction (high slip) or wheelspin (spinning wheels vs forward motion)

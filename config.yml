@@ -71,3 +71,20 @@ AssettoCorsa:
   add_previous_obs_to_state: True
   use_reference_line_in_reward: True
   use_target_speed: False
+
+# ===== CURRICULUM LEARNING =====
+curriculum:
+  enable: True                 # Enable/disable curriculum learning
+  strategy: 'linear'           # 'linear', 'exponential', or 'step'
+  initial_weight: 1.0          # Starting racing line reward weight (0-1)
+  final_weight: 0.1            # Ending racing line reward weight (0-1)
+  decay_steps: 100_000         # Number of training steps over which to decay
+
+# ===== RACING LINE REWARDS =====
+racing_line:
+  enable: True                 # Enable/disable racing line distance rewards
+  track_name: 'monza'          # Track name (informational, from plugin)
+  
+  # Reward configuration
+  line_distance_weight: 5.0    # Weight for racing line distance reward
+  line_distance_threshold: 10.0  # Max distance to track in meters (becomes full penalty)
