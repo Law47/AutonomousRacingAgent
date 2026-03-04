@@ -28,6 +28,10 @@
 
 local HOME = os.getenv("USERPROFILE") or os.getenv("HOME") or "C:/Users/Default"
 local TOGGLE_FILE = HOME .. "/ac_reset_toggle.txt"
+local RACING_LINE_CACHE_FILE = HOME .. "/ac_racing_line_cache.bin"
+local CHECK_INTERVAL = 0.1  -- seconds between file checks
+
+local timer = 0
 
 -- Racing line cache
 local RACING_LINE_CACHE = {
@@ -59,9 +63,19 @@ end
 -- Helper: write file (atomic write for toggle)
 local function writeFile(path, content)
   local f = io.open(path, "w")
-  if not f then return false end
-  f:write(content)
-  f:close()
+  if not f then 
+    ac.log("[RL_Reset] ERROR: Could not open file for writing: " .. path)
+    return false 
+  end
+  
+  local success = f:write(content)
+  f:close()  -- Close immediately to ensure flush on Windows
+  
+  if not success then
+    ac.log("[RL_Reset] ERROR: Failed to write to file: " .. path)
+    return false
+  end
+  
   return true
 end
 
@@ -220,9 +234,12 @@ function script.update(dt)
     return
   end
   
+  -- Strip whitespace for robust comparison
+  toggle_state = toggle_state:match("^%s*(.-)%s*$") or toggle_state
+  
   -- Check if reset is requested (state = "1")
-  if toggle_state:match("1") then
-    ac.log("[RL_Reset] Reset command received")
+  if toggle_state == "1" or toggle_state:match("^1") then
+    ac.log("[RL_Reset] Reset command received, toggle state: '" .. toggle_state .. "'")
     
     -- Perform the reset
     local success = resetCar()
@@ -230,31 +247,31 @@ function script.update(dt)
     -- CRITICAL: Load racing line immediately after reset
     -- This ensures Python can read it in the next step
     if success then
-      ac.log("[RL_Reset] Loading racing line after reset...")
+      ac.log("[RL_Reset] Car reset successful, loading racing line...")
       load_racing_line_for_track()
       
       -- Write "0" back to confirm reset complete
       local written = writeFile(TOGGLE_FILE, "0")
       if written then
-        ac.log("[RL_Reset] Reset complete, toggle cleared")
+        ac.log("[RL_Reset] Reset complete, toggle cleared to '0'")
       else
-        ac.log("[RL_Reset] ERROR: Could not write to toggle file")
+        ac.log("[RL_Reset] ERROR: Could not write '0' to toggle file - write may have failed!")
       end
     else
       -- Reset failed, still clear toggle to avoid infinite loop
+      ac.log("[RL_Reset] Car reset FAILED - clearing toggle anyway")
       writeFile(TOGGLE_FILE, "0")
-      ac.log("[RL_Reset] Reset failed")
     end
   end
 end
 
 -- Session start - verify script is running
 function script.sessionStart()
-  ac.log("[RL_Reset] ═══════════════════════════════════════")
+  ac.log("[RL_Reset] ========================================")
   ac.log("[RL_Reset] CSP Reset Script LOADED and RUNNING")
   ac.log("[RL_Reset] Toggle file: " .. TOGGLE_FILE)
   ac.log("[RL_Reset] Racing line cache: " .. RACING_LINE_CACHE_FILE)
-  ac.log("[RL_Reset] ═══════════════════════════════════════")
+  ac.log("[RL_Reset] ========================================")
   
   -- Load racing line at session start
   ac.log("[RL_Racing_Line] Session started, loading racing line")
