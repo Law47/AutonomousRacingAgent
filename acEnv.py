@@ -15,9 +15,13 @@ import vgamepad as vg
 from sharedMemoryStructs import SPageFilePhysics, SPageFileGraphic
 from curriculum_scheduler import CurriculumScheduler
 from racing_line_manager import RacingLineManager
+import socket
 
 TOP_SPEED_MS = 80
 MAX_EPISODE_STEPS = 5000  # ~200 seconds at 25Hz, prevents hour-long episodes
+
+HOST = "127.0.0.1"
+PORT = 65432
 
 class ACEnv(Env, gym_utils.EzPickle):
     observation_info = {
@@ -275,6 +279,10 @@ class ACEnv(Env, gym_utils.EzPickle):
         
         self.connect()
 
+        self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.srv.bind((HOST, PORT))
+
     # algo wants this
     def seed(self, seed=None):
         pass
@@ -315,6 +323,7 @@ class ACEnv(Env, gym_utils.EzPickle):
         return None
 
     #Connect to shared memory buffers
+    #Also connect to ac python app
     def connect(self) -> None:
         try:
             self.physicsMMAP = mmap.mmap(0, ctypes.sizeof(SPageFilePhysics), "acpmf_physics")
@@ -536,107 +545,14 @@ class ACEnv(Env, gym_utils.EzPickle):
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> np.ndarray:
         self.logger.info("Reseting")
         super().reset(seed=seed)
-        
-        # Track curriculum progress at episode reset
-        self.curriculum_scheduler.reset_episode()
-        
-        # Set controller to neutral during reset
-        self.gamepad.left_joystick_float(x_value_float=0.0, y_value_float=0.0)
-        self.gamepad.right_trigger_float(value_float=0.0)
-        self.gamepad.left_trigger_float(value_float=0.0)
-        self.gamepad.update()
-        
-        # Send reset command to AC via CSP Lua script using toggle file
-        # The Lua script (CSP_Reset/rl_reset.lua) monitors this file for "1" flag
-        reset_success = False
-        max_retries = 3
-        
-        home = os.path.expanduser("~")
-        toggle_file = os.path.join(home, "ac_reset_toggle.txt")
-        
-        for attempt in range(max_retries):
-            try:
-                # Write "1" to toggle file to request reset
-                with open(toggle_file, 'w') as f:
-                    f.write('1')
-                    f.flush()  # Ensure written to disk
-                
-                if attempt == 0:
-                    self.logger.info(f"Reset toggle file: {toggle_file}")
-                self.logger.info(f"Reset requested (attempt {attempt+1}/{max_retries})")
-                
-                # Wait for Lua script to acknowledge by writing "0" back
-                wait_start = time.time()
-                last_state = None
-                while time.time() - wait_start < 3.0:
-                    time.sleep(0.05)  # Poll every 50ms
-                    
-                    try:
-                        with open(toggle_file, 'r') as f:
-                            state = f.read().strip()
-                        
-                        if state != last_state:
-                            last_state = state
-                            if attempt == 0:  # Log state changes on first attempt
-                                self.logger.debug(f"Toggle state: '{state}'")
-                        
-                        if state == '0':
-                            self.logger.info("✓ Reset confirmed by Lua script")
-                            reset_success = True
-                            break
-                    except IOError:
-                        # File may be in use, retry
-                        pass
-                
-                if reset_success:
-                    break
-                elif attempt == max_retries - 1:
-                    # Last attempt - provide diagnosis
-                    try:
-                        with open(toggle_file, 'r') as f:
-                            final_state = f.read().strip()
-                        self.logger.error(f"Reset timed out. Toggle file state: '{final_state}'")
-                        self.logger.error(f"Expected '0' but got '{final_state}' - Lua script may not be running")
-                    except:
-                        self.logger.error("Reset timed out. Could not read toggle file")
-                else:
-                    time.sleep(0.5)  # Pause before retry
-            except Exception as e:
-                self.logger.warning(f"Reset attempt {attempt+1}/{max_retries} failed: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(0.5)
-        
-        if not reset_success:
-            self.logger.error("═" * 60)
-            self.logger.error("RESET FAILED - CSP Lua Script Not Responding")
-            self.logger.error("═" * 60)
-            self.logger.error("SOLUTION:")
-            self.logger.error("  1. Open Content Manager")
-            self.logger.error("  2. Go to: Settings → Custom Shaders Patch → Python Apps")
-            self.logger.error("     (or Content → Lua Apps in newer CM versions)")
-            self.logger.error("  3. Find 'rl_reset' script and make sure it's ENABLED")
-            self.logger.error("  4. Restart your AC session")
-            self.logger.error(f"  5. Verify toggle file exists: {toggle_file}")
-            self.logger.error("═" * 60)
-            time.sleep(1.0)
-        else:
-            time.sleep(0.5)  # Extra wait for racing line loading
-        
-        # Reset tracking state
-        self._last_gas = 0.0
-        self._last_brake = 0.0
-        self._last_steer = 0.0
-        
-        # Reset stuck detection - track position FROM THIS RESET
-        # This prevents reset regression (car going backwards on track)
-        self._position_after_reset = None  # Will be set on first step after reset
-        self._stuck_start_time = None
-        
-        # Reset low-speed stuck detection
-        self._low_speed_start_time = None
-        
-        # Reset speed tracking
-        self._prev_speed = 0.0
+
+        self.srv.listen(1)
+        conn, addr = self.srv.accept()
+        print("Connected with ACReset")
+        time.sleep(1)
+        conn.sendall(b"RESET\n")
+        print("Sent reset command")
+        time.sleep(1)
         
         observation = self.getObservation()
         self._prev_norm_pos = self.graphics.normalizedCarPosition
