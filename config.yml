@@ -83,8 +83,8 @@ curriculum:
 # ===== RACING LINE REWARDS =====
 racing_line:
   enable: True                 # Enable/disable racing line distance rewards
-  track_name: 'monza'          # Track name (informational, from plugin)
+  track_name: 'monza'          # Track name used to find Racing Lines/{track}_racing_line.csv
   
   # Reward configuration
-  line_distance_weight: 5.0    # Weight for racing line distance reward
-  line_distance_threshold: 10.0  # Max distance to track in meters (becomes full penalty)
+  line_distance_weight: 1.0    # Multiplier weight (1.0 = full gap penalty, matches assetto_corsa_gym)
+  line_distance_threshold: 12.0  # Gap constant in meters (matches assetto_corsa_gym gap_const: 12)

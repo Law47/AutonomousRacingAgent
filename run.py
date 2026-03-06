@@ -1,11 +1,9 @@
-import os, sys, argparse, logging, copy, time, signal
+import os, sys, argparse, logging, time, signal
 from datetime import datetime
-from pathlib import Path
 from omegaconf import OmegaConf
 import torch
 import keyboard
 
-# Set wandb to offline mode before importing
 os.environ['WANDB_MODE'] = 'offline'
 
 from acEnv import ACEnv
@@ -15,7 +13,6 @@ from Model.discor.algorithm import SAC, DisCor
 from Model.discor.agent import Agent
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "Common"))
-import Common.logging_config as logging_config
 from Common.logger import Logger
 
 # Global agent for signal handler
@@ -26,23 +23,19 @@ def signal_handler(sig, frame):
     """Handle Ctrl+C gracefully"""
     global global_agent, global_logger
     if global_logger:
-        global_logger.info("\n\n=== TRAINING INTERRUPTED ===")
-        global_logger.info("Saving checkpoint...")
+        global_logger.info("\n=== TRAINING INTERRUPTED ===")
     if global_agent:
         try:
-            # Use the proper agent.save() method
-            import os
             log_dir = global_agent._log_dir if hasattr(global_agent, '_log_dir') else 'Outputs'
             checkpoint_path = os.path.join(log_dir, "checkpoint_interrupted")
             global_agent.save(checkpoint_path, save_buffer=False)
             if global_logger:
-                global_logger.info("Checkpoint saved to {}".format(checkpoint_path))
+                global_logger.info(f"Checkpoint saved to {checkpoint_path}")
         except Exception as e:
             if global_logger:
-                global_logger.error("Error saving checkpoint: {}".format(e))
+                global_logger.error(f"Error saving checkpoint: {e}")
     if global_logger:
-        global_logger.info("Training stopped. You can resume with: python run.py --load_path <checkpoint_path>")
-        global_logger.info("="*40)
+        global_logger.info("Resume with: python run.py --load_path <checkpoint_path>")
     sys.exit(0)
 
 def wait_for_start():
@@ -69,19 +62,15 @@ def main():
     # Register signal handler for Ctrl+C
     signal.signal(signal.SIGINT, signal_handler)
     #region parseArgs into config
-    parser = argparse.ArgumentParser(description="Description of your program.")
-    parser.add_argument("--inference", default=False, type=bool, help="Run inference instead of training")
+    parser = argparse.ArgumentParser(description="Autonomous Racing Agent Training")
     parser.add_argument("--config", default="config.yml", type=str, help="Path to configuration file")
-    parser.add_argument("--load_path", type=str, default=None, help="Path to load the model from (default: None)")
-    parser.add_argument("--algo", type=str, default="sac", help="Algorithm type (default: sac)")
-    parser.add_argument("--test", action="store_true")
-    parser.add_argument("overrides", nargs=argparse.REMAINDER, help="Any key=value arguments to override config values")
+    parser.add_argument("--load_path", type=str, default=None, help="Path to load the model from")
+    parser.add_argument("--algo", type=str, default="sac", help="Algorithm type (sac or discor)")
+    parser.add_argument("overrides", nargs=argparse.REMAINDER, help="key=value config overrides")
     
     args = parser.parse_args()
     if args.load_path is not None:
-        args.load_path = os.path.abspath(args.load_path)  # Don't add trailing separator
-    else:
-        args.load_path = None
+        args.load_path = os.path.abspath(args.load_path)
     
     # Load config.yml arguments first
     config = OmegaConf.load(args.config)
@@ -90,9 +79,9 @@ def main():
     cli_conf = OmegaConf.from_dotlist(args.overrides)
     config = OmegaConf.merge(config, cli_conf)
 
-    # Make a work directory if not specififed
+    # Make a work directory
     if config.work_dir is not None:
-        work_dir = os.path.abspath(args.work_dir) + os.sep + config.track + os.sep + config.car + os.sep
+        work_dir = os.path.abspath(config.work_dir)
         os.makedirs(work_dir, exist_ok=True)
     else:
         work_dir = "Outputs" + os.sep + datetime.now().strftime('%Y%m%d_%H%M%S.%f')[:-3]
@@ -180,6 +169,8 @@ def main():
     except KeyboardInterrupt:
         logger.info("Training interrupted by user")
         signal_handler(None, None)
+    finally:
+        env.shutdown()
     
 if __name__ == "__main__":
     main()

@@ -1,4 +1,3 @@
-# ACReset.py
 import socket
 import errno
 
@@ -7,31 +6,42 @@ class ACResetClient:
         self.host = host
         self.port = port
 
+        self._connected = False
+        self._rx_buf = bytearray()
+        self._create_socket()
+
+    def _create_socket(self):
+        """Create (or recreate) the non-blocking TCP socket."""
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setblocking(False)
 
-        self._connected = False
-        self._rx_buf = bytearray()
-
     def connect_nonblocking(self):
-        """Call once at init; then keep calling from update until connected."""
+        """Try to establish a connection without blocking.
+
+        On Windows a failed non-blocking connect leaves the socket in an
+        unusable state, so we recreate it before every new attempt.
+        """
         if self._connected:
             return True
 
         try:
-            # Non-blocking connect: usually raises immediately with EINPROGRESS
             self.sock.connect((self.host, self.port))
             self._connected = True
             return True
         except BlockingIOError:
-            # connect in progress
+            # connect in progress — will complete on a later tick
             return False
         except OSError as e:
-            # Already connected can show up as EISCONN on some platforms
             if e.errno == errno.EISCONN:
                 self._connected = True
                 return True
-            # Connection refused / not ready: swallow and retry later
+            # Connection refused / reset / other failure:
+            # On Windows the socket is now unusable, so recreate it.
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self._create_socket()
             return False
 
     def requestMessage(self):
@@ -49,8 +59,7 @@ class ACResetClient:
                     try:
                         self.sock.close()
                     finally:
-                        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        self.sock.setblocking(False)
+                        self._create_socket()
                     return "Empty"
 
                 self._rx_buf.extend(chunk)

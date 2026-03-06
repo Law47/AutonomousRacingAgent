@@ -122,6 +122,49 @@ class CurriculumScheduler:
         
         return float(np.clip(weight, 0.0, 1.0))
     
+    def get_low_speed_timeout_multiplier(self) -> float:
+        """
+        Get multiplier for low-speed stuck detection timeout.
+        
+        Starts high (4.0x) at the beginning of training to give the model
+        time to learn to move, then decays to 1.0x (normal timeout).
+        
+        Returns:
+            float: Multiplier for _low_speed_timeout (1.0 to 4.0)
+        """
+        if not self.enabled:
+            return 1.0
+        
+        # Calculate progress (0.0 to 1.0+)
+        progress = self.current_step / self.decay_steps
+        progress = np.clip(progress, 0.0, 1.0)
+        
+        # Decay from 2.0x to 1.0x using the same strategy as racing line
+        # e.g. base timeouts of 5s → 10s initially, 5s once fully decayed
+        initial_multiplier = 2.0
+        final_multiplier = 1.0
+        
+        if self.strategy == 'linear':
+            multiplier = initial_multiplier - (initial_multiplier - final_multiplier) * progress
+        
+        elif self.strategy == 'exponential':
+            multiplier = final_multiplier + (initial_multiplier - final_multiplier) * np.exp(-3.0 * progress)
+        
+        elif self.strategy == 'step':
+            if progress < 0.25:
+                multiplier = initial_multiplier
+            elif progress < 0.5:
+                multiplier = initial_multiplier * 0.75 + final_multiplier * 0.25
+            elif progress < 0.75:
+                multiplier = initial_multiplier * 0.5 + final_multiplier * 0.5
+            else:
+                multiplier = final_multiplier
+        
+        else:
+            multiplier = initial_multiplier - (initial_multiplier - final_multiplier) * progress
+        
+        return float(np.clip(multiplier, 1.0, 2.0))
+    
     def get_other_curriculum_weights(self) -> dict:
         """
         Get weights for other curriculum components (future use).
@@ -131,5 +174,5 @@ class CurriculumScheduler:
         """
         return {
             'racing_line': self.get_racing_line_weight(),
-            # Add other curriculum components here as needed
+            'low_speed_timeout_multiplier': self.get_low_speed_timeout_multiplier(),
         }
