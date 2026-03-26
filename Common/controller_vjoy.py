@@ -18,7 +18,6 @@ def clamp_controls(steer: float, accel: float, brake: float) -> Tuple[float, flo
 
 def convert_to_vjoy_axes(steer: float, accel: float, brake: float, scale: int = VJOY_SCALE) -> Tuple[int, int, int]:
     steer, accel, brake = clamp_controls(steer, accel, brake)
-
     steer_pos = int((steer + 1.0) * scale)
     accel_pos = int(accel * 2.0 * scale)
     brake_pos = int(brake * 2.0 * scale)

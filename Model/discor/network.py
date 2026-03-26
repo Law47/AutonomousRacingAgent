@@ -31,7 +31,6 @@ def create_linear_network(input_dim, output_dim, hidden_units=[],
 
 
 class BaseNetwork(nn.Module):
-
     def save(self, path):
         torch.save(self.state_dict(), path)
 
@@ -40,10 +39,8 @@ class BaseNetwork(nn.Module):
 
 
 class StateActionFunction(BaseNetwork):
-
     def __init__(self, state_dim, action_dim, hidden_units=[256, 256]):
         super().__init__()
-
         self.net = create_linear_network(
             input_dim=state_dim+action_dim,
             output_dim=1,
@@ -54,16 +51,13 @@ class StateActionFunction(BaseNetwork):
 
 
 class TwinnedStateActionFunction(BaseNetwork):
-
     def __init__(self, state_dim, action_dim, hidden_units=[256, 256]):
         super().__init__()
-
         self.net1 = StateActionFunction(state_dim, action_dim, hidden_units)
         self.net2 = StateActionFunction(state_dim, action_dim, hidden_units)
 
     def forward(self, states, actions):
         assert states.dim() == 2 and actions.dim() == 2
-
         x = torch.cat([states, actions], dim=1)
         value1 = self.net1(x)
         value2 = self.net2(x)
@@ -95,29 +89,20 @@ class GaussianPolicy(BaseNetwork):
 
         action_scale = (action_high - action_low) / 2.0
         action_bias = (action_high + action_low) / 2.0
-        self.register_buffer('_action_low', action_low)
-        self.register_buffer('_action_high', action_high)
         self.register_buffer('_action_scale', action_scale)
         self.register_buffer('_action_bias', action_bias)
 
     def forward(self, states):
         assert states.dim() == 2
-
-        # Calculate means and stds of actions.
         means, log_stds = torch.chunk(self.net(states), 2, dim=-1)
-        log_stds = torch.clamp(
-            log_stds, min=self.LOG_STD_MIN, max=self.LOG_STD_MAX)
+        log_stds = torch.clamp(log_stds, min=self.LOG_STD_MIN, max=self.LOG_STD_MAX)
         stds = log_stds.exp_()
 
-        # Gaussian distributions.
         normals = Normal(means, stds)
-
-        # Sample actions.
         xs = normals.rsample()
         raw_actions = torch.tanh(xs)
         actions = raw_actions * self._action_scale + self._action_bias
 
-        # Calculate entropies.
         log_probs = normals.log_prob(xs) - torch.log(1 - raw_actions.pow(2) + 1e-6)
         log_probs = log_probs - torch.log(self._action_scale + 1e-6)
         entropies = -log_probs.sum(dim=1, keepdim=True)

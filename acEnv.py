@@ -65,9 +65,7 @@ class ACEnv(Env, gym_utils.EzPickle):
         'numberOfTyresOut', 'normalizedCarPosition', 'finalFF',
     ]
 
-    track_feature_names = [
-        'line_gap', 'heading_error', 'forward_progress', 'off_track', 'target_speed'
-    ]
+    track_feature_names = ['line_gap', 'heading_error', 'forward_progress', 'off_track', 'target_speed']
 
     _field_mapping = {
         'FL': 0, 'FR': 1, 'RL': 2, 'RR': 3,
@@ -121,7 +119,6 @@ class ACEnv(Env, gym_utils.EzPickle):
         self._last_reset_time = None
         self._reset_cooldown = 2.0
         self._p_key_pressed = False
-        self._last_termination_reason = 'running'
         self._last_reward_breakdown = {}
         self._last_track_features = {}
         self._current_core_obs = np.zeros(self._base_obs_dim, dtype=np.float32)
@@ -134,11 +131,6 @@ class ACEnv(Env, gym_utils.EzPickle):
         self._low_speed_threshold = float(self.termination_cfg.get('low_speed_threshold_kmh', 5.0))
         self._low_speed_timeout = float(self.termination_cfg.get('low_speed_timeout_s', 5.0))
 
-        self.curriculum_scheduler = CurriculumScheduler(config, logger)
-        self.racing_line_manager = RacingLineManager(config, logger)
-        self.controller = VJoyController(device_id=int(self.controller_cfg.get('device_id', 1)))
-        self.controller.neutral()
-
         self._reset_host = '127.0.0.1'
         self._reset_port = 65432
         self._reset_client_sock = None
@@ -146,6 +138,11 @@ class ACEnv(Env, gym_utils.EzPickle):
         self._reset_server_sock = None
         self._reset_server_thread = None
         self._start_reset_server()
+
+        self.curriculum_scheduler = CurriculumScheduler(config, logger)
+        self.racing_line_manager = RacingLineManager(config, logger)
+        self.controller = VJoyController(device_id=int(self.controller_cfg.get('device_id', 1)))
+        self.controller.neutral()
 
         self.logger.info(f"Action dim={self.action_dim}  Obs dim={self.state_dim}")
         self.connect()
@@ -231,20 +228,12 @@ class ACEnv(Env, gym_utils.EzPickle):
         return None
 
     def connect(self) -> None:
-        try:
-            self.physicsMMAP = mmap.mmap(0, ctypes.sizeof(SPageFilePhysics), 'acpmf_physics')
-            self.physicsConnected = True
-            self.logger.info("Connected to physics shared memory")
-        except Exception as exc:
-            self.logger.info(f"Could not connect to physics shared memory: {exc}")
-            raise
-        try:
-            self.graphicsMMAP = mmap.mmap(0, ctypes.sizeof(SPageFileGraphic), 'acpmf_graphics')
-            self.graphicsConnected = True
-            self.logger.info("Connected to graphics shared memory")
-        except Exception as exc:
-            self.logger.info(f"Could not connect to graphics shared memory: {exc}")
-            raise
+        self.physicsMMAP = mmap.mmap(0, ctypes.sizeof(SPageFilePhysics), 'acpmf_physics')
+        self.physicsConnected = True
+        self.logger.info("Connected to physics shared memory")
+        self.graphicsMMAP = mmap.mmap(0, ctypes.sizeof(SPageFileGraphic), 'acpmf_graphics')
+        self.graphicsConnected = True
+        self.logger.info("Connected to graphics shared memory")
 
     def _read_shared_memory(self) -> bool:
         try:
@@ -262,8 +251,7 @@ class ACEnv(Env, gym_utils.EzPickle):
         scale = float(self.raw_observation_info.get(feature_name, 1.0))
         if scale == 0.0:
             return 0.0
-        normalized = float(value) / scale
-        return safe_clip(normalized, -5.0, 5.0)
+        return safe_clip(float(value) / scale, -5.0, 5.0)
 
     def _get_track_position(self) -> tuple[float, float, float]:
         coordinates = self.graphics.carCoordinates
@@ -311,17 +299,14 @@ class ACEnv(Env, gym_utils.EzPickle):
 
     def _compose_observation(self, current_core_obs: np.ndarray) -> np.ndarray:
         chunks = [current_core_obs]
-
         if self._include_previous_obs:
-            padded_history = [np.zeros(self._base_obs_dim, dtype=np.float32)] * (self._history_length - len(self._core_obs_history))
+            padded_history = [np.zeros(self._base_obs_dim, dtype=np.float32) for _ in range(self._history_length - len(self._core_obs_history))]
             padded_history.extend(list(self._core_obs_history))
-            chunks.append(np.concatenate(padded_history, dtype=np.float32))
-
+            chunks.append(np.concatenate(padded_history).astype(np.float32))
         if self._include_previous_actions:
-            padded_actions = [np.zeros(self.action_dim, dtype=np.float32)] * (self._history_length - len(self._action_history))
+            padded_actions = [np.zeros(self.action_dim, dtype=np.float32) for _ in range(self._history_length - len(self._action_history))]
             padded_actions.extend(list(self._action_history))
-            chunks.append(np.concatenate(padded_actions, dtype=np.float32))
-
+            chunks.append(np.concatenate(padded_actions).astype(np.float32))
         observation = np.concatenate(chunks).astype(np.float32)
         if observation.shape[0] != self.state_dim:
             raise ValueError(f"Observation shape mismatch: expected {self.state_dim}, got {observation.shape[0]}")
@@ -422,7 +407,6 @@ class ACEnv(Env, gym_utils.EzPickle):
             self.logger.warning("Timeout waiting for next physics packet")
 
         terminated, truncated, reason = self._check_termination()
-        self._last_termination_reason = reason
         reward = self.getReward(terminated=terminated, truncated=truncated, termination_reason=reason)
 
         if self._safe_keyboard_pressed('p'):
@@ -488,7 +472,6 @@ class ACEnv(Env, gym_utils.EzPickle):
         self._position_after_reset = None
         self._stuck_start_time = None
         self._low_speed_start_time = None
-        self._last_termination_reason = 'running'
         self._prev_norm_pos = None
         self._core_obs_history.clear()
         self._action_history.clear()

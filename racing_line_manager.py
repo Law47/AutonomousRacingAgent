@@ -41,7 +41,6 @@ class RacingLineManager:
         self.segment_lengths = None
         self.cumulative_lengths = None
         self.total_length = 0.0
-        self.mean_segment_length = 1.0
 
         if self.enabled:
             self._load_racing_line_from_csv()
@@ -49,8 +48,8 @@ class RacingLineManager:
     def _load_racing_line_from_csv(self) -> bool:
         try:
             current_dir = os.path.dirname(os.path.abspath(__file__))
-            racing_lines_dir = os.path.join(current_dir, "Racing Lines")
-            csv_file = os.path.join(racing_lines_dir, f"{self.track_name}_racing_line.csv")
+            racing_lines_dir = os.path.join(current_dir, 'Racing Lines')
+            csv_file = os.path.join(racing_lines_dir, f'{self.track_name}_racing_line.csv')
 
             if not os.path.exists(csv_file):
                 self.logger.warning(f"[RACING_LINE] CSV file not found: {csv_file}")
@@ -65,7 +64,6 @@ class RacingLineManager:
 
             diffs = np.roll(self.racing_line_points, -1, axis=0) - self.racing_line_points
             self.segment_lengths = np.linalg.norm(diffs, axis=1)
-            self.mean_segment_length = float(np.clip(np.mean(self.segment_lengths), 0.1, None))
             self.cumulative_lengths = np.concatenate([[0.0], np.cumsum(self.segment_lengths[:-1])]).astype(np.float32)
             self.total_length = float(np.sum(self.segment_lengths))
 
@@ -159,9 +157,7 @@ class RacingLineManager:
     def get_line_visualization_points(self, max_points: int = 100):
         if not self.racing_line_loaded or self.racing_line_points is None:
             return []
-
         if len(self.racing_line_points) <= max_points:
             return self.racing_line_points.tolist()
-
         indices = np.linspace(0, len(self.racing_line_points) - 1, max_points, dtype=int)
         return self.racing_line_points[indices].tolist()

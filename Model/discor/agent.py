@@ -100,27 +100,19 @@ class Agent:
 
     @staticmethod
     def _safe_mean(values):
-        if not values:
-            return 0.0
-        return float(np.mean(values))
+        return float(np.mean(values)) if values else 0.0
 
     @staticmethod
     def _safe_max(values):
-        if not values:
-            return 0.0
-        return float(np.max(values))
+        return float(np.max(values)) if values else 0.0
 
     @staticmethod
     def _safe_std(values):
-        if not values:
-            return 0.0
-        return float(np.std(values))
+        return float(np.std(values)) if values else 0.0
 
     @staticmethod
     def _safe_q99(values):
-        if not values:
-            return 0.0
-        return float(np.quantile(np.asarray(values), 0.99))
+        return float(np.quantile(np.asarray(values), 0.99)) if values else 0.0
 
     def train_episode(self):
         self._episodes += 1
@@ -156,16 +148,13 @@ class Agent:
                 step_perf.append(time.perf_counter() - step_start_time)
                 step_start_time = time.perf_counter()
 
-                masked_done = bool(terminated)
-                replay_episode_done = bool(done)
-
                 self._replay_buffer.append(
                     state,
                     action,
                     reward,
                     next_state,
-                    terminated=masked_done,
-                    episode_done=replay_episode_done,
+                    terminated=bool(terminated),
+                    episode_done=bool(done),
                 )
 
                 self._steps += 1
@@ -210,12 +199,13 @@ class Agent:
             metrics.update(train_stats)
 
         if self.logger:
+            duration = max(time.time() - ep_start_time, 1e-6)
             self.logger.info(
                 "Episode done. Took %.2fs. Steps per episode: %s. Buffer size: %s fps: %.2f",
-                time.time() - ep_start_time,
+                duration,
                 episode_steps,
                 len(self._replay_buffer),
-                episode_steps / max(time.time() - ep_start_time, 1e-6),
+                episode_steps / duration,
             )
         if self.wandb_logger:
             self.wandb_logger.log(metrics, 'episodes')
@@ -250,7 +240,6 @@ class Agent:
             self._best_eval_score = mean_return
             self._algo.save_models(os.path.join(self._model_dir, 'best'))
         self._writer.add_scalar('reward/test', mean_return, self._steps)
-
         if self.logger:
             self.logger.info("Evaluation mean return: %.3f", mean_return)
 
