@@ -74,13 +74,31 @@ class GaussianPolicy(BaseNetwork):
     LOG_STD_MAX = 2
     LOG_STD_MIN = -20
 
-    def __init__(self, state_dim, action_dim, hidden_units=[256, 256]):
+    def __init__(self, state_dim, action_dim, hidden_units=[256, 256],
+                 action_low=None, action_high=None):
         super().__init__()
 
         self.net = create_linear_network(
             input_dim=state_dim,
             output_dim=2*action_dim,
             hidden_units=hidden_units)
+
+        if action_low is None:
+            action_low = -torch.ones(action_dim, dtype=torch.float32)
+        else:
+            action_low = torch.as_tensor(action_low, dtype=torch.float32)
+
+        if action_high is None:
+            action_high = torch.ones(action_dim, dtype=torch.float32)
+        else:
+            action_high = torch.as_tensor(action_high, dtype=torch.float32)
+
+        action_scale = (action_high - action_low) / 2.0
+        action_bias = (action_high + action_low) / 2.0
+        self.register_buffer('_action_low', action_low)
+        self.register_buffer('_action_high', action_high)
+        self.register_buffer('_action_scale', action_scale)
+        self.register_buffer('_action_bias', action_bias)
 
     def forward(self, states):
         assert states.dim() == 2
@@ -96,10 +114,13 @@ class GaussianPolicy(BaseNetwork):
 
         # Sample actions.
         xs = normals.rsample()
-        actions = torch.tanh(xs)
+        raw_actions = torch.tanh(xs)
+        actions = raw_actions * self._action_scale + self._action_bias
 
         # Calculate entropies.
-        log_probs = normals.log_prob(xs) - torch.log(1 - actions.pow(2) + 1e-6)
+        log_probs = normals.log_prob(xs) - torch.log(1 - raw_actions.pow(2) + 1e-6)
+        log_probs = log_probs - torch.log(self._action_scale + 1e-6)
         entropies = -log_probs.sum(dim=1, keepdim=True)
 
-        return actions, entropies, torch.tanh(means)
+        deterministic_actions = torch.tanh(means) * self._action_scale + self._action_bias
+        return actions, entropies, deterministic_actions

@@ -1,103 +1,74 @@
-from typing import Optional
+from __future__ import annotations
+
+from collections import deque
 from logging import Logger
-from omegaconf import OmegaConf
-from gymnasium import Env
-from gymnasium.spaces import Box
-from gymnasium import utils as gym_utils
-import numpy as np
+from typing import Optional
+
 import ctypes
+import keyboard
 import mmap
-import time
-import os
+import numpy as np
 import socket
 import threading
-import keyboard
-import vgamepad as vg
-from sharedMemoryStructs import SPageFilePhysics, SPageFileGraphic
+import time
+from gymnasium import Env
+from gymnasium import utils as gym_utils
+from gymnasium.spaces import Box
+from omegaconf import OmegaConf
+
+from Common.controller_vjoy import VJoyController
 from curriculum_scheduler import CurriculumScheduler
 from racing_line_manager import RacingLineManager
+from sharedMemoryStructs import SPageFileGraphic, SPageFilePhysics
+
 
 TOP_SPEED_MS = 80
-MAX_EPISODE_STEPS = 5000  # ~200 seconds at 25Hz, prevents hour-long episodes
+MAX_EPISODE_STEPS = 5000
+
+
+def safe_clip(value: float, minimum: float, maximum: float) -> float:
+    return float(np.clip(value, minimum, maximum))
+
 
 class ACEnv(Env, gym_utils.EzPickle):
-    observation_info = {
+    raw_observation_info = {
         'gas': 1.0,
         'brake': 1.0,
-        'gear': 6.,
-        'rpms': 10000.,
-        'steerAngle': 450,
+        'gear': 6.0,
+        'rpms': 10000.0,
+        'steerAngle': np.pi,
         'speedKmh': TOP_SPEED_MS * 3.6,
         'velocityX': TOP_SPEED_MS,
-        'velocityY': 20.,
-        'velocityZ': 5.,
-        'accGX': 5.,
-        'accGY': 5.,
-        'accGZ': 5.,
+        'velocityY': 20.0,
+        'velocityZ': 5.0,
+        'accGX': 5.0,
+        'accGY': 5.0,
+        'accGZ': 5.0,
         'wheelSlipFL': 1.0,
         'wheelSlipFR': 1.0,
         'wheelSlipRL': 1.0,
         'wheelSlipRR': 1.0,
-        'wheelLoadFL': 10000.,
-        'wheelLoadFR': 10000.,
-        'wheelLoadRL': 10000.,
-        'wheelLoadRR': 10000.,
-        'wheelsPressureFL': 30.,
-        'wheelsPressureFR': 30.,
-        'wheelsPressureRL': 30.,
-        'wheelsPressureRR': 30.,
-        'wheelAngularSpeedFL': TOP_SPEED_MS / 3.6,
-        'wheelAngularSpeedFR': TOP_SPEED_MS / 3.6,
-        'wheelAngularSpeedRL': TOP_SPEED_MS / 3.6,
-        'wheelAngularSpeedRR': TOP_SPEED_MS / 3.6,
-        'tyreCoreTemperatureFL': 100.,
-        'tyreCoreTemperatureFR': 100.,
-        'tyreCoreTemperatureRL': 100.,
-        'tyreCoreTemperatureRR': 100.,
-        'camberRADFL': 0.5,
-        'camberRADFR': 0.5,
-        'camberRADRL': 0.5,
-        'camberRADRR': 0.5,
-        'suspensionTravelFL': 0.1,
-        'suspensionTravelFR': 0.1,
-        'suspensionTravelRL': 0.1,
-        'suspensionTravelRR': 0.1,
-        'heading': 2 * np.pi,
-        'pitch': np.pi / 2,
-        'roll': np.pi / 2,
-        'cgHeight': 0.5,
-        'numberOfTyresOut': 4.,
-        'rideHeightFront': 0.1,
-        'rideHeightRear': 0.1,
         'localAngularVelX': np.pi,
         'localAngularVelY': np.pi,
         'localAngularVelZ': np.pi,
+        'numberOfTyresOut': 4.0,
         'normalizedCarPosition': 1.0,
-        'carCoordinatesX': 5000.,
-        'carCoordinatesY': 5000.,
-        'carCoordinatesZ': 500.,
+        'finalFF': 1.0,
     }
 
-    observation_inputs = [
+    raw_observation_inputs = [
         'gas', 'brake', 'gear', 'rpms', 'steerAngle', 'speedKmh',
         'velocityX', 'velocityY', 'velocityZ',
         'accGX', 'accGY', 'accGZ',
         'wheelSlipFL', 'wheelSlipFR', 'wheelSlipRL', 'wheelSlipRR',
-        'wheelLoadFL', 'wheelLoadFR', 'wheelLoadRL', 'wheelLoadRR',
-        'wheelsPressureFL', 'wheelsPressureFR', 'wheelsPressureRL', 'wheelsPressureRR',
-        'wheelAngularSpeedFL', 'wheelAngularSpeedFR', 'wheelAngularSpeedRL', 'wheelAngularSpeedRR',
-        'tyreCoreTemperatureFL', 'tyreCoreTemperatureFR', 'tyreCoreTemperatureRL', 'tyreCoreTemperatureRR',
-        'camberRADFL', 'camberRADFR', 'camberRADRL', 'camberRADRR',
-        'suspensionTravelFL', 'suspensionTravelFR', 'suspensionTravelRL', 'suspensionTravelRR',
-        'heading', 'pitch', 'roll', 'cgHeight',
-        'numberOfTyresOut',
-        'rideHeightFront', 'rideHeightRear',
         'localAngularVelX', 'localAngularVelY', 'localAngularVelZ',
-        'normalizedCarPosition',
-        'carCoordinatesX', 'carCoordinatesY', 'carCoordinatesZ',
+        'numberOfTyresOut', 'normalizedCarPosition', 'finalFF',
     ]
 
-    # Suffix-to-index mapping for array fields (class-level constant)
+    track_feature_names = [
+        'line_gap', 'heading_error', 'forward_progress', 'off_track', 'target_speed'
+    ]
+
     _field_mapping = {
         'FL': 0, 'FR': 1, 'RL': 2, 'RR': 3,
         'X': 0, 'Y': 1, 'Z': 2,
@@ -106,18 +77,34 @@ class ACEnv(Env, gym_utils.EzPickle):
     def __init__(self, config: OmegaConf, logger: Logger):
         self.config = config
         self.logger = logger
-
         self._max_episode_steps = MAX_EPISODE_STEPS
+        self.is_metaworld = False
 
-        self.action_dim = 2
-        self.action_space = Box(low=np.array([-1.0, -1.0]), high=np.array([1.0, 1.0]), dtype=np.float32)
+        self.assetto_cfg = config.AssettoCorsa
+        self.obs_cfg = config.get('observation', {})
+        self.reward_cfg = config.get('reward', {})
+        self.termination_cfg = config.get('termination', {})
+        self.controller_cfg = config.get('controller', {})
 
-        self.state_dim = len(self.observation_inputs)
+        self._history_length = int(self.obs_cfg.get('history_length', 3))
+        self._include_previous_obs = bool(self.assetto_cfg.get('add_previous_obs_to_state', True))
+        self._include_previous_actions = bool(self.obs_cfg.get('include_previous_actions', True))
+        self._include_track_relative_features = bool(self.obs_cfg.get('include_track_relative_features', True))
+        self._curvature_points = int(self.obs_cfg.get('curvature_lookahead_points', 12))
+
+        action_low = np.array([-1.0, 0.0, 0.0], dtype=np.float32)
+        action_high = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+        self.action_dim = 3
+        self.action_space = Box(low=action_low, high=action_high, dtype=np.float32)
+
+        self._base_obs_dim = len(self.raw_observation_inputs) + len(self.track_feature_names) + self._curvature_points
+        self.state_dim = self._base_obs_dim
+        if self._include_previous_obs:
+            self.state_dim += self._history_length * self._base_obs_dim
+        if self._include_previous_actions:
+            self.state_dim += self._history_length * self.action_dim
         self.observation_space = Box(low=-np.inf, high=np.inf, shape=(self.state_dim,), dtype=np.float32)
 
-        self.logger.info(f"Action dim={self.action_dim}  Obs dim={self.state_dim}")
-
-        # Shared memory handles
         self.physicsMMAP = None
         self.physics = None
         self.physicsConnected = False
@@ -125,107 +112,62 @@ class ACEnv(Env, gym_utils.EzPickle):
         self.graphics = None
         self.graphicsConnected = False
 
-        self.state = {"packetID": 0}
-
-        # Last applied actions (for reward calculation)
-        self._last_gas = 0.0
-        self._last_brake = 0.0
-        self._last_steer = 0.0
-
-        # Progress tracking
+        self.state = {'packetID': 0}
+        self._episode_step = 0
         self._prev_norm_pos = None
-
-        # Stuck detection: distance from reset position
         self._position_after_reset = None
         self._stuck_start_time = None
-        self._stuck_threshold = 2.0   # meters
-        self._stuck_timeout = 5.0     # seconds (scaled by curriculum multiplier)
-
-        # Low-speed stuck detection
         self._low_speed_start_time = None
-        self._low_speed_threshold = 5.0   # km/h
-        self._low_speed_timeout = 5.0     # seconds (scaled by curriculum multiplier)
-
-        # Extreme slip flag (set by getReward)
-        self._extreme_slip_detected = False
-
-        # Reset cooldown
         self._last_reset_time = None
-        self._reset_cooldown = 2.0  # seconds
-        
-        # Initialize curriculum learning
+        self._reset_cooldown = 2.0
+        self._p_key_pressed = False
+        self._last_termination_reason = 'running'
+        self._last_reward_breakdown = {}
+        self._last_track_features = {}
+        self._current_core_obs = np.zeros(self._base_obs_dim, dtype=np.float32)
+        self._core_obs_history = deque(maxlen=self._history_length)
+        self._action_history = deque(maxlen=self._history_length)
+        self._last_applied_action = np.zeros(self.action_dim, dtype=np.float32)
+
+        self._stuck_threshold = float(self.termination_cfg.get('stuck_distance_threshold_m', 2.0))
+        self._stuck_timeout = float(self.termination_cfg.get('stuck_timeout_s', 5.0))
+        self._low_speed_threshold = float(self.termination_cfg.get('low_speed_threshold_kmh', 5.0))
+        self._low_speed_timeout = float(self.termination_cfg.get('low_speed_timeout_s', 5.0))
+
         self.curriculum_scheduler = CurriculumScheduler(config, logger)
-        
-        # Initialize racing line manager
         self.racing_line_manager = RacingLineManager(config, logger)
-        
-        # Initialize virtual Xbox 360 controller
-        self.gamepad = vg.VX360Gamepad()
-        self.logger.info("Virtual Xbox 360 controller initialized")
-        
-        # Set controller to neutral state
-        try:
-            self.gamepad.left_joystick_float(x_value_float=0.0, y_value_float=0.0)
-            self.gamepad.right_trigger_float(value_float=0.0)
-            self.gamepad.left_trigger_float(value_float=0.0)
-            self.gamepad.update()
-            self.logger.info("Controller set to neutral state")
-        except Exception as e:
-            self.logger.warning(f"Could not initialize controller state: {e}")
-        
-        # ===== ACReset Plugin Socket Server =====
-        # The ACReset plugin (running inside AC) connects to this server as a TCP client.
-        # When we need to reset, we send "RESET\n" over the socket and the plugin
-        # calls ac.ext_resetCar().
-        self._reset_host = "127.0.0.1"
+        self.controller = VJoyController(device_id=int(self.controller_cfg.get('device_id', 1)))
+        self.controller.neutral()
+
+        self._reset_host = '127.0.0.1'
         self._reset_port = 65432
-        self._reset_client_sock = None       # connected ACReset plugin socket
+        self._reset_client_sock = None
         self._reset_client_lock = threading.Lock()
         self._reset_server_sock = None
         self._reset_server_thread = None
         self._start_reset_server()
-        
-        # Debug key debounce
-        self._p_key_pressed = False
-        
+
+        self.logger.info(f"Action dim={self.action_dim}  Obs dim={self.state_dim}")
         self.connect()
 
-    # ---------- ACReset socket server ----------
     def _start_reset_server(self):
-        """Start a TCP server that the ACReset plugin connects to.
-        
-        The ACReset plugin (ACResetClient) connects to 127.0.0.1:65432 as a
-        non-blocking TCP client and polls for newline-delimited commands.
-        When it receives 'RESET', it calls ac.ext_resetCar().
-        """
         try:
             self._reset_server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._reset_server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self._reset_server_sock.bind((self._reset_host, self._reset_port))
             self._reset_server_sock.listen(1)
-            self._reset_server_sock.settimeout(1.0)  # allow periodic shutdown checks
-
-            self._reset_server_thread = threading.Thread(
-                target=self._reset_server_loop, daemon=True
-            )
+            self._reset_server_sock.settimeout(1.0)
+            self._reset_server_thread = threading.Thread(target=self._reset_server_loop, daemon=True)
             self._reset_server_thread.start()
-            self.logger.info(
-                f"ACReset server listening on {self._reset_host}:{self._reset_port}"
-            )
-        except Exception as e:
-            self.logger.error(f"Failed to start ACReset server: {e}")
+            self.logger.info(f"ACReset server listening on {self._reset_host}:{self._reset_port}")
+        except Exception as exc:
+            self.logger.error(f"Failed to start ACReset server: {exc}")
 
     def _reset_server_loop(self):
-        """Accept loop running in a daemon thread.
-        
-        Accepts one client at a time (the ACReset plugin).  If the plugin
-        disconnects and reconnects, the new connection replaces the old one.
-        """
         while True:
             try:
                 client_sock, addr = self._reset_server_sock.accept()
                 with self._reset_client_lock:
-                    # Close any previous connection
                     if self._reset_client_sock is not None:
                         try:
                             self._reset_client_sock.close()
@@ -236,16 +178,9 @@ class ACEnv(Env, gym_utils.EzPickle):
             except socket.timeout:
                 continue
             except OSError:
-                # Server socket closed (during shutdown)
                 break
 
     def _send_reset_command(self, retries: int = 10, retry_interval: float = 0.5) -> bool:
-        """Send 'RESET\\n' to the connected ACReset plugin.
-        
-        Retries up to `retries` times (default 10 = 5 seconds) in case the
-        plugin hasn't connected yet.
-        Returns True if the command was sent successfully.
-        """
         for attempt in range(retries):
             with self._reset_client_lock:
                 if self._reset_client_sock is not None:
@@ -253,428 +188,367 @@ class ACEnv(Env, gym_utils.EzPickle):
                         self._reset_client_sock.sendall(b"RESET\n")
                         self.logger.info("Sent RESET command to ACReset plugin")
                         return True
-                    except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                        self.logger.warning(f"ACReset plugin connection lost: {e}")
+                    except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+                        self.logger.warning(f"ACReset plugin connection lost: {exc}")
                         try:
                             self._reset_client_sock.close()
                         except Exception:
                             pass
                         self._reset_client_sock = None
-
-            # Plugin not connected - wait and retry
             if attempt < retries - 1:
-                self.logger.debug(
-                    f"ACReset plugin not connected, retrying in {retry_interval}s "
-                    f"(attempt {attempt + 1}/{retries})"
-                )
                 time.sleep(retry_interval)
-
-        self.logger.warning(
-            "ACReset plugin did not connect after {:.1f}s. "
-            "Make sure the ACReset app is enabled in Assetto Corsa.".format(
-                retries * retry_interval
-            )
-        )
+        self.logger.warning("ACReset plugin did not connect after %.1fs", retries * retry_interval)
         return False
 
-    # algo wants this
     def seed(self, seed=None):
-        pass
+        if seed is not None:
+            np.random.seed(seed)
 
     def extractFieldValue(self, field_name: str, field_mapping: dict):
-        """Extract field value from physics/graphics using suffix-based indexing"""
-        # Check physics array fields with wheel suffixes
         wheel_suffixes = ['FL', 'FR', 'RL', 'RR']
         vector_suffixes = ['X', 'Y', 'Z']
-        
+
         for suffix in wheel_suffixes:
             if field_name.endswith(suffix):
                 idx = field_mapping[suffix]
                 base_name = field_name[:-len(suffix)]
                 if hasattr(self.physics, base_name):
                     return getattr(self.physics, base_name)[idx]
-        
+
         for suffix in vector_suffixes:
             if field_name.endswith(suffix):
                 idx = field_mapping[suffix]
                 base_name = field_name[:-len(suffix)]
-                # Try physics first
                 if hasattr(self.physics, base_name):
                     return getattr(self.physics, base_name)[idx]
-                # Then try graphics
                 if hasattr(self.graphics, base_name):
                     return getattr(self.graphics, base_name)[idx]
-        
-        # Handle special cases like rideHeightFront/Rear
-        if field_name.startswith('rideHeight'):
-            idx = 0 if 'Front' in field_name else 1
-            return self.physics.rideHeight[idx]
-        
-        # Try graphics fields
+
+        if hasattr(self.physics, field_name):
+            return getattr(self.physics, field_name)
         if hasattr(self.graphics, field_name):
             return getattr(self.graphics, field_name)
-        
         return None
 
     def connect(self) -> None:
-        """Connect to AC shared memory buffers."""
         try:
-            self.physicsMMAP = mmap.mmap(0, ctypes.sizeof(SPageFilePhysics), "acpmf_physics")
-            self.logger.info("Connected to physics shared memory")
+            self.physicsMMAP = mmap.mmap(0, ctypes.sizeof(SPageFilePhysics), 'acpmf_physics')
             self.physicsConnected = True
-        except Exception as e:
-            self.logger.info(f"Could not connect to physics shared memory: {e}")
+            self.logger.info("Connected to physics shared memory")
+        except Exception as exc:
+            self.logger.info(f"Could not connect to physics shared memory: {exc}")
             raise
         try:
-            self.graphicsMMAP = mmap.mmap(0, ctypes.sizeof(SPageFileGraphic), "acpmf_graphics")
-            self.logger.info("Connected to graphics shared memory")
+            self.graphicsMMAP = mmap.mmap(0, ctypes.sizeof(SPageFileGraphic), 'acpmf_graphics')
             self.graphicsConnected = True
-        except Exception as e:
-            self.logger.info(f"Could not connect to graphics shared memory: {e}")
+            self.logger.info("Connected to graphics shared memory")
+        except Exception as exc:
+            self.logger.info(f"Could not connect to graphics shared memory: {exc}")
             raise
 
-    def getObservation(self) -> np.ndarray:
+    def _read_shared_memory(self) -> bool:
         try:
             self.physics = SPageFilePhysics.from_buffer_copy(self.physicsMMAP)
             self.graphics = SPageFileGraphic.from_buffer_copy(self.graphicsMMAP)
-        except Exception as e:
-            self.logger.error(f"Failed to read shared memory: {e}")
-            return np.zeros(self.state_dim, dtype=np.float32)
+            return True
+        except Exception as exc:
+            self.logger.error(f"Failed to read shared memory: {exc}")
+            return False
 
-        self.state["packetID"] = self.physics.packetId
-        self.state["tyresOut"] = self.physics.numberOfTyresOut
-        self.state["speed"] = self.physics.speedKmh
+    def _normalize_raw_feature(self, feature_name: str) -> float:
+        value = self.extractFieldValue(feature_name, self._field_mapping)
+        if value is None:
+            return 0.0
+        scale = float(self.raw_observation_info.get(feature_name, 1.0))
+        if scale == 0.0:
+            return 0.0
+        normalized = float(value) / scale
+        return safe_clip(normalized, -5.0, 5.0)
 
-        observation = np.empty(self.state_dim, dtype=np.float32)
-        for i, input_name in enumerate(self.observation_inputs):
-            try:
-                if hasattr(self.physics, input_name):
-                    value = getattr(self.physics, input_name)
-                else:
-                    value = self.extractFieldValue(input_name, self._field_mapping)
+    def _get_track_position(self) -> tuple[float, float, float]:
+        coordinates = self.graphics.carCoordinates
+        return float(coordinates[2]), float(coordinates[0]), float(coordinates[1])
 
-                if value is not None and input_name in self.observation_info:
-                    max_val = self.observation_info[input_name]
-                    observation[i] = float(value) / max_val if max_val != 0 else 0.0
-                else:
-                    observation[i] = 0.0
-            except Exception as e:
-                self.logger.warning(f"Could not extract {input_name}: {e}")
-                observation[i] = 0.0
+    def _compute_track_features(self) -> tuple[np.ndarray, dict]:
+        if not self._include_track_relative_features:
+            zeros = np.zeros(len(self.track_feature_names) + self._curvature_points, dtype=np.float32)
+            return zeros, {
+                'distance': 0.0,
+                'signed_distance': 0.0,
+                'heading_error': 0.0,
+                'lookahead_curvature': np.zeros(self._curvature_points, dtype=np.float32),
+                'target_speed': 0.0,
+            }
 
+        car_pos = self._get_track_position()
+        heading = float(self.physics.heading)
+        track_features = self.racing_line_manager.get_track_features(car_pos, heading=heading)
+        signed_distance = float(track_features['signed_distance'])
+        heading_error = float(track_features['heading_error'])
+        speed_ms = max(float(self.physics.speedKmh) / 3.6, 0.0)
+        forward_progress = speed_ms * np.cos(heading_error) / TOP_SPEED_MS
+        off_track = 1.0 if int(self.physics.numberOfTyresOut) >= 3 else 0.0
+        target_speed = float(track_features.get('target_speed', 0.0)) / (TOP_SPEED_MS * 3.6)
+
+        scalar_features = np.array([
+            safe_clip(signed_distance / max(self.racing_line_manager.line_distance_threshold, 1e-6), -2.0, 2.0),
+            safe_clip(heading_error / np.pi, -1.0, 1.0),
+            safe_clip(forward_progress, -2.0, 2.0),
+            off_track,
+            safe_clip(target_speed, 0.0, 2.0),
+        ], dtype=np.float32)
+        lookahead = np.asarray(track_features['lookahead_curvature'], dtype=np.float32)
+        return np.concatenate([scalar_features, lookahead]).astype(np.float32), track_features
+
+    def _build_core_observation(self) -> np.ndarray:
+        raw_features = np.array([
+            self._normalize_raw_feature(feature_name)
+            for feature_name in self.raw_observation_inputs
+        ], dtype=np.float32)
+        derived_features, track_features = self._compute_track_features()
+        self._last_track_features = track_features
+        return np.concatenate([raw_features, derived_features]).astype(np.float32)
+
+    def _compose_observation(self, current_core_obs: np.ndarray) -> np.ndarray:
+        chunks = [current_core_obs]
+
+        if self._include_previous_obs:
+            padded_history = [np.zeros(self._base_obs_dim, dtype=np.float32)] * (self._history_length - len(self._core_obs_history))
+            padded_history.extend(list(self._core_obs_history))
+            chunks.append(np.concatenate(padded_history, dtype=np.float32))
+
+        if self._include_previous_actions:
+            padded_actions = [np.zeros(self.action_dim, dtype=np.float32)] * (self._history_length - len(self._action_history))
+            padded_actions.extend(list(self._action_history))
+            chunks.append(np.concatenate(padded_actions, dtype=np.float32))
+
+        observation = np.concatenate(chunks).astype(np.float32)
+        if observation.shape[0] != self.state_dim:
+            raise ValueError(f"Observation shape mismatch: expected {self.state_dim}, got {observation.shape[0]}")
         return observation
-    
+
+    def _update_state_metadata(self):
+        self.state['packetID'] = int(self.physics.packetId)
+        self.state['tyresOut'] = int(self.physics.numberOfTyresOut)
+        self.state['speed'] = float(self.physics.speedKmh)
+        self.state['normalizedCarPosition'] = float(self.graphics.normalizedCarPosition)
+        self.state['line_gap'] = float(self._last_track_features.get('signed_distance', 0.0))
+        self.state['heading_error'] = float(self._last_track_features.get('heading_error', 0.0))
+        heading_error = float(self._last_track_features.get('heading_error', 0.0))
+        speed_ms = max(float(self.physics.speedKmh) / 3.6, 0.0)
+        self.state['forward_progress'] = float(speed_ms * np.cos(heading_error))
+        self.state['off_track'] = bool(int(self.physics.numberOfTyresOut) >= 3)
+
+    def getObservation(self) -> np.ndarray:
+        if not self._read_shared_memory():
+            return np.zeros(self.state_dim, dtype=np.float32)
+        self._current_core_obs = self._build_core_observation()
+        self._update_state_metadata()
+        return self._compose_observation(self._current_core_obs)
+
     def getInfo(self) -> dict:
-        return self.state
+        return dict(self.state)
 
-    #Await response from asseto corsa and collects current game state info
-    #Returns observation, reward, terminated, truncated, info
-    def step(self, action: np.ndarray) -> tuple[np.ndarray, np.ndarray, bool, bool, dict]:
-        if not self.physicsConnected or not self.graphicsConnected:
-            self.connect()
-            return self.step(action)
+    def _safe_keyboard_pressed(self, key: str) -> bool:
+        try:
+            return keyboard.is_pressed(key)
+        except Exception:
+            return False
 
-        self.curriculum_scheduler.step()
-
-        if action is not None:
-            self.set_actions(action)
-
-        # Wait for next physics packet
-        last_packet = self.state["packetID"]
-        for _ in range(100):
-            observations = self.getObservation()
-            if last_packet != self.state["packetID"]:
-                break
-        else:
-            self.logger.warning("Timeout waiting for next physics packet")
-
-        info = self.getInfo()
-        reward = self.getReward()
-
-        # Debug: press 'P' to print reward breakdown
-        if keyboard.is_pressed('p'):
-            if not self._p_key_pressed:
-                self._p_key_pressed = True
-                if hasattr(self, '_last_reward_breakdown'):
-                    lines = [f"  {k:30s}: {v:+8.2f}" for k, v in self._last_reward_breakdown.items()]
-                    print("\nREWARD BREAKDOWN:\n" + "\n".join(lines) + f"\n  {'TOTAL':30s}: {reward[0]:+8.2f}\n")
-        else:
-            self._p_key_pressed = False
-
-        # --- Termination checks ---
+    def _check_termination(self) -> tuple[bool, bool, str]:
         terminated = False
-        tyres_out = self.state.get("tyresOut", 0) or 0
+        truncated = self._episode_step >= self._max_episode_steps
+        reason = 'running'
+        tyres_out = self.state.get('tyresOut', 0) or 0
         now = time.time()
 
         if tyres_out >= 3:
             terminated = True
-            self.logger.info(f"Episode terminated: {tyres_out} tires off track")
+            reason = 'off_track'
 
-        # Stuck detection: distance from reset position (curriculum-scaled)
         if not terminated:
             try:
-                current_pos = self.graphics.carCoordinates
+                current_pos = np.array(self.graphics.carCoordinates, dtype=np.float32)
                 timeout_mult = self.curriculum_scheduler.get_low_speed_timeout_multiplier()
                 adjusted_stuck_timeout = self._stuck_timeout * timeout_mult
                 if self._position_after_reset is None:
-                    self._position_after_reset = current_pos[:]
+                    self._position_after_reset = current_pos.copy()
                     self._stuck_start_time = now
                 else:
-                    dist = np.linalg.norm(np.array(current_pos) - np.array(self._position_after_reset))
-                    if dist <= self._stuck_threshold and (now - self._stuck_start_time) > adjusted_stuck_timeout:
+                    distance = float(np.linalg.norm(current_pos - self._position_after_reset))
+                    if distance <= self._stuck_threshold and (now - self._stuck_start_time) > adjusted_stuck_timeout:
                         terminated = True
-                        self.logger.info(f"Episode terminated: stuck ({dist:.2f}m in {now - self._stuck_start_time:.1f}s, timeout={adjusted_stuck_timeout:.1f}s)")
-            except Exception as e:
-                self.logger.warning(f"Stuck detection error: {e}")
+                        reason = 'stuck'
+            except Exception as exc:
+                self.logger.warning(f"Stuck detection error: {exc}")
 
-        # Low-speed stuck detection (uses curriculum-based timeout multiplier)
         if not terminated:
             try:
-                current_speed = self.state.get("speed", 0.0) or 0.0
-                # Get curriculum multiplier (high at start, decays to 1.0)
+                current_speed = float(self.state.get('speed', 0.0) or 0.0)
                 timeout_mult = self.curriculum_scheduler.get_low_speed_timeout_multiplier()
                 adjusted_timeout = self._low_speed_timeout * timeout_mult
-                
                 if current_speed < self._low_speed_threshold:
                     if self._low_speed_start_time is None:
                         self._low_speed_start_time = now
                     elif (now - self._low_speed_start_time) > adjusted_timeout:
                         terminated = True
-                        self.logger.info(f"Episode terminated: low speed ({current_speed:.1f} km/h for {now - self._low_speed_start_time:.1f}s, timeout={adjusted_timeout:.1f}s)")
+                        reason = 'low_speed'
                 else:
                     self._low_speed_start_time = None
-            except Exception as e:
-                self.logger.warning(f"Low-speed detection error: {e}")
+            except Exception as exc:
+                self.logger.warning(f"Low-speed detection error: {exc}")
 
-        return observations, reward, terminated, False, info
+        if truncated and not terminated:
+            reason = 'time_limit'
+        return terminated, truncated, reason
+
+    def step(self, action: Optional[np.ndarray]) -> tuple[np.ndarray, float, bool, bool, dict]:
+        if not self.physicsConnected or not self.graphicsConnected:
+            self.connect()
+            return self.step(action)
+
+        self.curriculum_scheduler.step()
+        if action is not None:
+            self.set_actions(action)
+
+        self._episode_step += 1
+        last_packet = self.state.get('packetID', -1)
+        for _ in range(100):
+            observation = self.getObservation()
+            if last_packet != self.state['packetID']:
+                break
+        else:
+            observation = self._compose_observation(self._current_core_obs)
+            self.logger.warning("Timeout waiting for next physics packet")
+
+        terminated, truncated, reason = self._check_termination()
+        self._last_termination_reason = reason
+        reward = self.getReward(terminated=terminated, truncated=truncated, termination_reason=reason)
+
+        if self._safe_keyboard_pressed('p'):
+            if not self._p_key_pressed and self._last_reward_breakdown:
+                self._p_key_pressed = True
+                lines = [f"  {key:30s}: {value:+8.3f}" for key, value in self._last_reward_breakdown.items()]
+                print("\nREWARD BREAKDOWN:\n" + "\n".join(lines) + f"\n  {'TOTAL':30s}: {reward:+8.3f}\n")
+        else:
+            self._p_key_pressed = False
+
+        info = self.getInfo()
+        info.update({
+            'terminated': bool(terminated),
+            'termination_reason': reason,
+            'line_gap': float(self._last_track_features.get('signed_distance', 0.0)),
+            'heading_error': float(self._last_track_features.get('heading_error', 0.0)),
+            'forward_progress': float(self.state.get('forward_progress', 0.0)),
+            'off_track': bool(self.state.get('off_track', False)),
+        })
+
+        self._core_obs_history.append(self._current_core_obs.copy())
+        return observation, float(reward), bool(terminated), bool(truncated), info
 
     def set_actions(self, action: np.ndarray) -> None:
-        """Apply [throttle_brake, steer] action to the virtual Xbox 360 controller."""
-        throttle_brake = float(np.clip(action[0], -1.0, 1.0))
-        steer = float(np.clip(action[1], -1.0, 1.0))
+        action = np.asarray(action, dtype=np.float32)
+        if action.shape != (self.action_dim,):
+            raise ValueError(f"Expected action shape {(self.action_dim,)}, got {action.shape}")
 
-        if throttle_brake >= 0:
-            gas, brake = throttle_brake, 0.0
-        else:
-            gas, brake = 0.0, -throttle_brake
+        steer = safe_clip(float(action[0]), -1.0, 1.0)
+        accel = safe_clip(float(action[1]), 0.0, 1.0)
+        brake = safe_clip(float(action[2]), 0.0, 1.0)
+        applied_action = self.controller.apply(steer=steer, accel=accel, brake=brake)
+        self._last_applied_action = applied_action.copy()
+        self._action_history.append(applied_action.copy())
 
-        self._last_gas = gas
-        self._last_brake = brake
-        self._last_steer = steer
-
-        self.gamepad.left_joystick_float(x_value_float=steer, y_value_float=0.0)
-        self.gamepad.right_trigger_float(value_float=gas)
-        self.gamepad.left_trigger_float(value_float=brake)
-        self.gamepad.update()
-
-    #Resets the game state via ACReset plugin over TCP socket
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> np.ndarray:
         self.logger.info("Reset requested")
         super().reset(seed=seed)
 
-        # Check reset cooldown to prevent spam resets
         current_time = time.time()
         if self._last_reset_time is not None:
             time_since_last_reset = current_time - self._last_reset_time
             if time_since_last_reset < self._reset_cooldown:
-                self.logger.warning(f"Reset spam detected! Only {time_since_last_reset:.2f}s since last reset (cooldown: {self._reset_cooldown}s). Ignoring reset command.")
-                observation = self.getObservation()
-                return observation
-        
+                self.logger.warning(
+                    "Reset spam detected! Only %.2fs since last reset (cooldown: %.2fs). Ignoring reset command.",
+                    time_since_last_reset,
+                    self._reset_cooldown,
+                )
+                return self.getObservation()
         self._last_reset_time = current_time
 
-        # Set controller to neutral before reset so the car doesn't keep driving
         try:
-            self.gamepad.left_joystick_float(x_value_float=0.0, y_value_float=0.0)
-            self.gamepad.right_trigger_float(value_float=0.0)
-            self.gamepad.left_trigger_float(value_float=0.0)
-            self.gamepad.update()
-        except Exception as e:
-            self.logger.warning(f"Could not neutralize controller before reset: {e}")
+            self.controller.neutral()
+        except Exception as exc:
+            self.logger.warning(f"Could not neutralize controller before reset: {exc}")
 
-        # Send RESET command to the ACReset plugin via TCP socket
         self.logger.info("Sending RESET command to ACReset plugin via socket...")
-        reset_sent = self._send_reset_command()
-        
-        if not reset_sent:
-            self.logger.warning(
-                "Could not send reset command. "
-                "Ensure the ACReset app is enabled in Assetto Corsa and has connected."
-            )
-        
-        # Give AC a moment to execute ac.ext_resetCar() and stabilize
+        if not self._send_reset_command():
+            self.logger.warning("Could not send reset command. Ensure the ACReset app is enabled in Assetto Corsa.")
+
         time.sleep(1.0)
-        
-        # Reset episode tracking state
+        self._episode_step = 0
         self._position_after_reset = None
         self._stuck_start_time = None
         self._low_speed_start_time = None
-        self._extreme_slip_detected = False
-        
+        self._last_termination_reason = 'running'
+        self._prev_norm_pos = None
+        self._core_obs_history.clear()
+        self._action_history.clear()
+        self._last_applied_action = np.zeros(self.action_dim, dtype=np.float32)
+        self.controller.neutral()
+
         observation = self.getObservation()
-        self._prev_norm_pos = self.graphics.normalizedCarPosition
+        self._core_obs_history.append(self._current_core_obs.copy())
+        self._prev_norm_pos = float(self.graphics.normalizedCarPosition)
         return observation
-    
-    def getReward(self) -> np.ndarray:
-        """Compute reward for the current step.
-        
-        Simplified reward matching assetto_corsa_gym model:
-        Base reward is speed-normalized, with optional racing line guidance.
-        
-        Racing line acts as a multiplier on speed reward (curriculum-based decay).
-        
-        Commented out components from original model:
-        - Track progress reward (lap position)
-        - Speed conditional penalties (idle/stalling)
-        - Throttle bonus
-        - Braking while stopped penalty
-        - Pit lane penalty
-        - Off-track penalty (via lap termination instead)
-        """
-        breakdown = {}
-        self._extreme_slip_detected = False
-        
-        # --- Base speed reward (primary signal) ---
-        # Matches assetto_corsa_gym: speed_kmh / 300
-        # Note: self.physics.speedKmh is already in km/h, no 3.6x conversion needed
-        # (assetto_corsa_gym multiplies by 3.6 because their speed is in m/s)
-        speed = self.state.get("speed", 0.0) or 0.0
-        speed_normalized = speed / 300.0
-        reward = speed_normalized
-        breakdown['Speed (km/h ÷ 300)'] = speed_normalized
-        
-        # --- Racing line distance reward (optional, curriculum-based) ---
-        # Similar to assetto_corsa_gym's gap-based multiplier
-        racing_line_penalty = 0.0
-        
-        try:
-            rl_cfg = self.config.get('racing_line', {})
-            if rl_cfg.get('enable', True) and self.racing_line_manager.racing_line_loaded:
-                rl_weight = self.curriculum_scheduler.get_racing_line_weight()
 
-                if not hasattr(self, '_logged_rl_diagnostic'):
-                    self.logger.info(
-                        f"Racing line: loaded=True, curriculum_weight={rl_weight:.2f}"
-                    )
-                    self._logged_rl_diagnostic = True
+    def getReward(self, terminated: bool = False, truncated: bool = False, termination_reason: Optional[str] = None) -> float:
+        speed_ms = max(float(self.physics.speedKmh) / 3.6, 0.0)
+        line_gap = abs(float(self._last_track_features.get('signed_distance', 0.0)))
+        heading_error = abs(float(self._last_track_features.get('heading_error', 0.0)))
+        forward_progress = speed_ms * np.cos(float(self._last_track_features.get('heading_error', 0.0))) / TOP_SPEED_MS
+        off_track = 1.0 if int(self.physics.numberOfTyresOut) >= 3 else 0.0
+        overlap = min(float(self._last_applied_action[1]), float(self._last_applied_action[2]))
 
-                if rl_weight > 0.0:
-                    # AC shared memory carCoordinates = [x, y, z] where Y is vertical
-                    # Racing line CSV pos_x/pos_y map to AC's (z, x) ground plane
-                    # So car ground position = (carCoordinates[2], carCoordinates[0])
-                    car_pos = (self.graphics.carCoordinates[2],
-                               self.graphics.carCoordinates[0],
-                               0.0)
-                    racing_line_distance = self.racing_line_manager.distance_to_racing_line(car_pos)
-                    rl_threshold = self.racing_line_manager.line_distance_threshold
-                    
-                    # Matches assetto_corsa_gym: r *= (1.0 - abs(gap) / gap_const)
-                    normalized_distance = min(abs(racing_line_distance) / rl_threshold, 1.0)
-                    
-                    # Apply curriculum-weighted penalty: as weight increases, penalty increases
-                    line_multiplier = 1.0 - (normalized_distance * rl_weight)
-                    reward *= line_multiplier
-                    
-                    # Track penalty applied (for breakdown only)
-                    racing_line_penalty = speed_normalized * (1.0 - line_multiplier)
-                    breakdown['Racing line penalty'] = -racing_line_penalty
-            elif rl_cfg.get('enable', True) and not self.racing_line_manager.racing_line_loaded:
-                if not hasattr(self, '_logged_rl_missing'):
-                    self.logger.warning("Racing line not loaded - check Racing Lines CSV files")
-                    self._logged_rl_missing = True
-        except Exception as e:
-            self.logger.debug(f"Racing line penalty error: {e}")
+        w_progress = float(self.reward_cfg.get('w_progress', 1.0))
+        w_gap = float(self.reward_cfg.get('w_gap', 0.35))
+        w_heading = float(self.reward_cfg.get('w_heading', 0.15))
+        w_offtrack = float(self.reward_cfg.get('w_offtrack', 2.0))
+        w_terminal_stuck = float(self.reward_cfg.get('w_terminal_stuck', 3.0))
+        w_overlap = float(self.reward_cfg.get('w_overlap', 0.05))
 
-        breakdown['Total reward'] = reward
+        gap_term = line_gap / max(self.racing_line_manager.line_distance_threshold, 1e-6)
+        heading_term = heading_error / np.pi
+        terminal_stuck_flag = 1.0 if terminated and termination_reason in {'stuck', 'low_speed'} else 0.0
 
-        # ===== COMMENTED OUT COMPONENTS FROM ORIGINAL MODEL =====
-        
-        # --- Off-track penalty (commented out - termination handles this) ---
-        # tyres_out = self.state.get("tyresOut", 0) or 0
-        # off_track_penalty = 0.0
-        # if tyres_out >= 3:
-        #     off_track_penalty = 5.0 * tyres_out
-        #     reward -= off_track_penalty
-        # breakdown['Off-track penalty'] = -off_track_penalty
-
-        # --- Track progress (commented out - now handled by speed reward) ---
-        # norm_pos = self.graphics.normalizedCarPosition
-        # progress_reward = 0.0
-        # 
-        # # Validate norm_pos is a valid number
-        # if norm_pos is None or not isinstance(norm_pos, (int, float)) or np.isnan(norm_pos) or np.isinf(norm_pos):
-        #     self.logger.warning("Invalid normalizedCarPosition: {}".format(norm_pos))
-        #     norm_pos = self._prev_norm_pos if self._prev_norm_pos is not None else 0.0
-        # 
-        # if self._prev_norm_pos is not None:
-        #     progress = norm_pos - self._prev_norm_pos
-        #
-        #     if progress < -0.5:        # Lap wrap-around
-        #         progress += 1.0
-        #         progress_reward = 50.0
-        #     elif progress > 0.5:       # Went backwards significantly
-        #         progress -= 1.0
-        #
-        #     progress_reward += progress * 200.0
-        #     reward += progress_reward
-        #
-        # breakdown['Progress reward'] = progress_reward
-        # self._prev_norm_pos = norm_pos
-
-        # --- Conditional speed penalties (commented out) ---
-        # speed_reward = 0.0
-        # if speed > 5:
-        #     speed_reward = speed / 100.0
-        # elif self._last_gas < 0.3:
-        #     speed_reward = -100.0     # Not pressing gas = wasting time
-        # else:
-        #     speed_reward = -30.0      # Pressing gas but not moving yet
-        # reward += speed_reward
-        # breakdown['Speed reward'] = speed_reward
-
-        # --- Throttle bonus (commented out) ---
-        # throttle_bonus = 0.0
-        # if speed < 5 and self._last_gas > 0.3:
-        #     throttle_bonus = 8.0 * self._last_gas
-        #     reward += throttle_bonus
-        # breakdown['Throttle bonus'] = throttle_bonus
-
-        # --- Braking while stopped penalty (commented out) ---
-        # braking_penalty = 0.0
-        # if speed < 10 and self._last_brake > 0.3:
-        #     braking_penalty = 10.0 * self._last_brake
-        #     reward -= braking_penalty
-        # breakdown['Braking w/o movement'] = -braking_penalty
-
-        # --- Pit lane penalty (commented out) ---
-        # pit_penalty = 0.0
-        # if self.graphics.isInPit:
-        #     pit_penalty = 1.0
-        #     reward -= pit_penalty
-        # breakdown['Pit lane penalty'] = -pit_penalty
+        reward = (
+            w_progress * forward_progress
+            - w_gap * gap_term
+            - w_heading * heading_term
+            - w_offtrack * off_track
+            - w_terminal_stuck * terminal_stuck_flag
+            - w_overlap * overlap
+        )
 
         if np.isnan(reward) or np.isinf(reward):
             self.logger.error(f"Invalid reward detected: {reward}, clamping to -10")
             reward = -10.0
 
-        self._last_reward_breakdown = breakdown
-        return np.array([reward], dtype=np.float32)
+        self._last_reward_breakdown = {
+            'forward_progress': float(w_progress * forward_progress),
+            'line_gap_penalty': float(-w_gap * gap_term),
+            'heading_penalty': float(-w_heading * heading_term),
+            'off_track_penalty': float(-w_offtrack * off_track),
+            'terminal_stuck_penalty': float(-w_terminal_stuck * terminal_stuck_flag),
+            'overlap_penalty': float(-w_overlap * overlap),
+        }
+        return float(reward)
 
-    # Per-episode cleanup (Agent calls this after every episode).
     def close(self):
         try:
-            # Set controller to neutral between episodes
-            self.gamepad.left_joystick_float(x_value_float=0.0, y_value_float=0.0)
-            self.gamepad.right_trigger_float(value_float=0.0)
-            self.gamepad.left_trigger_float(value_float=0.0)
-            self.gamepad.update()
-        except Exception as e:
-            self.logger.warning("Error during close: {}".format(e))
-        return
+            self.controller.neutral()
+        except Exception as exc:
+            self.logger.warning(f"Error during close: {exc}")
 
-    # Final shutdown — call once when training is completely done
     def shutdown(self):
-        """Tear down the socket server and all resources.  Call once at exit."""
         try:
             if self._reset_server_sock is not None:
                 self._reset_server_sock.close()
@@ -684,7 +558,10 @@ class ACEnv(Env, gym_utils.EzPickle):
                     self._reset_client_sock.close()
                     self._reset_client_sock = None
             self.logger.info("ACReset socket server shut down")
-        except Exception as e:
-            self.logger.warning(f"Error shutting down reset server: {e}")
+        except Exception as exc:
+            self.logger.warning(f"Error shutting down reset server: {exc}")
         self.close()
-        return
+        try:
+            self.controller.close()
+        except Exception:
+            pass

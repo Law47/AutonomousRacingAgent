@@ -61,7 +61,7 @@ def main():
     
     # Register signal handler for Ctrl+C
     signal.signal(signal.SIGINT, signal_handler)
-    #region parseArgs into config
+    #region config, parseArgs into config
     parser = argparse.ArgumentParser(description="Autonomous Racing Agent Training")
     parser.add_argument("--config", default="config.yml", type=str, help="Path to configuration file")
     parser.add_argument("--load_path", type=str, default=None, help="Path to load the model from")
@@ -90,7 +90,7 @@ def main():
     config.work_dir = work_dir
     #endregion
     
-    #region SetupLogger
+    #region logger, SetupLogger
     loggingFormat = logging.Formatter('%(levelname)s:%(asctime)s:%(message)s')
 
     fileHandler = logging.FileHandler(config.work_dir + "log.log")
@@ -104,11 +104,10 @@ def main():
     logger.addHandler(fileHandler)
     logger.addHandler(stream_handler)
     
-    logger.info(f"Config: \n{OmegaConf.to_yaml(config)}")
-    logger.info(f"Work Dir: {work_dir}")
+    global_logger = logger
     #endregion
     
-    global_logger = logger
+    logger.info(f"\n{OmegaConf.to_yaml(config)}")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
@@ -124,6 +123,8 @@ def main():
             state_dim=env.observation_space.shape[0],
             action_dim=env.action_space.shape[0],
             device=device, seed=config.seed,
+            action_low=env.action_space.low,
+            action_high=env.action_space.high,
             **OmegaConf.to_container(config.SAC), **OmegaConf.to_container(config.DisCor))
         logger.info(f"Using Algorithmn DisCor")
     elif args.algo == 'sac':
@@ -131,6 +132,8 @@ def main():
             state_dim=env.observation_space.shape[0],
             action_dim=env.action_space.shape[0],
             device=device, seed=config.seed,
+            action_low=env.action_space.low,
+            action_high=env.action_space.high,
             **OmegaConf.to_container(config.SAC))
         logger.info(f"Using Algorithmn SAC")
     else:

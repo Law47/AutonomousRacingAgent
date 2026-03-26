@@ -51,7 +51,7 @@ AssettoCorsa:
   ego_server_port: 2345
   opponents_server_port: 2346
   simulation_management_server_port: 2347
-  use_relative_actions: True
+  use_relative_actions: False
   enable_sensors: True
   vjoy_executed_by_server: False
   enable_out_of_track_termination: True
@@ -64,13 +64,48 @@ AssettoCorsa:
   enable_task_id_in_obs: False
   penalize_actions_diff: False
   penalize_actions_diff_coef: 0.1
-  max_steer_rate: 900.0   # steering: deg/s
+  max_steer_rate: 900.0   # retained for compatibility; controller defaults are below
   track: "monza"
   car: "bmw_z4_gt3"
   use_ac_out_of_track: True
   add_previous_obs_to_state: True
   use_reference_line_in_reward: True
   use_target_speed: False
+
+controller:
+  backend: vjoy
+  device_id: 1
+  copy_upstream_mapping: True
+  action_order: [steer, accel, brake]
+  steer_rate_limit_deg_s: 900.0
+  pedal_rate_limit_per_s: 12.0
+
+observation:
+  history_length: 3
+  include_previous_actions: True
+  include_force_feedback: True
+  include_track_relative_features: True
+  curvature_lookahead_points: 12
+  curvature_lookahead_distance_m: 300
+
+reward:
+  w_progress: 1.0
+  w_gap: 0.35
+  w_heading: 0.15
+  w_offtrack: 2.0
+  w_terminal_stuck: 3.0
+  w_overlap: 0.05
+
+termination:
+  low_speed_threshold_kmh: 5.0
+  low_speed_timeout_s: 5.0
+  stuck_distance_threshold_m: 2.0
+  stuck_timeout_s: 5.0
+
+trainer:
+  strict_scalar_rewards: True
+  treat_truncation_as_terminal: False
+  eval_uses_direct_step_action: False
 
 # ===== CURRICULUM LEARNING =====
 curriculum:

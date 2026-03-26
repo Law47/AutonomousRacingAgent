@@ -15,11 +15,11 @@ class DisCor(SAC):
                  error_lr=0.0003, policy_hidden_units=[256, 256],
                  q_hidden_units=[256, 256], error_hidden_units=[256, 256, 256],
                  tau_init=10.0, target_update_coef=0.005,
-                 log_interval=10, seed=0):
+                 log_interval=10, seed=0, action_low=None, action_high=None):
         super().__init__(
             state_dim, action_dim, device, gamma, nstep, policy_lr, q_lr,
             entropy_lr, policy_hidden_units, q_hidden_units,
-            target_update_coef, log_interval, seed)
+            target_update_coef, log_interval, seed, action_low, action_high)
 
         # Build error networks.
         self._online_error_net = TwinnedStateActionFunction(
