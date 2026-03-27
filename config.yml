@@ -75,6 +75,7 @@ AssettoCorsa:
 controller:
   backend: vjoy
   device_id: 1
+  dll_path: null
   copy_upstream_mapping: True
   action_order: [steer, accel, brake]
   steer_rate_limit_deg_s: 900.0

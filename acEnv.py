@@ -141,8 +141,15 @@ class ACEnv(Env, gym_utils.EzPickle):
 
         self.curriculum_scheduler = CurriculumScheduler(config, logger)
         self.racing_line_manager = RacingLineManager(config, logger)
-        self.controller = VJoyController(device_id=int(self.controller_cfg.get('device_id', 1)))
+        controller_device_id = int(self.controller_cfg.get('device_id', 1))
+        controller_dll_path = self.controller_cfg.get('dll_path', None)
+        self.controller = VJoyController(device_id=controller_device_id, dll_path=controller_dll_path)
         self.controller.neutral()
+        self.logger.info(
+            "vJoy controller initialized on device %s%s",
+            controller_device_id,
+            f" using {controller_dll_path}" if controller_dll_path else "",
+        )
 
         self.logger.info(f"Action dim={self.action_dim}  Obs dim={self.state_dim}")
         self.connect()
