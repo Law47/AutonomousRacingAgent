@@ -121,6 +121,7 @@ class Agent:
         ep_start_time = time.time()
         train_stats = None
         step_perf, action_perf, update_model_perf = [], [], []
+        steer_abs_history, brake_history, pedal_command_history, speed_history = [], [], [], []
 
         try:
             state = self._env.reset()
@@ -147,6 +148,10 @@ class Agent:
                 done = bool(terminated or truncated)
                 step_perf.append(time.perf_counter() - step_start_time)
                 step_start_time = time.perf_counter()
+                steer_abs_history.append(float(info.get('abs_steer', abs(action[0]))))
+                brake_history.append(float(info.get('applied_brake', 0.0)))
+                pedal_command_history.append(float(info.get('pedal_command', 0.0)))
+                speed_history.append(float(info.get('speed', 0.0)))
 
                 self._replay_buffer.append(
                     state,
@@ -194,6 +199,11 @@ class Agent:
             'action_perf_mean': self._safe_mean(action_perf),
             'action_perf_max': self._safe_max(action_perf),
             'action_perf_std': self._safe_std(action_perf),
+            'mean_abs_steer': self._safe_mean(steer_abs_history),
+            'frac_max_steer': float(np.mean(np.asarray(steer_abs_history) > 0.9)) if steer_abs_history else 0.0,
+            'frac_max_brake': float(np.mean(np.asarray(brake_history) > 0.9)) if brake_history else 0.0,
+            'mean_pedal_command': self._safe_mean(pedal_command_history),
+            'mean_speed': self._safe_mean(speed_history),
         })
         if train_stats:
             metrics.update(train_stats)
@@ -211,6 +221,12 @@ class Agent:
             self.wandb_logger.log(metrics, 'episodes')
         self.episodes_stats.append(metrics)
         pd.DataFrame(self.episodes_stats).to_csv(os.path.join(self._log_dir, 'summary.csv'), index=None)
+        if self._episodes % self._log_interval == 0:
+            self._writer.add_scalar('behavior/mean_abs_steer', metrics['mean_abs_steer'], self._steps)
+            self._writer.add_scalar('behavior/frac_max_steer', metrics['frac_max_steer'], self._steps)
+            self._writer.add_scalar('behavior/frac_max_brake', metrics['frac_max_brake'], self._steps)
+            self._writer.add_scalar('behavior/mean_pedal_command', metrics['mean_pedal_command'], self._steps)
+            self._writer.add_scalar('behavior/mean_speed', metrics['mean_speed'], self._steps)
 
     def evaluate(self):
         total_return = 0.0

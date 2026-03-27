@@ -34,6 +34,9 @@ class ACEnv(Env, gym_utils.EzPickle):
     raw_observation_info = {
         'gas': 1.0,
         'brake': 1.0,
+        'pedalCommand': 1.0,
+        'appliedAccel': 1.0,
+        'appliedBrake': 1.0,
         'gear': 6.0,
         'rpms': 10000.0,
         'steerAngle': np.pi,
@@ -57,7 +60,7 @@ class ACEnv(Env, gym_utils.EzPickle):
     }
 
     raw_observation_inputs = [
-        'gas', 'brake', 'gear', 'rpms', 'steerAngle', 'speedKmh',
+        'gas', 'brake', 'pedalCommand', 'appliedAccel', 'appliedBrake', 'gear', 'rpms', 'steerAngle', 'speedKmh',
         'velocityX', 'velocityY', 'velocityZ',
         'accGX', 'accGY', 'accGZ',
         'wheelSlipFL', 'wheelSlipFR', 'wheelSlipRL', 'wheelSlipRR',
@@ -253,7 +256,14 @@ class ACEnv(Env, gym_utils.EzPickle):
             return False
 
     def _normalize_raw_feature(self, feature_name: str) -> float:
-        value = self.extractFieldValue(feature_name, self._field_mapping)
+        if feature_name == 'pedalCommand':
+            value = self._current_pedal_command
+        elif feature_name == 'appliedAccel':
+            value = self.state.get('applied_accel', 0.0)
+        elif feature_name == 'appliedBrake':
+            value = self.state.get('applied_brake', 0.0)
+        else:
+            value = self.extractFieldValue(feature_name, self._field_mapping)
         if value is None:
             return 0.0
         scale = float(self.raw_observation_info.get(feature_name, 1.0))
@@ -331,6 +341,7 @@ class ACEnv(Env, gym_utils.EzPickle):
         speed_ms = max(float(self.physics.speedKmh) / 3.6, 0.0)
         self.state['forward_progress'] = float(speed_ms * np.cos(heading_error))
         self.state['off_track'] = bool(int(self.physics.numberOfTyresOut) >= 3)
+        self.state['abs_steer'] = abs(float(self._last_applied_action[0]))
 
     def getObservation(self) -> np.ndarray:
         if not self._read_shared_memory():
@@ -433,7 +444,12 @@ class ACEnv(Env, gym_utils.EzPickle):
             'heading_error': float(self._last_track_features.get('heading_error', 0.0)),
             'forward_progress': float(self.state.get('forward_progress', 0.0)),
             'off_track': bool(self.state.get('off_track', False)),
+            'pedal_command': float(self.state.get('pedal_command', 0.0)),
+            'applied_accel': float(self.state.get('applied_accel', 0.0)),
+            'applied_brake': float(self.state.get('applied_brake', 0.0)),
+            'abs_steer': float(self.state.get('abs_steer', 0.0)),
         })
+        info.update({f'reward_{key}': float(value) for key, value in self._last_reward_breakdown.items()})
 
         self._core_obs_history.append(self._current_core_obs.copy())
         return observation, float(reward), bool(terminated), bool(truncated), info
@@ -461,6 +477,7 @@ class ACEnv(Env, gym_utils.EzPickle):
         self.state['pedal_command'] = float(self._current_pedal_command)
         self.state['applied_accel'] = float(applied_action[1])
         self.state['applied_brake'] = float(applied_action[2])
+        self.state['abs_steer'] = abs(float(steer))
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> np.ndarray:
         self.logger.info("Reset requested")
@@ -497,6 +514,10 @@ class ACEnv(Env, gym_utils.EzPickle):
         self._action_history.clear()
         self._last_applied_action = np.zeros(self.action_dim, dtype=np.float32)
         self._current_pedal_command = 0.0
+        self.state['pedal_command'] = 0.0
+        self.state['applied_accel'] = 0.0
+        self.state['applied_brake'] = 0.0
+        self.state['abs_steer'] = 0.0
         self.controller.neutral()
 
         observation = self.getObservation()
@@ -506,11 +527,15 @@ class ACEnv(Env, gym_utils.EzPickle):
 
     def getReward(self, terminated: bool = False, truncated: bool = False, termination_reason: Optional[str] = None) -> float:
         speed_ms = max(float(self.physics.speedKmh) / 3.6, 0.0)
+        speed_kmh = max(float(self.physics.speedKmh), 0.0)
         line_gap = abs(float(self._last_track_features.get('signed_distance', 0.0)))
         heading_error = abs(float(self._last_track_features.get('heading_error', 0.0)))
         forward_progress = speed_ms * np.cos(float(self._last_track_features.get('heading_error', 0.0))) / TOP_SPEED_MS
         off_track = 1.0 if int(self.physics.numberOfTyresOut) >= 3 else 0.0
         pedal_delta_magnitude = abs(float(self._last_applied_action[1]))
+        steer_penalty = abs(float(self._last_applied_action[0]))
+        low_speed_target_kmh = float(self.reward_cfg.get('low_speed_target_kmh', 25.0))
+        low_speed_penalty = max(0.0, (low_speed_target_kmh - speed_kmh) / max(low_speed_target_kmh, 1e-6))
 
         w_progress = float(self.reward_cfg.get('w_progress', 1.0))
         w_gap = float(self.reward_cfg.get('w_gap', 0.35))
@@ -518,6 +543,11 @@ class ACEnv(Env, gym_utils.EzPickle):
         w_offtrack = float(self.reward_cfg.get('w_offtrack', 2.0))
         w_terminal_stuck = float(self.reward_cfg.get('w_terminal_stuck', 3.0))
         w_overlap = float(self.reward_cfg.get('w_overlap', 0.0))
+        w_low_speed = float(self.reward_cfg.get('w_low_speed', 0.20))
+        w_steer = float(self.reward_cfg.get('w_steer', 0.03))
+        w_steer_delta = float(self.reward_cfg.get('w_steer_delta', 0.0))
+        previous_steer = float(self._action_history[-1][0]) if self._action_history else 0.0
+        steer_delta_penalty = abs(float(self._last_applied_action[0]) - previous_steer)
 
         gap_term = line_gap / max(self.racing_line_manager.line_distance_threshold, 1e-6)
         heading_term = heading_error / np.pi
@@ -529,6 +559,9 @@ class ACEnv(Env, gym_utils.EzPickle):
             - w_heading * heading_term
             - w_offtrack * off_track
             - w_terminal_stuck * terminal_stuck_flag
+            - w_low_speed * low_speed_penalty
+            - w_steer * steer_penalty
+            - w_steer_delta * steer_delta_penalty
             - w_overlap * pedal_delta_magnitude
         )
 
@@ -542,6 +575,9 @@ class ACEnv(Env, gym_utils.EzPickle):
             'heading_penalty': float(-w_heading * heading_term),
             'off_track_penalty': float(-w_offtrack * off_track),
             'terminal_stuck_penalty': float(-w_terminal_stuck * terminal_stuck_flag),
+            'low_speed_penalty': float(-w_low_speed * low_speed_penalty),
+            'steer_penalty': float(-w_steer * steer_penalty),
+            'steer_delta_penalty': float(-w_steer_delta * steer_delta_penalty),
             'pedal_delta_penalty': float(-w_overlap * pedal_delta_magnitude),
         }
         return float(reward)

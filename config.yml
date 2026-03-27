@@ -95,6 +95,10 @@ reward:
   w_heading: 0.15
   w_offtrack: 2.0
   w_terminal_stuck: 3.0
+  w_low_speed: 0.20
+  low_speed_target_kmh: 25.0
+  w_steer: 0.03
+  w_steer_delta: 0.0
   w_overlap: 0.0
 
 termination:
