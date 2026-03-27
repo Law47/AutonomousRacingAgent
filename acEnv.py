@@ -130,7 +130,7 @@ class ACEnv(Env, gym_utils.EzPickle):
         self._stuck_threshold = float(self.termination_cfg.get('stuck_distance_threshold_m', 2.0))
         self._stuck_timeout = float(self.termination_cfg.get('stuck_timeout_s', 5.0))
         self._low_speed_threshold = float(self.termination_cfg.get('low_speed_threshold_kmh', 5.0))
-        self._low_speed_timeout = float(self.termination_cfg.get('low_speed_timeout_s', 5.0))
+        self._low_speed_timeout = float(self.termination_cfg.get('low_speed_timeout_s', 10.0))
 
         self._reset_host = '127.0.0.1'
         self._reset_port = 65432
