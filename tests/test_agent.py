@@ -19,15 +19,15 @@ class DummyAlgo:
         return {'ok': 1.0}
 
     def explore(self, state):
-        return np.array([0.0, 0.5, 0.0], dtype=np.float32), None
+        return np.array([0.0, 0.5], dtype=np.float32), None
 
     def exploit(self, state):
-        return np.array([0.0, 0.5, 0.0], dtype=np.float32), None
+        return np.array([0.0, 0.5], dtype=np.float32), None
 
 
 class DummyEnv:
     def __init__(self):
-        self.action_space = Box(low=np.array([-1.0, 0.0, 0.0], dtype=np.float32), high=np.array([1.0, 1.0, 1.0], dtype=np.float32), dtype=np.float32)
+        self.action_space = Box(low=np.array([-1.0, -1.0], dtype=np.float32), high=np.array([1.0, 1.0], dtype=np.float32), dtype=np.float32)
         self.observation_space = Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
         self._max_episode_steps = 2
         self.steps = 0

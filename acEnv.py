@@ -90,9 +90,9 @@ class ACEnv(Env, gym_utils.EzPickle):
         self._include_track_relative_features = bool(self.obs_cfg.get('include_track_relative_features', True))
         self._curvature_points = int(self.obs_cfg.get('curvature_lookahead_points', 12))
 
-        action_low = np.array([-1.0, 0.0, 0.0], dtype=np.float32)
-        action_high = np.array([1.0, 1.0, 1.0], dtype=np.float32)
-        self.action_dim = 3
+        action_low = np.array([-1.0, -1.0], dtype=np.float32)
+        action_high = np.array([1.0, 1.0], dtype=np.float32)
+        self.action_dim = 2
         self.action_space = Box(low=action_low, high=action_high, dtype=np.float32)
 
         self._base_obs_dim = len(self.raw_observation_inputs) + len(self.track_feature_names) + self._curvature_points
@@ -125,6 +125,7 @@ class ACEnv(Env, gym_utils.EzPickle):
         self._core_obs_history = deque(maxlen=self._history_length)
         self._action_history = deque(maxlen=self._history_length)
         self._last_applied_action = np.zeros(self.action_dim, dtype=np.float32)
+        self._current_pedal_command = 0.0
 
         self._stuck_threshold = float(self.termination_cfg.get('stuck_distance_threshold_m', 2.0))
         self._stuck_timeout = float(self.termination_cfg.get('stuck_timeout_s', 5.0))
@@ -443,11 +444,23 @@ class ACEnv(Env, gym_utils.EzPickle):
             raise ValueError(f"Expected action shape {(self.action_dim,)}, got {action.shape}")
 
         steer = safe_clip(float(action[0]), -1.0, 1.0)
-        accel = safe_clip(float(action[1]), 0.0, 1.0)
-        brake = safe_clip(float(action[2]), 0.0, 1.0)
+        pedal_delta = safe_clip(float(action[1]), -1.0, 1.0)
+        self._current_pedal_command = safe_clip(self._current_pedal_command + pedal_delta, -1.0, 1.0)
+
+        if self._current_pedal_command >= 0.0:
+            accel = self._current_pedal_command
+            brake = 0.0
+        else:
+            accel = 0.0
+            brake = -self._current_pedal_command
+
         applied_action = self.controller.apply(steer=steer, accel=accel, brake=brake)
-        self._last_applied_action = applied_action.copy()
-        self._action_history.append(applied_action.copy())
+        policy_action = np.array([steer, pedal_delta], dtype=np.float32)
+        self._last_applied_action = policy_action
+        self._action_history.append(policy_action.copy())
+        self.state['pedal_command'] = float(self._current_pedal_command)
+        self.state['applied_accel'] = float(applied_action[1])
+        self.state['applied_brake'] = float(applied_action[2])
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> np.ndarray:
         self.logger.info("Reset requested")
@@ -483,6 +496,7 @@ class ACEnv(Env, gym_utils.EzPickle):
         self._core_obs_history.clear()
         self._action_history.clear()
         self._last_applied_action = np.zeros(self.action_dim, dtype=np.float32)
+        self._current_pedal_command = 0.0
         self.controller.neutral()
 
         observation = self.getObservation()
@@ -496,14 +510,14 @@ class ACEnv(Env, gym_utils.EzPickle):
         heading_error = abs(float(self._last_track_features.get('heading_error', 0.0)))
         forward_progress = speed_ms * np.cos(float(self._last_track_features.get('heading_error', 0.0))) / TOP_SPEED_MS
         off_track = 1.0 if int(self.physics.numberOfTyresOut) >= 3 else 0.0
-        overlap = min(float(self._last_applied_action[1]), float(self._last_applied_action[2]))
+        pedal_delta_magnitude = abs(float(self._last_applied_action[1]))
 
         w_progress = float(self.reward_cfg.get('w_progress', 1.0))
         w_gap = float(self.reward_cfg.get('w_gap', 0.35))
         w_heading = float(self.reward_cfg.get('w_heading', 0.15))
         w_offtrack = float(self.reward_cfg.get('w_offtrack', 2.0))
         w_terminal_stuck = float(self.reward_cfg.get('w_terminal_stuck', 3.0))
-        w_overlap = float(self.reward_cfg.get('w_overlap', 0.05))
+        w_overlap = float(self.reward_cfg.get('w_overlap', 0.0))
 
         gap_term = line_gap / max(self.racing_line_manager.line_distance_threshold, 1e-6)
         heading_term = heading_error / np.pi
@@ -515,7 +529,7 @@ class ACEnv(Env, gym_utils.EzPickle):
             - w_heading * heading_term
             - w_offtrack * off_track
             - w_terminal_stuck * terminal_stuck_flag
-            - w_overlap * overlap
+            - w_overlap * pedal_delta_magnitude
         )
 
         if np.isnan(reward) or np.isinf(reward):
@@ -528,7 +542,7 @@ class ACEnv(Env, gym_utils.EzPickle):
             'heading_penalty': float(-w_heading * heading_term),
             'off_track_penalty': float(-w_offtrack * off_track),
             'terminal_stuck_penalty': float(-w_terminal_stuck * terminal_stuck_flag),
-            'overlap_penalty': float(-w_overlap * overlap),
+            'pedal_delta_penalty': float(-w_overlap * pedal_delta_magnitude),
         }
         return float(reward)
 
