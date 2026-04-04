@@ -1,0 +1,7 @@
+outputs/
+outputs/
+.venv/
+__pycache__/
+*.pyc
+*.pkl
+assetto_corsa_gym/AssettoCorsaConfigs/tracks/ks_barcelona-layout_gp_0.1m.pkl assetto_corsa_gym/AssettoCorsaConfigs/tracks/monza_0.1m.pkl

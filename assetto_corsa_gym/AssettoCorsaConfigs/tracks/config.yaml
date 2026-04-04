@@ -1,0 +1,15 @@
+ks_barcelona-layout_gp:
+  track_name: ks_barcelona
+  track_configuration: layout_gp
+  track_file: ks_barcelona-layout_gp.csv
+  track_grid_file: ks_barcelona-layout_gp_0.1m.pkl
+  ref_lap_file: ks_barcelona-layout_gp-racing_line_fixed.csv
+  TrackLength: 4591.88720703125
+
+monza:
+  track_name: monza
+  track_configuration:
+  track_file: monza.csv
+  track_grid_file: monza_0.1m.pkl
+  ref_lap_file: monza-racing_line.csv
+  TrackLength: 5758.66064453125
