@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 import pickle
+import tempfile
 from pathlib import Path
 from tqdm import tqdm
 
@@ -21,7 +22,7 @@ class Agent:
                  batch_size=256, memory_size=1_000_000,
                  update_interval=1, start_steps=10000, log_interval=10, checkpoint_freq=0,
                  eval_interval=5000, num_eval_episodes=5, seed=0, use_offline_buffer=False, offline_buffer_size=1_000_000,
-                 wandb_logger=None, save_final_buffer=False):
+                 wandb_logger=None, save_final_buffer=False, checkpoint_save_buffer=True):
 
         # Environment.
         self._env = env
@@ -29,6 +30,7 @@ class Agent:
         self.checkpoint_freq = checkpoint_freq
         self.wandb_logger = wandb_logger
         self.save_final_buffer = save_final_buffer
+        self.checkpoint_save_buffer = checkpoint_save_buffer
 
         self._env.seed(seed)
         self._test_env.seed(2**31-1-seed)
@@ -84,12 +86,28 @@ class Agent:
         logger.info(f'gamma: {self._algo.gamma}')
         logger.info(f'nstep: {self._algo.nstep}')
         logger.info(f'memory_size: {memory_size}')
+        logger.info(f'checkpoint_save_buffer: {self.checkpoint_save_buffer}')
+
+    def _save_replay_buffer_atomic(self, path):
+        os.makedirs(path, exist_ok=True)
+        replay_buffer_path = os.path.join(path, 'replay_buffer.pkl')
+
+        # Write to a temp file and atomically replace to avoid partial .pkl
+        # when interruption happens during save.
+        fd, tmp_path = tempfile.mkstemp(prefix='replay_buffer_', suffix='.pkl', dir=path)
+        os.close(fd)
+        try:
+            with open(tmp_path, 'wb') as f:
+                pickle.dump(self._replay_buffer, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_path, replay_buffer_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
     def save(self, path, save_buffer=True):
         self._algo.save_models(path)
         if save_buffer:
-            with open(os.path.join(path, 'replay_buffer.pkl'), 'wb') as f:
-                pickle.dump(self._replay_buffer, f)
+            self._save_replay_buffer_atomic(path)
             logger.info("saved replay buffer to {}".format(path))
         logger.info("saved models to {}".format(path))
 
@@ -140,6 +158,8 @@ class Agent:
         ep_start_time = time.time()
         ep_stats = {}
         train_stats = None
+        env_ep_stats = {}
+        episode_failed = False
 
         try:
             done = False
@@ -192,11 +212,22 @@ class Agent:
 
                 if self.checkpoint_freq and (self._steps % self.checkpoint_freq == 0):
                     logger.info(f"checkpointing model {self._steps} steps")
-                    self.save(os.path.join(self._model_dir, "checkpoints", f"step_{self._steps:08d}"), save_buffer=False)
+                    self.save(
+                        os.path.join(self._model_dir, "checkpoints", f"step_{self._steps:08d}"),
+                        save_buffer=self.checkpoint_save_buffer,
+                    )
         except TimeoutError:
             logger.exception("Agent TimeoutError")
+            episode_failed = True
+        except Exception:
+            logger.exception("Unexpected error during train_episode")
+            episode_failed = True
         finally:
-            env_ep_stats = self._env.close()
+            try:
+                env_ep_stats = self._env.close()
+            except Exception:
+                logger.exception("Failed to close environment at episode end")
+                env_ep_stats = {}
 
         # We log running mean of training rewards.
         self._train_return.append(episode_return)
@@ -216,31 +247,38 @@ class Agent:
         ep_stats['ep_steps'] = episode_steps
         ep_stats.update(env_ep_stats if isinstance(env_ep_stats, dict) else {})
 
-        if env_ep_stats["BestLap"] < self.best_lap_time:
-            logger.info(f"new best lap time {env_ep_stats['BestLap']}")
-            self.best_lap_time = env_ep_stats["BestLap"]
+        best_lap = env_ep_stats.get("BestLap") if isinstance(env_ep_stats, dict) else None
+        if best_lap is not None and np.isfinite(best_lap) and best_lap < self.best_lap_time:
+            logger.info(f"new best lap time {best_lap}")
+            self.best_lap_time = best_lap
             self.save(os.path.join(self._model_dir, 'best_lap_time'), save_buffer=False)
 
-        if env_ep_stats["ep_reward"] > self.best_reward:
-            logger.info(f"new best reward {env_ep_stats['ep_reward']}")
-            self.best_reward = env_ep_stats["ep_reward"]
+        best_reward = env_ep_stats.get("ep_reward") if isinstance(env_ep_stats, dict) else None
+        if best_reward is not None and np.isfinite(best_reward) and best_reward > self.best_reward:
+            logger.info(f"new best reward {best_reward}")
+            self.best_reward = best_reward
             self.save(os.path.join(self._model_dir, 'best_reward'), save_buffer=False)
 
         eval_metrics = self.common_metrics()
         eval_metrics.update(ep_stats)
         if train_stats:
             eval_metrics.update(train_stats)
-        eval_metrics["update_model_perf_mean"] = np.array(update_model_perf).mean()
-        eval_metrics["update_model_perf_max"] = np.array(update_model_perf).max()
-        eval_metrics["update_model_perf_std"] = np.array(update_model_perf).std()
-        eval_metrics["step_perf_mean"] = np.array(step_perf).mean()
-        eval_metrics["step_perf_max"] = np.array(step_perf).max()
-        eval_metrics["step_perf_std"] = np.array(step_perf).std()
-        eval_metrics["step_perf_q99"] = np.quantile(np.array(step_perf), 0.99)
-        eval_metrics["step_perf_> thres"] = np.sum(np.array(step_perf) > 0.041)
-        eval_metrics["action_perf_mean"] = np.array(action_perf).mean()
-        eval_metrics["action_perf_max"] = np.array(action_perf).max()
-        eval_metrics["action_perf_std"] = np.array(action_perf).std()
+        update_model_perf_arr = np.array(update_model_perf, dtype=np.float64)
+        step_perf_arr = np.array(step_perf, dtype=np.float64)
+        action_perf_arr = np.array(action_perf, dtype=np.float64)
+
+        eval_metrics["update_model_perf_mean"] = update_model_perf_arr.mean() if update_model_perf_arr.size else np.nan
+        eval_metrics["update_model_perf_max"] = update_model_perf_arr.max() if update_model_perf_arr.size else np.nan
+        eval_metrics["update_model_perf_std"] = update_model_perf_arr.std() if update_model_perf_arr.size else np.nan
+        eval_metrics["step_perf_mean"] = step_perf_arr.mean() if step_perf_arr.size else np.nan
+        eval_metrics["step_perf_max"] = step_perf_arr.max() if step_perf_arr.size else np.nan
+        eval_metrics["step_perf_std"] = step_perf_arr.std() if step_perf_arr.size else np.nan
+        eval_metrics["step_perf_q99"] = np.quantile(step_perf_arr, 0.99) if step_perf_arr.size else np.nan
+        eval_metrics["step_perf_> thres"] = np.sum(step_perf_arr > 0.041) if step_perf_arr.size else 0
+        eval_metrics["action_perf_mean"] = action_perf_arr.mean() if action_perf_arr.size else np.nan
+        eval_metrics["action_perf_max"] = action_perf_arr.max() if action_perf_arr.size else np.nan
+        eval_metrics["action_perf_std"] = action_perf_arr.std() if action_perf_arr.size else np.nan
+        eval_metrics["episode_failed"] = int(episode_failed)
         logger.info(f"Avr step time: {eval_metrics['step_perf_mean']:.3f}s, actions: {eval_metrics['action_perf_mean']:.4f}s, update: {eval_metrics['update_model_perf_mean']:.3f}s")
         logger.info(f"Max step time: {eval_metrics['step_perf_max']:.3f}s, actions: {eval_metrics['action_perf_max']:.4f}s, update: {eval_metrics['update_model_perf_max']:.3f}s")
         logger.info(f"std step time: {eval_metrics['step_perf_std']:.3f}s, actions: {eval_metrics['action_perf_std']:.4f}s, update: {eval_metrics['update_model_perf_std']:.3f}s")
@@ -249,7 +287,8 @@ class Agent:
             self.wandb_logger.log(eval_metrics, 'episodes')
         self.episodes_stats.append(eval_metrics)
         pd.DataFrame(self.episodes_stats).to_csv(os.path.join(self._log_dir, 'summary.csv'), index=None)
-        logger.info(f'Episode done. Took {ep_time:.2f}s.  Steps per episode: {episode_steps}. Buffer size: {len(self._replay_buffer)} fps: {episode_steps/ep_time:.2f}')
+        fps = (episode_steps / ep_time) if ep_time > 0 else 0.0
+        logger.info(f'Episode done. Took {ep_time:.2f}s.  Steps per episode: {episode_steps}. Buffer size: {len(self._replay_buffer)} fps: {fps:.2f}')
 
     def evaluate(self):
         try:

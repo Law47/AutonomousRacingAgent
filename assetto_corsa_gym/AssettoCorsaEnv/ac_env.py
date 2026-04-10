@@ -250,6 +250,30 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         self.penalize_actions_diff = config.penalize_actions_diff
         self.penalize_actions_diff_coef = config.penalize_actions_diff_coef
 
+        # Optional curriculum that very slowly reduces racing-line reward shaping
+        # as training progresses.
+        self.racing_line_curriculum_enabled = bool(getattr(self.config, "racing_line_curriculum_enabled", True))
+        self.racing_line_curriculum_start_weight = float(getattr(self.config, "racing_line_curriculum_start_weight", 1.0))
+        self.racing_line_curriculum_end_weight = float(getattr(self.config, "racing_line_curriculum_end_weight", 0.2))
+        self.racing_line_curriculum_warmup_steps = int(getattr(self.config, "racing_line_curriculum_warmup_steps", 0))
+        self.racing_line_curriculum_decay_steps = int(getattr(self.config, "racing_line_curriculum_decay_steps", 6_000_000))
+
+        # Keep curriculum parameters in a sane range and avoid divide-by-zero.
+        self.racing_line_curriculum_start_weight = np.clip(self.racing_line_curriculum_start_weight, 0.0, 1.0)
+        self.racing_line_curriculum_end_weight = np.clip(self.racing_line_curriculum_end_weight, 0.0, 1.0)
+        if self.racing_line_curriculum_end_weight > self.racing_line_curriculum_start_weight:
+            logger.warning(
+                "racing_line_curriculum_end_weight (%.3f) is greater than start_weight (%.3f); clamping end to start",
+                self.racing_line_curriculum_end_weight,
+                self.racing_line_curriculum_start_weight,
+            )
+            self.racing_line_curriculum_end_weight = self.racing_line_curriculum_start_weight
+        self.racing_line_curriculum_decay_steps = max(self.racing_line_curriculum_decay_steps, 1)
+
+        if self.gap_const <= 0:
+            logger.warning("gap_const must be > 0, got %s. Falling back to 12.0", self.gap_const)
+            self.gap_const = 12.0
+
         self.max_laps_number = self.config.max_laps_number
 
         self.tracks_path = os.path.join(self.ac_configs_path, "tracks")
@@ -375,6 +399,15 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             if self.config.enable_task_id_in_obs:
                 logger.info(f"task_id: {self.current_task_id} num_tasks: {self.tasks_ids.get_number_of_tasks()}")
 
+        logger.info(
+            "Racing-line curriculum enabled=%s start=%.3f end=%.3f warmup_steps=%d decay_steps=%d",
+            self.racing_line_curriculum_enabled,
+            self.racing_line_curriculum_start_weight,
+            self.racing_line_curriculum_end_weight,
+            self.racing_line_curriculum_warmup_steps,
+            self.racing_line_curriculum_decay_steps,
+        )
+
         logger.info(f"state_dim {self.state_dim}")
         logger.info(f"action_space: {self.action_space}")
 
@@ -467,7 +500,12 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         #
         #   Reward
         #
-        self.state["reward"] = self.get_reward(self.state, actions_diff).item()
+        self.state["racing_line_reward_weight"] = self.get_racing_line_reward_weight()
+        self.state["reward"] = self.get_reward(
+            self.state,
+            actions_diff,
+            racing_line_reward_weight=self.state["racing_line_reward_weight"],
+        ).item()
 
         if (self.ep_steps % 50) == 0:
             logger.debug(f't: {self.ep_steps} speed: {state["speed"]:.2f}, oot: {state["out_of_track"]} '
@@ -603,14 +641,33 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
     def get_extra_obs_index(self, channel_name):
         return self.obs_extra_enabled_channels.index(channel_name)
 
-    def get_reward(self, state, actions_diff):
+    def get_racing_line_reward_weight(self):
+        if not self.racing_line_curriculum_enabled:
+            return self.racing_line_curriculum_start_weight
+
+        if self.total_steps <= self.racing_line_curriculum_warmup_steps:
+            return self.racing_line_curriculum_start_weight
+
+        progress_steps = self.total_steps - self.racing_line_curriculum_warmup_steps
+        progress = min(progress_steps / self.racing_line_curriculum_decay_steps, 1.0)
+
+        return self.racing_line_curriculum_start_weight + (
+            self.racing_line_curriculum_end_weight - self.racing_line_curriculum_start_weight
+        ) * progress
+
+    def get_reward(self, state, actions_diff, racing_line_reward_weight=None):
         speed = 3.6 * np.array(state['speed'])
         out_of_track = state["out_of_track_calc"]
         dist_to_border = state["dist_to_border"]
 
         r = speed
         if self.use_reference_line_in_reward:
-            r *= ( 1.0 - (np.abs( state["gap"]) / 12.00))
+            if racing_line_reward_weight is None:
+                racing_line_reward_weight = self.get_racing_line_reward_weight()
+
+            # Decrease racing-line shaping over long training runs to avoid
+            # over-reliance on this dense signal.
+            r *= (1.0 - racing_line_reward_weight * (np.abs(state["gap"]) / self.gap_const))
         r /= 300. # normalize
 
         if self.penalize_actions_diff:
@@ -833,6 +890,7 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
                   "total_steps": self.total_steps,
                   "packages_lost": number_packages_lost,
                   "ep_reward": ep.reward.sum(),
+                "racing_line_reward_weight": ep.racing_line_reward_weight.values[-1] if "racing_line_reward_weight" in ep.columns else np.nan,
                   "speed_mean": ep.speed.mean(),
                   "speed_max": ep.speed.max(),
                   #"completedLaps": ep.completedLaps.values[-1],
@@ -849,6 +907,7 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
                 for i, lapCount in enumerate(list(set( ep.LapCount ))):
                     logger.info(f"LapNo_{i}: {r[f'LapNo_{i}']:6.2f}")
                 logger.info(f"ep_bestLapTime: {r['ep_bestLapTime']:6.2f}")
+                logger.info(f"racing_line_reward_weight: {r['racing_line_reward_weight']:.4f}")
                 logger.info(f"speed_mean: {r['speed_mean']:6.2f} speed_max: {r['speed_max']:6.2f} max_abs_gap: {gap_abs_max:6.2f} ep_laps: {len(set(ep.LapCount))}")
                 if len(ep) > 10:
                     dt = np.diff( ep.currentTime.values )[1:]

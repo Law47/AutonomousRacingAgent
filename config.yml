@@ -13,6 +13,7 @@ Agent:
   eval_interval: 0
   num_eval_episodes: 1
   checkpoint_freq: 200_000
+  checkpoint_save_buffer: True
   save_final_buffer: True
 
 SAC:
@@ -56,6 +57,11 @@ AssettoCorsa:
   use_ac_out_of_track: True
   add_previous_obs_to_state: True
   use_reference_line_in_reward: True
+  racing_line_curriculum_enabled: True
+  racing_line_curriculum_start_weight: 1.0
+  racing_line_curriculum_end_weight: 0.2
+  racing_line_curriculum_warmup_steps: 0
+  racing_line_curriculum_decay_steps: 6_000_000
   use_target_speed: False
   screen_capture_enable: False
   final_image_width: 320
