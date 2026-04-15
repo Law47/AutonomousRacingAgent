@@ -165,7 +165,6 @@ class EnsembleBuffer(ReplayBuffer):
     def __len__(self):
         offline_len = len(self._offline)
         online_len = super().__len__()
-        logger.info(f"Offline buffer size: {offline_len}, Online buffer size: {online_len}.")
         return offline_len + online_len
 
     def sample(self, batch_size, device=torch.device('cpu')):

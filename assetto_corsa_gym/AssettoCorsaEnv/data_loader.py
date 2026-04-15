@@ -42,11 +42,54 @@ class DataLoader():
         self.brake_map = BrakeMap.load(brake_map_file)
         self.steer_max = env.max_steer_deg
 
-    def get_actions_from_state(self, state):
+    def get_absolute_actions_from_state(self, state):
         steer = state["steerAngle"] / self.steer_max
         pedal = (state["accStatus"] - 0.5) * 2  # 0,1 -> -1,1
         brake = self.brake_map.get_x(state["brakeStatus"]).item() # map
         return np.array( [steer, pedal, brake] )
+
+    def get_actions_from_state(self, state):
+        return self.get_absolute_actions_from_state(state)
+
+    def get_recorded_model_actions(self, state):
+        action_dim = getattr(self.env, "action_dim", 5)
+        action_keys = [f"actions_{i}" for i in range(action_dim)]
+        if all(key in state for key in action_keys):
+            return np.array([state[key] for key in action_keys], dtype='float32')
+
+        legacy_action_keys = [f"actions_{i}" for i in range(min(3, action_dim))]
+        if all(key in state for key in legacy_action_keys):
+            actions = np.zeros(action_dim, dtype='float32')
+            actions[:len(legacy_action_keys)] = np.array([state[key] for key in legacy_action_keys], dtype='float32')
+            return actions
+
+        return None
+
+    def infer_shift_actions(self, current_state, previous_state):
+        if previous_state is None:
+            return np.zeros(2, dtype='float32')
+
+        current_gear = int(current_state.get("actualGear", 0))
+        previous_gear = int(previous_state.get("actualGear", current_gear))
+        gear_delta = current_gear - previous_gear
+
+        if gear_delta > 0:
+            return np.array([1.0, 0.0], dtype='float32')
+        if gear_delta < 0:
+            return np.array([0.0, 1.0], dtype='float32')
+        return np.zeros(2, dtype='float32')
+
+    def pad_model_actions(self, actions):
+        actions = np.asarray(actions, dtype='float32')
+        action_dim = getattr(self.env, "action_dim", actions.shape[0])
+        if action_dim == actions.shape[0]:
+            return actions
+        if actions.shape[0] > action_dim:
+            raise ValueError(f"Expected at most {action_dim} actions, got {actions.shape[0]}")
+
+        padded_actions = np.zeros(action_dim, dtype='float32')
+        padded_actions[:actions.shape[0]] = actions
+        return padded_actions
 
     def compute_steer_ratio_statistics(self, trajectory):
         # trajectory is a list of dictionaries
@@ -80,21 +123,24 @@ class DataLoader():
     def read_step(self):
         state = self.trajectory[self.current_step]
         history = self.trajectory[:self.current_step] # get the history seen so far
-        current_abs_actions = self.get_actions_from_state(state)
+        previous_state = self.trajectory[self.current_step - 1] if self.current_step > 0 else None
+        current_abs_actions = self.get_absolute_actions_from_state(state)
 
         if self.current_step == 0:
             self.prev_abs_actions = current_abs_actions
 
-        actions = self.env.inverse_preprocess_actions(self.prev_abs_actions, current_abs_actions)
+        recorded_model_actions = self.get_recorded_model_actions(state)
+        if recorded_model_actions is not None:
+            actions = recorded_model_actions
+        else:
+            controls_actions = self.env.inverse_preprocess_actions(self.prev_abs_actions, current_abs_actions)
+            shift_actions = self.infer_shift_actions(state, previous_state)
+            actions = self.pad_model_actions(np.concatenate([controls_actions, shift_actions]))
         self.prev_abs_actions = current_abs_actions
 
         # abs values or relative
-        self.current_actions = np.array([current_abs_actions[0],
-                                         current_abs_actions[1],
-                                         current_abs_actions[2]], dtype='float32')
-        self.action = np.array( [actions[0],
-                                 actions[1],
-                                 actions[2]], dtype='float32')
+        self.current_actions = self.pad_model_actions(current_abs_actions)
+        self.action = self.pad_model_actions(actions)
 
         self.state = state
         # re build the observations and the reward using the current environment settings

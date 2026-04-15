@@ -88,19 +88,52 @@ class Agent:
     def save(self, path, save_buffer=True):
         self._algo.save_models(path)
         if save_buffer:
-            with open(os.path.join(path, 'replay_buffer.pkl'), 'wb') as f:
-                pickle.dump(self._replay_buffer, f)
-            logger.info("saved replay buffer to {}".format(path))
+            replay_buffer_path = os.path.join(path, 'replay_buffer.pkl')
+            tmp_path = replay_buffer_path + ".tmp"
+            try:
+                with open(tmp_path, 'wb') as f:
+                    pickle.dump(self._replay_buffer, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, replay_buffer_path)
+                logger.info("saved replay buffer to %s", path)
+            except Exception:
+                logger.exception("Failed to save replay buffer to %s", replay_buffer_path)
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    logger.exception("Failed to remove temp replay buffer at %s", tmp_path)
         logger.info("saved models to {}".format(path))
 
     def load(self, path, load_buffer=True):
-        self._algo.load_models(path)
+        try:
+            self._algo.load_models(path)
+        except ValueError:
+            logger.exception("Unable to load model from %s", path)
+            raise
         logger.info(f"loaded model from {path}")
         if load_buffer:
             replay_buffer_path = os.path.join(path, 'replay_buffer.pkl')
             if os.path.exists(replay_buffer_path):
-                with open(replay_buffer_path, 'rb') as f:
-                    self._replay_buffer = pickle.load(f)
+                try:
+                    with open(replay_buffer_path, 'rb') as f:
+                        loaded_replay_buffer = pickle.load(f)
+                except (pickle.UnpicklingError, EOFError) as exc:
+                    logger.warning(
+                        "Unable to load replay buffer from %s (%s). "
+                        "Continuing with model weights only.",
+                        replay_buffer_path,
+                        exc,
+                    )
+                    return
+                if getattr(loaded_replay_buffer, "_action_shape", None) != self._env.action_space.shape:
+                    raise ValueError(
+                        "Replay buffer is incompatible with the current action shape. "
+                        "This project now uses 5 actions, so old 3-action replay buffers cannot be resumed; "
+                        "start a fresh run or load weights without the old buffer."
+                    )
+                self._replay_buffer = loaded_replay_buffer
                 self._steps = self._replay_buffer._n
                 logger.info(f"loaded buffer from {path}. Number of steps: {len(self._replay_buffer)}")
             else:
@@ -129,6 +162,9 @@ class Agent:
         self._algo.update_target_networks()
         return train_stats
 
+    def has_min_experience(self):
+        return len(self._replay_buffer) >= self._start_steps
+
     def train_episode(self):
         """
         Train only one episode
@@ -149,7 +185,7 @@ class Agent:
 
             while (not done):
                 start_profile = time.perf_counter()
-                if self._start_steps > self._steps:
+                if not self.has_min_experience():
                     action = self._env.action_space.sample()
                 else:
                     action, _ = self._algo.explore(state)
@@ -160,7 +196,7 @@ class Agent:
 
                 # update model
                 start_profile = time.perf_counter()
-                if self._steps >= self._start_steps:
+                if self.has_min_experience():
                     train_stats = self.update_model()
                 update_model_perf.append(time.perf_counter() - start_profile)
 
@@ -294,10 +330,11 @@ class Agent:
             total_time=time.time() - self._start_time,
         )
 
-    def load_pre_train_data(self, trajs_path, env):
+    def load_pre_train_data(self, trajs_path, env, log_steer_ratios=False):
         total_added_episodes = 0
 
-        env_data = DataLoader(env, trajs_path)
+        buffer_size_before = len(self._replay_buffer)
+        env_data = DataLoader(env, trajs_path, log_steer_ratios=log_steer_ratios)
         for ep in tqdm(range(env_data.trajectories_count)[:]):
             state = env_data.reset()
 
@@ -321,11 +358,27 @@ class Agent:
                 state = next_state
                 if episode_done:
                     break
-        logger.info(f"Loaded {trajs_path} Buffer size: {len(self._replay_buffer)}")
+        added_transitions = len(self._replay_buffer) - buffer_size_before
+        logger.info(
+            "Loaded %s demonstration episodes from %s. Added %s transitions. Buffer size: %s",
+            total_added_episodes,
+            trajs_path,
+            added_transitions,
+            len(self._replay_buffer),
+        )
+        return added_transitions
 
-    def pre_train(self):
+    def pre_train(self, num_updates=None):
         self._algo.update_entropy = False
-        logger.info("Pre-training...")
-        for _ in tqdm(range(self._replay_buffer._n)):
-            self.update_model()
-        self._algo.update_entropy = True
+        if len(self._replay_buffer) == 0:
+            raise ValueError("Cannot pre-train without demonstration data in the replay buffer")
+
+        if num_updates is None:
+            num_updates = len(self._replay_buffer)
+
+        logger.info("Pre-training for %s updates...", num_updates)
+        try:
+            for _ in tqdm(range(num_updates)):
+                self.update_model()
+        finally:
+            self._algo.update_entropy = True

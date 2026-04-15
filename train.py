@@ -10,16 +10,18 @@ from omegaconf import OmegaConf
 
 ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
 
-sys.path.extend([
+LOCAL_IMPORT_PATHS = [
     os.path.join(ROOT_DIR, "assetto_corsa_gym"),
     os.path.join(ROOT_DIR, "algorithm", "discor"),
-])
+]
+for path in reversed(LOCAL_IMPORT_PATHS):
+    sys.path.insert(0, path)
 
 import AssettoCorsaEnv.assettoCorsa as assettoCorsa
 from discor.agent import Agent
 from discor.algorithm.sac import SAC
-import common.logging_config as logging_config
-import common.misc as misc
+import Common.logging_config as logging_config
+import Common.misc as misc
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal Assetto Corsa SAC trainer")
     parser.add_argument("--config", default="config.yml", type=str, help="Config path")
     parser.add_argument("--load_path", type=str, default=None, help="Optional model dir to load")
+    parser.add_argument(
+        "--load_weights_only",
+        action="store_true",
+        help="Load model weights but skip replay buffer (useful for corrupted/incompatible buffers)",
+    )
     parser.add_argument("--test", action="store_true", help="Run eval instead of training")
     parser.add_argument("overrides", nargs=argparse.REMAINDER, help="OmegaConf dotlist overrides")
     return parser.parse_args()
@@ -64,6 +71,35 @@ def build_work_dir(config) -> str:
         work_dir = os.path.abspath(work_dir)
     os.makedirs(work_dir, exist_ok=True)
     return work_dir + os.sep
+
+
+def maybe_load_demonstrations(agent: Agent, env, config) -> None:
+    demo_config = getattr(config, "Demonstrations", None)
+    if demo_config is None or not getattr(demo_config, "enabled", False):
+        return
+
+    data_paths = []
+    single_path = getattr(demo_config, "data_path", None)
+    if single_path:
+        data_paths.append(single_path)
+    for path in getattr(demo_config, "data_paths", []) or []:
+        data_paths.append(path)
+
+    if not data_paths:
+        raise ValueError("Demonstrations.enabled is true, but no Demonstrations.data_path or data_paths were provided")
+
+    total_transitions = 0
+    log_steer_ratios = getattr(demo_config, "log_steer_ratios", False)
+    for data_path in data_paths:
+        abs_data_path = os.path.abspath(data_path)
+        total_transitions += agent.load_pre_train_data(abs_data_path, env, log_steer_ratios=log_steer_ratios)
+
+    if total_transitions <= 0:
+        raise ValueError("No demonstration transitions were loaded from the configured paths")
+
+    pretrain_steps = int(getattr(demo_config, "pretrain_steps", 0))
+    if pretrain_steps > 0:
+        agent.pre_train(pretrain_steps)
 
 
 def main() -> None:
@@ -85,8 +121,6 @@ def main() -> None:
 
     env = assettoCorsa.make_ac_env(cfg=config, work_dir=config.work_dir)
     logger.info("Environment initialized")
-
-    wait_for_start()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Using device: %s", device)
@@ -114,7 +148,11 @@ def main() -> None:
         load_path = os.path.abspath(args.load_path)
         if not load_path.endswith(os.sep):
             load_path += os.sep
-        agent.load(load_path, load_buffer=not args.test)
+        agent.load(load_path, load_buffer=(not args.test and not args.load_weights_only))
+
+    if not args.test:
+        maybe_load_demonstrations(agent, env, config)
+        wait_for_start()
 
     if args.test:
         env.set_eval_mode()

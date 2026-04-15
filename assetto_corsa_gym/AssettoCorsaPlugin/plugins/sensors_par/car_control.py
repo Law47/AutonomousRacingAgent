@@ -26,6 +26,9 @@ else:
             vJoy = None
 
 SCALE = 16384
+VJOY_SHIFT_UP_BUTTON = 0x00000001
+VJOY_SHIFT_DOWN_BUTTON = 0x00000004
+SHIFT_BUTTON_HOLD_UPDATES = 3
 
 
 class Controls(object):
@@ -35,6 +38,8 @@ class Controls(object):
             raise ValueError(f"Unsupported control backend '{self.backend}'. Use 'vigem' or 'vjoy'.")
 
         self.onButtons = 0
+        self._shift_up_hold_remaining = 0
+        self._shift_down_hold_remaining = 0
         self.gamepad = None
         self.vj = None
 
@@ -71,7 +76,7 @@ class Controls(object):
             self.steer = 1.0
             self.acc = 0.0
             self.brake = 0.0
-            self.onButtons = 0
+            self._clear_shift_buttons()
             self.update()
             if self.vj is not None:
                 self.vj.close()
@@ -83,6 +88,7 @@ class Controls(object):
         self.steer = 1.0
         self.acc = 0.0
         self.brake = 0.5
+        self._clear_shift_buttons()
         logger.info("CT12 triggered")
         self.update()
 
@@ -111,25 +117,60 @@ class Controls(object):
                 self.brake = 1.0
 
             if enable_gear_shift:
-                if shift_up:
-                    self.onButtons = 0x00000001  # shift up
+                if shift_up and shift_down:
+                    self._clear_shift_buttons()
+                elif shift_up:
+                    self._shift_up_hold_remaining = SHIFT_BUTTON_HOLD_UPDATES
+                    self._shift_down_hold_remaining = 0
                 elif shift_down:
-                    self.onButtons = 0x00000002
+                    self._shift_down_hold_remaining = SHIFT_BUTTON_HOLD_UPDATES
+                    self._shift_up_hold_remaining = 0
                 else:
-                    self.onButtons = 0
+                    pass
             else:
-                self.onButtons = 0
+                self._clear_shift_buttons()
         self.update()
 
     def update(self):
+        self.onButtons = self._shift_buttons_for_update()
         if self.backend == "vigem":
             steer_normalized = float(self.steer) - 1.0
             self.gamepad.left_joystick_float(x_value_float=steer_normalized, y_value_float=0.0)
             self.gamepad.right_trigger_float(value_float=float(self.acc))
             self.gamepad.left_trigger_float(value_float=float(self.brake))
+            self._update_vigem_shift_buttons()
             self.gamepad.update()
         else:
             self.setJoy(self.steer, self.acc, self.brake, self.onButtons, SCALE)
+
+    def _clear_shift_buttons(self):
+        self._shift_up_hold_remaining = 0
+        self._shift_down_hold_remaining = 0
+        self.onButtons = 0
+
+    def _shift_buttons_for_update(self):
+        buttons = 0
+        if self._shift_up_hold_remaining > 0:
+            buttons |= VJOY_SHIFT_UP_BUTTON
+            self._shift_up_hold_remaining -= 1
+        if self._shift_down_hold_remaining > 0:
+            buttons |= VJOY_SHIFT_DOWN_BUTTON
+            self._shift_down_hold_remaining -= 1
+        return buttons
+
+    def _update_vigem_shift_buttons(self):
+        shift_up_button = vg.XUSB_BUTTON.XUSB_GAMEPAD_A
+        shift_down_button = vg.XUSB_BUTTON.XUSB_GAMEPAD_X
+
+        if self.onButtons & VJOY_SHIFT_UP_BUTTON:
+            self.gamepad.press_button(button=shift_up_button)
+        else:
+            self.gamepad.release_button(button=shift_up_button)
+
+        if self.onButtons & VJOY_SHIFT_DOWN_BUTTON:
+            self.gamepad.press_button(button=shift_down_button)
+        else:
+            self.gamepad.release_button(button=shift_down_button)
 
     def setJoy(self, valueX, valueY, valueZ, onButtons, scale):
         xPos = int(valueX * scale)

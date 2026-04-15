@@ -69,7 +69,7 @@ class Client():
         self.simulation_management = SimulationManagement(self.config)
         self.socket = None
         self.controls = DriverControls(self.vjoy_executed_by_server, self.control_backend)
-        self.record_controls_from_client = config.record_controls_from_client
+        self.record_controls_from_client = getattr(config, "record_controls_from_client", False)
 
         # Joystick handler (only used if needed)
         self.joystick_handler = None

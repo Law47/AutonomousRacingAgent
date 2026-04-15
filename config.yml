@@ -26,12 +26,17 @@ SAC:
   target_update_coef: 0.005
   log_interval: 10
 
+Demonstrations:
+  enabled: False
+  data_path: null
+  data_paths: []
+  pretrain_steps: 0
+  log_steer_ratios: False
+
 AssettoCorsa:
   ego_sampling_freq: 25
   max_episode_py_time: 600.0
-  gap_const: 12.0
   eval_number_of_laps: 4
-  save_lap_csv: False
   remote_machine_ip: "localhost"
   ego_server_port: 2345
   opponents_server_port: 2346
@@ -44,21 +49,31 @@ AssettoCorsa:
   enable_low_speed_termination: True
   recover_car_on_done: False
   send_reset_at_start: True
-  record_controls_from_client: False
-  enable_out_of_track_penalty: False
   max_laps_number: null
   enable_task_id_in_obs: False
-  penalize_actions_diff: False
-  penalize_actions_diff_coef: 0.1
   max_steer_rate: 900.0
   track: "monza"
   car: "bmw_z4_gt3"
   use_ac_out_of_track: True
   add_previous_obs_to_state: True
-  use_reference_line_in_reward: True
   use_target_speed: False
   screen_capture_enable: False
   final_image_width: 320
   final_image_height: 240
   color_mode: "gray"
   use_obs_extra: False
+
+  GearShift:
+    threshold: 0.5
+    release_threshold: 0.1
+    cooldown_s: 0.0
+
+  Rewards:
+    use_reference_line_in_reward: True
+    penalize_actions_diff: False
+    penalize_actions_diff_coef: 0.1
+    neutral_reverse_gear_penalty: 0.1
+    enable_out_of_track_penalty: True
+    out_of_track_penalty_start: 0.075
+    out_of_track_penalty_end: 0.5
+    out_of_track_penalty_ramp_steps: 3_000_000

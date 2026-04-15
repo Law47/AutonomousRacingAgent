@@ -36,7 +36,16 @@ class BaseNetwork(nn.Module):
         torch.save(self.state_dict(), path)
 
     def load(self, path):
-        self.load_state_dict(torch.load(path))
+        state_dict = torch.load(path)
+        try:
+            self.load_state_dict(state_dict)
+        except RuntimeError as exc:
+            raise ValueError(
+                "Model checkpoint is incompatible with the current network shape. "
+                "This project now uses 5 actions "
+                "[steer, throttle, brake, shift_up_signal, shift_down_signal], "
+                "so old 3-action checkpoints must not be resumed; start a fresh run instead."
+            ) from exc
 
 
 class StateActionFunction(BaseNetwork):
