@@ -117,6 +117,21 @@ class ReplayBuffer:
         idxes = self._sample_idxes(batch_size)
         return self._sample_batch(idxes, batch_size, device)
 
+    def iter_batches(self, batch_size, device=torch.device('cpu'), num_samples=None, shuffle=True):
+        assert isinstance(batch_size, int) and batch_size > 0
+
+        sample_count = self._n if num_samples is None else min(int(num_samples), self._n)
+        if sample_count <= 0:
+            return
+
+        idxes = np.arange(sample_count)
+        if shuffle:
+            np.random.shuffle(idxes)
+
+        for start in range(0, sample_count, batch_size):
+            batch_idxes = idxes[start:start + batch_size]
+            yield self._sample_batch(batch_idxes, len(batch_idxes), device)
+
     def _sample_idxes(self, batch_size):
         return np.random.randint(low=0, high=self._n, size=batch_size)
 
@@ -180,3 +195,9 @@ class EnsembleBuffer(ReplayBuffer):
         dones = torch.cat([dones0, dones1], dim=0)
 
         return states, actions, rewards, next_states, dones
+
+    def iter_batches(self, batch_size, device=torch.device('cpu'), num_samples=None, shuffle=True):
+        if len(self._offline) > 0:
+            yield from self._offline.iter_batches(batch_size, device, num_samples, shuffle)
+        else:
+            yield from super().iter_batches(batch_size, device, num_samples, shuffle)

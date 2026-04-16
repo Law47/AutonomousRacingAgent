@@ -79,6 +79,68 @@ class DataLoader():
             return np.array([0.0, 1.0], dtype='float32')
         return np.zeros(2, dtype='float32')
 
+    def validate_shift_action_alignment(self, trajectory):
+        threshold = float(getattr(self.env, "gear_shift_threshold", 0.5))
+        stats = {
+            "gear_up_events": 0,
+            "gear_down_events": 0,
+            "shift_up_signals": 0,
+            "shift_down_signals": 0,
+            "mismatches": 0,
+            "has_recorded_model_actions": False,
+        }
+
+        for index in range(1, len(trajectory)):
+            previous_state = trajectory[index - 1]
+            current_state = trajectory[index]
+            recorded_actions = self.get_recorded_model_actions(current_state)
+            if recorded_actions is None or recorded_actions.shape[0] < 5:
+                continue
+
+            stats["has_recorded_model_actions"] = True
+            current_gear = int(current_state.get("actualGear", 0))
+            previous_gear = int(previous_state.get("actualGear", current_gear))
+            gear_delta = current_gear - previous_gear
+            shift_up_active = bool(recorded_actions[3] > threshold)
+            shift_down_active = bool(recorded_actions[4] > threshold)
+
+            stats["shift_up_signals"] += int(shift_up_active)
+            stats["shift_down_signals"] += int(shift_down_active)
+
+            if gear_delta > 0:
+                stats["gear_up_events"] += 1
+                if not shift_up_active or shift_down_active:
+                    stats["mismatches"] += 1
+            elif gear_delta < 0:
+                stats["gear_down_events"] += 1
+                if not shift_down_active or shift_up_active:
+                    stats["mismatches"] += 1
+            elif shift_up_active or shift_down_active:
+                stats["mismatches"] += 1
+
+        if not stats["has_recorded_model_actions"]:
+            logger.info("No recorded 5-action shift signals found; shift actions will be inferred from gear deltas.")
+            return stats
+
+        log_message = (
+            "Demonstration shift alignment: gear_up_events=%s gear_down_events=%s "
+            "shift_up_signals=%s shift_down_signals=%s mismatches=%s "
+            "model_threshold=%.3f"
+        )
+        log_args = (
+            stats["gear_up_events"],
+            stats["gear_down_events"],
+            stats["shift_up_signals"],
+            stats["shift_down_signals"],
+            stats["mismatches"],
+            threshold,
+        )
+        if stats["mismatches"]:
+            logger.warning(log_message, *log_args)
+        else:
+            logger.info(log_message, *log_args)
+        return stats
+
     def pad_model_actions(self, actions):
         actions = np.asarray(actions, dtype='float32')
         action_dim = getattr(self.env, "action_dim", actions.shape[0])
@@ -114,6 +176,7 @@ class DataLoader():
             self.trajectory, self.static_info = self.env.load_history(load_path)
             self.trajectory_number += 1
             self.current_step = 0
+            self.validate_shift_action_alignment(self.trajectory)
             if self.log_steer_ratios:
                 self.compute_steer_ratio_statistics(self.trajectory)
         except Exception:

@@ -9,6 +9,9 @@ ROOT = Path(__file__).resolve().parents[1]
 ASSETTO_GYM = ROOT / "assetto_corsa_gym"
 if str(ASSETTO_GYM) not in sys.path:
     sys.path.insert(0, str(ASSETTO_GYM))
+DISCOR = ROOT / "algorithm" / "discor"
+if str(DISCOR) not in sys.path:
+    sys.path.insert(0, str(DISCOR))
 
 try:
     from gym.spaces import Box
@@ -87,6 +90,7 @@ sys.modules["AssettoCorsaEnv.brake_map"] = brake_map_module
 from AssettoCorsaEnv.ac_env import AssettoCorsaEnv, GearShiftGate, STREAMING_DEMO_FORMAT
 from AssettoCorsaEnv.data_loader import DataLoader
 from AssettoCorsaPlugin.plugins.sensors_par import car_control
+from discor.replay_buffer import ReplayBuffer
 
 
 class FakeControls(dict):
@@ -124,7 +128,7 @@ def make_env_stub(cooldown_steps=0):
     env.shift_down_count = 0
     env.use_reference_line_in_reward = False
     env.penalize_actions_diff = False
-    env.neutral_reverse_gear_penalty = 0.05
+    env.neutral_reverse_gear_step_penalty = 0.001
     env.enable_out_of_track_penalty = False
     env.out_of_track_penalty_start = 0.1
     env.out_of_track_penalty_end = 0.1
@@ -216,6 +220,54 @@ def test_offline_loader_infers_shift_up_from_gear_delta():
     np.testing.assert_allclose(inferred, [1.0, 0.0])
 
 
+def test_demo_shift_alignment_matches_model_shift_gate_indices():
+    loader = DataLoader.__new__(DataLoader)
+    loader.env = type("EnvStub", (), {"action_dim": 5, "gear_shift_threshold": 0.5})()
+    trajectory = [
+        {"actualGear": 2, "actions_0": 0.0, "actions_1": 0.0, "actions_2": 0.0, "actions_3": 0.0, "actions_4": 0.0},
+        {"actualGear": 3, "actions_0": 0.0, "actions_1": 0.0, "actions_2": 0.0, "actions_3": 1.0, "actions_4": 0.0},
+        {"actualGear": 2, "actions_0": 0.0, "actions_1": 0.0, "actions_2": 0.0, "actions_3": 0.0, "actions_4": 1.0},
+    ]
+
+    stats = loader.validate_shift_action_alignment(trajectory)
+
+    assert stats["gear_up_events"] == 1
+    assert stats["gear_down_events"] == 1
+    assert stats["shift_up_signals"] == 1
+    assert stats["shift_down_signals"] == 1
+    assert stats["mismatches"] == 0
+
+
+def test_demo_shift_alignment_detects_missing_shift_signal():
+    loader = DataLoader.__new__(DataLoader)
+    loader.env = type("EnvStub", (), {"action_dim": 5, "gear_shift_threshold": 0.5})()
+    trajectory = [
+        {"actualGear": 2, "actions_0": 0.0, "actions_1": 0.0, "actions_2": 0.0, "actions_3": 0.0, "actions_4": 0.0},
+        {"actualGear": 3, "actions_0": 0.0, "actions_1": 0.0, "actions_2": 0.0, "actions_3": 0.0, "actions_4": 0.0},
+    ]
+
+    stats = loader.validate_shift_action_alignment(trajectory)
+
+    assert stats["gear_up_events"] == 1
+    assert stats["shift_up_signals"] == 0
+    assert stats["mismatches"] == 1
+
+
+def test_replay_buffer_iter_batches_visits_demo_dataset_once():
+    buffer = ReplayBuffer(memory_size=5, state_shape=(1,), action_shape=(5,), gamma=0.99, nstep=1)
+    for index in range(5):
+        state = np.array([index], dtype=np.float32)
+        action = np.full((5,), index, dtype=np.float32)
+        buffer.append(state, action, float(index), state + 1.0, False)
+
+    batches = list(buffer.iter_batches(batch_size=2, num_samples=5, shuffle=False))
+
+    batch_sizes = [batch[0].shape[0] for batch in batches]
+    visited_states = np.concatenate([batch[0].cpu().numpy().reshape(-1) for batch in batches])
+    assert batch_sizes == [2, 2, 1]
+    np.testing.assert_allclose(visited_states, [0, 1, 2, 3, 4])
+
+
 def test_load_history_reads_streaming_demo_file_and_ignores_partial_tail(tmp_path):
     env = AssettoCorsaEnv.__new__(AssettoCorsaEnv)
     save_path = tmp_path / "demo.pkl"
@@ -261,7 +313,8 @@ def test_gear_shift_reward_penalizes_neutral_or_reverse():
     env = make_env_stub()
     state = {"RPM": 4000.0, "actualGear": 0, "shift_up": False, "shift_down": False}
 
-    assert env.get_gear_shift_reward(state) == -0.05
+    assert env.get_gear_shift_reward(state) == -0.001
+    assert state["neutral_reverse_gear_penalty"] == -0.001
 
 
 def test_gear_shift_reward_does_not_reward_shift_signal_before_threshold():

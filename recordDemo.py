@@ -285,6 +285,7 @@ def main() -> None:
     previous_gear = None
     history_tail = []
     total_saved_states = 0
+    total_seen_states = 0
     last_flush_time = time.perf_counter()
     logger.info("Recording demonstration to %s", output_dir)
 
@@ -296,6 +297,7 @@ def main() -> None:
             raw_state["capture_time_s"] = capture_time
             expanded_state, _ = env.expand_state(raw_state)
             recorded_states.append(expanded_state)
+            total_seen_states += 1
 
             should_flush = (capture_time - last_flush_time) >= args.flush_interval_s
             if should_flush:
@@ -310,7 +312,7 @@ def main() -> None:
                 total_saved_states += saved_count
                 last_flush_time = capture_time
 
-            if args.max_steps and len(recorded_states) >= args.max_steps:
+            if args.max_steps and total_seen_states >= args.max_steps:
                 logger.info("Reached max_steps=%s", args.max_steps)
                 break
             if should_stop_recording():

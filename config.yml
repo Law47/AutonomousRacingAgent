@@ -27,10 +27,10 @@ SAC:
   log_interval: 10
 
 Demonstrations:
-  enabled: False
-  data_path: null
+  enabled: True
+  data_path: "C:\\Users\\Leo\\Documents\\Github\\AutonomousRacingAgent\\demonstrations\\session_01"
   data_paths: []
-  pretrain_steps: 0
+  pretrain_epochs: 5
   log_steer_ratios: False
 
 AssettoCorsa:
@@ -72,7 +72,7 @@ AssettoCorsa:
     use_reference_line_in_reward: True
     penalize_actions_diff: False
     penalize_actions_diff_coef: 0.1
-    neutral_reverse_gear_penalty: 0.1
+    neutral_reverse_gear_step_penalty: 0.001
     enable_out_of_track_penalty: True
     out_of_track_penalty_start: 0.075
     out_of_track_penalty_end: 0.5

@@ -73,10 +73,10 @@ def build_work_dir(config) -> str:
     return work_dir + os.sep
 
 
-def maybe_load_demonstrations(agent: Agent, env, config) -> None:
+def maybe_load_demonstrations(agent: Agent, env, config) -> bool:
     demo_config = getattr(config, "Demonstrations", None)
     if demo_config is None or not getattr(demo_config, "enabled", False):
-        return
+        return False
 
     data_paths = []
     single_path = getattr(demo_config, "data_path", None)
@@ -97,9 +97,22 @@ def maybe_load_demonstrations(agent: Agent, env, config) -> None:
     if total_transitions <= 0:
         raise ValueError("No demonstration transitions were loaded from the configured paths")
 
-    pretrain_steps = int(getattr(demo_config, "pretrain_steps", 0))
-    if pretrain_steps > 0:
-        agent.pre_train(pretrain_steps)
+    pretrain_epochs = int(getattr(demo_config, "pretrain_epochs", 0))
+    if pretrain_epochs > 0:
+        agent.pre_train_epochs(pretrain_epochs, num_samples=total_transitions)
+        return True
+
+    legacy_pretrain_steps = int(getattr(demo_config, "pretrain_steps", 0))
+    if legacy_pretrain_steps > 0:
+        logger.warning(
+            "Demonstrations.pretrain_steps is deprecated. "
+            "Use Demonstrations.pretrain_epochs so each epoch covers the demonstration dataset once."
+        )
+        agent.pre_train(legacy_pretrain_steps)
+        return True
+
+    logger.info("Demonstrations were loaded, but pretrain_epochs=0 so demo pretraining was skipped.")
+    return False
 
 
 def main() -> None:
@@ -151,8 +164,9 @@ def main() -> None:
         agent.load(load_path, load_buffer=(not args.test and not args.load_weights_only))
 
     if not args.test:
-        maybe_load_demonstrations(agent, env, config)
-        wait_for_start()
+        did_demo_pretrain = maybe_load_demonstrations(agent, env, config)
+        if not did_demo_pretrain:
+            wait_for_start()
 
     if args.test:
         env.set_eval_mode()

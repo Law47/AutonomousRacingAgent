@@ -35,6 +35,7 @@ class Agent:
 
         # Algorithm.
         self._algo = algo
+        self._demo_transition_count = 0
 
         if use_offline_buffer:
             self._replay_buffer = EnsembleBuffer(memory_size=memory_size, state_shape=self._env.observation_space.shape,
@@ -156,9 +157,11 @@ class Agent:
         # Update online networks.
         if self._steps % self._update_interval == 0:
             batch = self._replay_buffer.sample(self._batch_size, self._device)
-            train_stats = self._algo.update_online_networks(batch, self._writer)
+            train_stats = self.update_model_from_batch(batch)
+        return train_stats
 
-        # Update target networks.
+    def update_model_from_batch(self, batch):
+        train_stats = self._algo.update_online_networks(batch, self._writer)
         self._algo.update_target_networks()
         return train_stats
 
@@ -359,6 +362,7 @@ class Agent:
                 if episode_done:
                     break
         added_transitions = len(self._replay_buffer) - buffer_size_before
+        self._demo_transition_count += added_transitions
         logger.info(
             "Loaded %s demonstration episodes from %s. Added %s transitions. Buffer size: %s",
             total_added_episodes,
@@ -367,6 +371,58 @@ class Agent:
             len(self._replay_buffer),
         )
         return added_transitions
+
+    def pre_train_epochs(self, num_epochs, num_samples=None):
+        if len(self._replay_buffer) == 0:
+            raise ValueError("Cannot pre-train without demonstration data in the replay buffer")
+
+        num_epochs = int(num_epochs)
+        if num_epochs <= 0:
+            logger.info("Skipping demonstration pre-training because num_epochs=%s", num_epochs)
+            return 0
+
+        if num_samples is None:
+            num_samples = self._demo_transition_count or len(self._replay_buffer)
+        num_samples = min(int(num_samples), len(self._replay_buffer))
+        if num_samples <= 0:
+            raise ValueError("Cannot pre-train without demonstration transitions")
+
+        total_updates = 0
+        self._algo.update_entropy = False
+        logger.info(
+            "Pre-training from demonstrations for %s epochs over %s samples "
+            "(batch_size=%s)",
+            num_epochs,
+            num_samples,
+            self._batch_size,
+        )
+        try:
+            for epoch in range(num_epochs):
+                epoch_updates = 0
+                progress = tqdm(
+                    self._replay_buffer.iter_batches(
+                        self._batch_size,
+                        self._device,
+                        num_samples=num_samples,
+                        shuffle=True,
+                    ),
+                    desc=f"Demo epoch {epoch + 1}/{num_epochs}",
+                )
+                for batch in progress:
+                    self.update_model_from_batch(batch)
+                    epoch_updates += 1
+                    total_updates += 1
+                logger.info(
+                    "Finished demonstration epoch %s/%s with %s updates",
+                    epoch + 1,
+                    num_epochs,
+                    epoch_updates,
+                )
+        finally:
+            self._algo.update_entropy = True
+
+        logger.info("Finished demonstration pre-training with %s total updates", total_updates)
+        return total_updates
 
     def pre_train(self, num_updates=None):
         self._algo.update_entropy = False

@@ -312,10 +312,14 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             "penalize_actions_diff_coef",
             getattr(self.config, "penalize_actions_diff_coef", 0.1),
         )
-        self.neutral_reverse_gear_penalty = getattr(
+        self.neutral_reverse_gear_step_penalty = getattr(
             reward_config,
-            "neutral_reverse_gear_penalty",
-            getattr(self.config, "neutral_reverse_gear_penalty", 0.05),
+            "neutral_reverse_gear_step_penalty",
+            getattr(
+                reward_config,
+                "neutral_reverse_gear_penalty",
+                getattr(self.config, "neutral_reverse_gear_penalty", 0.001),
+            ),
         )
         self.enable_out_of_track_penalty = getattr(
             reward_config,
@@ -783,9 +787,10 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
 
         reward = 0.0
         if gear <= 0:
-            reward -= self.neutral_reverse_gear_penalty
+            reward -= self.neutral_reverse_gear_step_penalty
 
         state["gear_shift_reward"] = reward
+        state["neutral_reverse_gear_penalty"] = reward
         return reward
 
     def get_current_out_of_track_penalty(self):
