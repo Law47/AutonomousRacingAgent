@@ -35,6 +35,51 @@ import Common.logging_config as logging_config
 
 logger = logging.getLogger(__name__)
 DEFAULT_FLUSH_INTERVAL_S = 300.0
+PROGRESS_LOG_INTERVAL_STEPS = 10_000
+
+
+class PeriodicResetSchedule:
+    def __init__(self, start_period_s, end_period_s, duration_steps):
+        if start_period_s <= 0.0:
+            raise ValueError("periodic reset start period must be greater than 0 seconds")
+        if end_period_s <= 0.0:
+            raise ValueError("periodic reset end period must be greater than 0 seconds")
+        if duration_steps <= 0:
+            raise ValueError("periodic reset duration steps must be greater than 0")
+
+        self.start_period_s = float(start_period_s)
+        self.end_period_s = float(end_period_s)
+        self.duration_steps = int(duration_steps)
+
+    def get_period_s(self, step_count):
+        progress = min(max(int(step_count), 0) / self.duration_steps, 1.0)
+        return self.start_period_s + ((self.end_period_s - self.start_period_s) * progress)
+
+    def __str__(self):
+        return (
+            f"{self.start_period_s:g}s->{self.end_period_s:g}s "
+            f"over {self.duration_steps} steps"
+        )
+
+
+def parse_periodic_reset_schedule(raw_value):
+    if not raw_value:
+        return None
+
+    parts = raw_value.split(":")
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError(
+            "--periodic_reset must use START_SECONDS:END_SECONDS:DURATION_STEPS, "
+            "for example --periodic_reset 10:400:1000000"
+        )
+
+    try:
+        start_period_s = float(parts[0])
+        end_period_s = float(parts[1])
+        duration_steps = int(parts[2])
+        return PeriodicResetSchedule(start_period_s, end_period_s, duration_steps)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,6 +102,17 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_FLUSH_INTERVAL_S,
         help="How often to flush recorded demonstration chunks to disk",
+    )
+    parser.add_argument(
+        "--periodic_reset",
+        type=parse_periodic_reset_schedule,
+        default=None,
+        help=(
+            "Optionally send periodic ACReset reset commands while recording. "
+            "Format: START_SECONDS:END_SECONDS:DURATION_STEPS. "
+            "Example: 10:400:1000000 starts with resets every 10s and linearly "
+            "increases the period to 400s over 1,000,000 recorded steps."
+        ),
     )
     parser.add_argument(
         "overrides",
@@ -264,6 +320,20 @@ def flush_recorded_states(
     return previous_abs_controls, previous_stable_gear, history_tail, saved_count
 
 
+def send_periodic_reset(env, reset_count, current_period_s, total_seen_states) -> None:
+    logger.info(
+        "Sending periodic ACReset command #%s at recorded_step=%s current_period=%.3fs",
+        reset_count,
+        total_seen_states,
+        current_period_s,
+    )
+    env.client.controls.set_defaults()
+    env.client.respond_to_server()
+    env.client.simulation_management.send_reset()
+    env.shift_gate.reset()
+    env.termination_counter = int(TERMINAL_JUDGE_TIMEOUT * env.ctrl_rate)
+
+
 def main() -> None:
     args = parse_args()
     config = OmegaConf.load(args.config)
@@ -296,7 +366,11 @@ def main() -> None:
     total_saved_states = 0
     total_seen_states = 0
     last_flush_time = time.perf_counter()
+    last_periodic_reset_time = last_flush_time
+    periodic_reset_count = 0
     logger.info("Recording demonstration to %s", output_dir)
+    if args.periodic_reset:
+        logger.info("Periodic ACReset enabled: %s", args.periodic_reset)
 
     try:
         while True:
@@ -307,6 +381,10 @@ def main() -> None:
             expanded_state, _ = env.expand_state(raw_state)
             recorded_states.append(expanded_state)
             total_seen_states += 1
+            if total_seen_states % PROGRESS_LOG_INTERVAL_STEPS == 0:
+                message = f"Recorded {total_seen_states} demonstration steps"
+                print(message)
+                logger.info(message)
 
             should_flush = (capture_time - last_flush_time) >= args.flush_interval_s
             if should_flush:
@@ -321,6 +399,28 @@ def main() -> None:
                 )
                 total_saved_states += saved_count
                 last_flush_time = capture_time
+
+            if args.periodic_reset:
+                current_period_s = args.periodic_reset.get_period_s(total_seen_states)
+                should_reset = (capture_time - last_periodic_reset_time) >= current_period_s
+                if should_reset:
+                    previous_abs_controls, previous_stable_gear, history_tail, saved_count = flush_recorded_states(
+                        env,
+                        save_path,
+                        recorded_states,
+                        previous_abs_controls,
+                        previous_stable_gear,
+                        history_tail,
+                        shift_label_min_drive_gear,
+                    )
+                    total_saved_states += saved_count
+                    last_flush_time = capture_time
+                    periodic_reset_count += 1
+                    send_periodic_reset(env, periodic_reset_count, current_period_s, total_seen_states)
+                    previous_abs_controls = None
+                    previous_stable_gear = None
+                    history_tail = []
+                    last_periodic_reset_time = time.perf_counter()
 
             if args.max_steps and total_seen_states >= args.max_steps:
                 logger.info("Reached max_steps=%s", args.max_steps)

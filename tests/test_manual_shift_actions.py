@@ -96,6 +96,7 @@ from AssettoCorsaEnv import vjoy as vjoy_module
 from AssettoCorsaPlugin.plugins.sensors_par import car_control
 from discor.replay_buffer import ReplayBuffer
 from discor.algorithm.sac import SAC
+from recordDemo import PeriodicResetSchedule, parse_periodic_reset_schedule
 
 
 class FakeControls(dict):
@@ -354,6 +355,23 @@ def test_sac_behavior_cloning_trains_against_demo_actions():
     )
 
     assert stats["behavior_clone_loss"] > 0.0
+
+
+def test_periodic_reset_schedule_lerps_period_by_recorded_steps():
+    schedule = PeriodicResetSchedule(start_period_s=10.0, end_period_s=400.0, duration_steps=1_000_000)
+
+    assert np.isclose(schedule.get_period_s(0), 10.0)
+    assert np.isclose(schedule.get_period_s(500_000), 205.0)
+    assert np.isclose(schedule.get_period_s(1_000_000), 400.0)
+    assert np.isclose(schedule.get_period_s(2_000_000), 400.0)
+
+
+def test_parse_periodic_reset_schedule_uses_start_end_steps_format():
+    schedule = parse_periodic_reset_schedule("10:400:1000000")
+
+    assert np.isclose(schedule.start_period_s, 10.0)
+    assert np.isclose(schedule.end_period_s, 400.0)
+    assert schedule.duration_steps == 1_000_000
 
 
 def test_load_history_reads_streaming_demo_file_and_ignores_partial_tail(tmp_path):
