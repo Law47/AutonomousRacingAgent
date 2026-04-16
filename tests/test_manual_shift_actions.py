@@ -1,5 +1,6 @@
 import sys
 import types
+import pickle
 from pathlib import Path
 
 import numpy as np
@@ -83,7 +84,7 @@ sys.modules["AssettoCorsaEnv.sensors_ray_casting"] = sensors_module
 sys.modules["AssettoCorsaEnv.gap"] = gap_module
 sys.modules["AssettoCorsaEnv.brake_map"] = brake_map_module
 
-from AssettoCorsaEnv.ac_env import AssettoCorsaEnv, GearShiftGate
+from AssettoCorsaEnv.ac_env import AssettoCorsaEnv, GearShiftGate, STREAMING_DEMO_FORMAT
 from AssettoCorsaEnv.data_loader import DataLoader
 from AssettoCorsaPlugin.plugins.sensors_par import car_control
 
@@ -213,6 +214,25 @@ def test_offline_loader_infers_shift_up_from_gear_delta():
     inferred = loader.infer_shift_actions({"actualGear": 4}, {"actualGear": 3})
 
     np.testing.assert_allclose(inferred, [1.0, 0.0])
+
+
+def test_load_history_reads_streaming_demo_file_and_ignores_partial_tail(tmp_path):
+    env = AssettoCorsaEnv.__new__(AssettoCorsaEnv)
+    save_path = tmp_path / "demo.pkl"
+    static_info = {"TrackFullName": "monza", "CarName": "bmw_z4_gt3"}
+    states = [{"step": 1}, {"step": 2}, {"step": 3}]
+
+    with open(save_path, "wb") as file_handle:
+        pickle.dump({"format": STREAMING_DEMO_FORMAT, "static_info": static_info}, file_handle)
+        pickle.dump({"states": states[:2]}, file_handle)
+        pickle.dump({"states": states[2:]}, file_handle)
+        truncated_chunk = pickle.dumps({"states": [{"step": 999}]}, protocol=pickle.HIGHEST_PROTOCOL)[:-7]
+        file_handle.write(truncated_chunk)
+
+    trajectory, loaded_static_info = env.load_history(save_path)
+
+    assert loaded_static_info == static_info
+    assert trajectory == states
 
 
 def test_gear_shift_reward_does_not_reward_upshift_at_high_rpm():

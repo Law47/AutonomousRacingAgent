@@ -21,11 +21,16 @@ for path in reversed(LOCAL_IMPORT_PATHS):
     sys.path.insert(0, path)
 
 import AssettoCorsaEnv.assettoCorsa as assettoCorsa
-from AssettoCorsaEnv.ac_env import TERMINAL_JUDGE_TIMEOUT
+from AssettoCorsaEnv.ac_env import (
+    PAST_ACTIONS_WINDOW,
+    STREAMING_DEMO_FORMAT,
+    TERMINAL_JUDGE_TIMEOUT,
+)
 from AssettoCorsaEnv.brake_map import BrakeMap
 import Common.logging_config as logging_config
 
 logger = logging.getLogger(__name__)
+DEFAULT_FLUSH_INTERVAL_S = 300.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,6 +49,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional maximum number of recorded telemetry steps (0 means unlimited)",
     )
     parser.add_argument(
+        "--flush_interval_s",
+        type=float,
+        default=DEFAULT_FLUSH_INTERVAL_S,
+        help="How often to flush recorded demonstration chunks to disk",
+    )
+    parser.add_argument(
         "overrides",
         nargs=argparse.REMAINDER,
         help="OmegaConf dotlist overrides",
@@ -58,6 +69,11 @@ def build_output_dir(args: argparse.Namespace) -> str:
         output_dir = os.path.join(ROOT_DIR, "demonstrations", datetime.now().strftime("%Y%m%d_%H%M%S.%f")[:-3])
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
+
+
+def build_demo_file_path(output_dir: str) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S.%f")[:-3]
+    return os.path.join(output_dir, f"{timestamp}_demo.pkl")
 
 
 def wait_for_record_start() -> None:
@@ -133,9 +149,18 @@ def interpolate_controls(states, absolute_controls):
     return interpolated.astype(np.float32)
 
 
-def enrich_states_with_actions(env, recorded_states):
+def enrich_states_with_actions(
+    env,
+    recorded_states,
+    previous_abs_controls=None,
+    previous_gear=None,
+    history_tail=None,
+):
     if not recorded_states:
-        return []
+        return [], previous_abs_controls, previous_gear, history_tail or []
+
+    if history_tail is None:
+        history_tail = []
 
     brake_map_file = Path(env.ac_configs_path) / "cars" / env.config.car / "brake_map.csv"
     brake_map = BrakeMap.load(brake_map_file)
@@ -145,29 +170,23 @@ def enrich_states_with_actions(env, recorded_states):
     absolute_controls = interpolate_controls(recorded_states, absolute_controls)
 
     processed_states = []
-    previous_abs_controls = absolute_controls[0]
-    previous_gear = int(recorded_states[0].get("actualGear", 0))
-
     for index, raw_state in enumerate(recorded_states):
         state = raw_state.copy()
         current_abs_controls = absolute_controls[index]
+        current_gear = int(state.get("actualGear", 0))
+        model_actions = np.zeros(env.action_dim, dtype=np.float32)
 
-        if index == 0:
-            model_actions = np.zeros(env.action_dim, dtype=np.float32)
-        else:
-            model_actions = np.zeros(env.action_dim, dtype=np.float32)
+        if previous_abs_controls is not None:
             model_actions[:env.control_action_dim] = env.inverse_preprocess_actions(
                 previous_abs_controls,
                 current_abs_controls,
             )
-
-            current_gear = int(state.get("actualGear", previous_gear))
+        if previous_gear is not None:
             gear_delta = current_gear - previous_gear
             if gear_delta > 0:
                 model_actions[3] = 1.0
             elif gear_delta < 0:
                 model_actions[4] = 1.0
-            previous_gear = current_gear
 
         for control_index in range(env.control_action_dim):
             state[f"current_action_abs_{control_index}"] = float(current_abs_controls[control_index])
@@ -176,23 +195,68 @@ def enrich_states_with_actions(env, recorded_states):
         state["shift_up"] = bool(model_actions[3] > 0.5)
         state["shift_down"] = bool(model_actions[4] > 0.5)
 
-        _, actions_diff = env.get_obs(state, processed_states)
+        _, actions_diff = env.get_obs(state, history_tail + processed_states)
         state["reward"] = env.get_reward(state, actions_diff).item()
 
         processed_states.append(state)
         previous_abs_controls = current_abs_controls
+        previous_gear = current_gear
 
-    return processed_states
+    history_tail = (history_tail + processed_states)[-PAST_ACTIONS_WINDOW:]
+    return processed_states, previous_abs_controls, previous_gear, history_tail
 
 
-def save_demonstration(output_dir, states, static_info):
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S.%f")[:-3]
-    save_path = os.path.join(output_dir, f"{timestamp}_demo.pkl")
-    payload = {"states": states, "static_info": static_info}
+def initialize_streaming_demo_file(save_path, static_info):
+    payload = {
+        "format": STREAMING_DEMO_FORMAT,
+        "static_info": static_info,
+        "created_at": datetime.now().isoformat(),
+    }
     with open(save_path, "wb") as file_handle:
         pickle.dump(payload, file_handle, protocol=pickle.HIGHEST_PROTOCOL)
-    logger.info("Saved demonstration to %s", save_path)
-    return save_path
+        file_handle.flush()
+        os.fsync(file_handle.fileno())
+    logger.info("Initialized streaming demonstration file at %s", save_path)
+
+
+def append_demo_chunk(save_path, states):
+    if not states:
+        return 0
+
+    payload = {
+        "states": states,
+        "saved_at": datetime.now().isoformat(),
+        "count": len(states),
+    }
+    with open(save_path, "ab") as file_handle:
+        pickle.dump(payload, file_handle, protocol=pickle.HIGHEST_PROTOCOL)
+        file_handle.flush()
+        os.fsync(file_handle.fileno())
+    logger.info("Flushed %s recorded states to %s", len(states), save_path)
+    return len(states)
+
+
+def flush_recorded_states(
+    env,
+    save_path,
+    pending_states,
+    previous_abs_controls,
+    previous_gear,
+    history_tail,
+):
+    if not pending_states:
+        return previous_abs_controls, previous_gear, history_tail, 0
+
+    processed_states, previous_abs_controls, previous_gear, history_tail = enrich_states_with_actions(
+        env,
+        pending_states,
+        previous_abs_controls=previous_abs_controls,
+        previous_gear=previous_gear,
+        history_tail=history_tail,
+    )
+    saved_count = append_demo_chunk(save_path, processed_states)
+    pending_states.clear()
+    return previous_abs_controls, previous_gear, history_tail, saved_count
 
 
 def main() -> None:
@@ -213,7 +277,15 @@ def main() -> None:
     env.shift_gate.reset()
     env.termination_counter = int(TERMINAL_JUDGE_TIMEOUT * env.ctrl_rate)
 
+    save_path = build_demo_file_path(output_dir)
+    initialize_streaming_demo_file(save_path, env.static_info)
+
     recorded_states = []
+    previous_abs_controls = None
+    previous_gear = None
+    history_tail = []
+    total_saved_states = 0
+    last_flush_time = time.perf_counter()
     logger.info("Recording demonstration to %s", output_dir)
 
     try:
@@ -225,6 +297,19 @@ def main() -> None:
             expanded_state, _ = env.expand_state(raw_state)
             recorded_states.append(expanded_state)
 
+            should_flush = (capture_time - last_flush_time) >= args.flush_interval_s
+            if should_flush:
+                previous_abs_controls, previous_gear, history_tail, saved_count = flush_recorded_states(
+                    env,
+                    save_path,
+                    recorded_states,
+                    previous_abs_controls,
+                    previous_gear,
+                    history_tail,
+                )
+                total_saved_states += saved_count
+                last_flush_time = capture_time
+
             if args.max_steps and len(recorded_states) >= args.max_steps:
                 logger.info("Reached max_steps=%s", args.max_steps)
                 break
@@ -234,14 +319,21 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.info("Recording interrupted by user")
     finally:
+        previous_abs_controls, previous_gear, history_tail, saved_count = flush_recorded_states(
+            env,
+            save_path,
+            recorded_states,
+            previous_abs_controls,
+            previous_gear,
+            history_tail,
+        )
+        total_saved_states += saved_count
         env.client.close()
 
-    if not recorded_states:
+    if total_saved_states == 0:
         raise ValueError("No telemetry frames were recorded")
 
-    processed_states = enrich_states_with_actions(env, recorded_states)
-    save_path = save_demonstration(output_dir, processed_states, env.static_info)
-    print(f"Saved demonstration: {save_path}")
+    print(f"Saved demonstration: {save_path} ({total_saved_states} states)")
 
 
 if __name__ == "__main__":

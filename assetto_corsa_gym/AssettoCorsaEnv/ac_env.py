@@ -47,6 +47,7 @@ CONTROL_ACTION_DIM = 3
 MODEL_ACTION_DIM = 5
 SHIFT_UP_ACTION_INDEX = 3
 SHIFT_DOWN_ACTION_INDEX = 4
+STREAMING_DEMO_FORMAT = "streaming_demo_v1"
 
 def get_date_timestemp():
     return datetime.now().strftime('%Y%m%d_%H%M%S.%f')[:-3]
@@ -1087,8 +1088,25 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         elif file_path.suffix == ".pkl":
             with open(file_path, "rb") as f:
                 data = pickle.load(f)
-                trajectory = data["states"]
-                static_info = data["static_info"]
+                if isinstance(data, dict) and data.get("format") == STREAMING_DEMO_FORMAT:
+                    static_info = data["static_info"]
+                    trajectory = []
+                    while True:
+                        try:
+                            chunk = pickle.load(f)
+                        except EOFError:
+                            break
+                        except pickle.UnpicklingError:
+                            logger.warning(
+                                "Detected an incomplete trailing chunk while loading %s. "
+                                "Continuing with the last fully-saved demonstration data.",
+                                file_path,
+                            )
+                            break
+                        trajectory.extend(chunk.get("states", []))
+                else:
+                    trajectory = data["states"]
+                    static_info = data["static_info"]
         else:
             raise ValueError(f"Unsupported file format: {file_path.suffix}")
 
