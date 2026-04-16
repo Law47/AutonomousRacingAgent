@@ -1,9 +1,11 @@
 import sys
 import types
 import pickle
+import os
 from pathlib import Path
 
 import numpy as np
+import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 ASSETTO_GYM = ROOT / "assetto_corsa_gym"
@@ -89,8 +91,11 @@ sys.modules["AssettoCorsaEnv.brake_map"] = brake_map_module
 
 from AssettoCorsaEnv.ac_env import AssettoCorsaEnv, GearShiftGate, STREAMING_DEMO_FORMAT
 from AssettoCorsaEnv.data_loader import DataLoader
+from AssettoCorsaEnv.gear_shift_labels import infer_shift_from_state
+from AssettoCorsaEnv import vjoy as vjoy_module
 from AssettoCorsaPlugin.plugins.sensors_par import car_control
 from discor.replay_buffer import ReplayBuffer
+from discor.algorithm.sac import SAC
 
 
 class FakeControls(dict):
@@ -128,7 +133,7 @@ def make_env_stub(cooldown_steps=0):
     env.shift_down_count = 0
     env.use_reference_line_in_reward = False
     env.penalize_actions_diff = False
-    env.neutral_reverse_gear_step_penalty = 0.001
+    env.reverse_gear_step_penalty = 0.001
     env.enable_out_of_track_penalty = False
     env.out_of_track_penalty_start = 0.1
     env.out_of_track_penalty_end = 0.1
@@ -214,15 +219,48 @@ def test_offline_loader_prefers_recorded_five_action_demo_tensor():
 
 def test_offline_loader_infers_shift_up_from_gear_delta():
     loader = DataLoader.__new__(DataLoader)
+    loader.shift_label_min_drive_gear = 2
 
     inferred = loader.infer_shift_actions({"actualGear": 4}, {"actualGear": 3})
 
     np.testing.assert_allclose(inferred, [1.0, 0.0])
 
 
+def test_stable_shift_labels_ignore_transient_neutral_gear():
+    previous_stable_gear = None
+    sequence = [6, 1, 7]
+    labels = []
+
+    for gear in sequence:
+        shift_actions, previous_stable_gear, _ = infer_shift_from_state(
+            {"actualGear": gear},
+            previous_stable_gear,
+            min_drive_gear=2,
+        )
+        labels.append(shift_actions)
+
+    np.testing.assert_allclose(labels[0], [0.0, 0.0])
+    np.testing.assert_allclose(labels[1], [0.0, 0.0])
+    np.testing.assert_allclose(labels[2], [1.0, 0.0])
+
+
+def test_offline_loader_replaces_bad_recorded_shift_labels():
+    loader = DataLoader.__new__(DataLoader)
+    loader.env = type("EnvStub", (), {"action_dim": 5, "gear_shift_threshold": 0.5})()
+
+    actions, changed = loader.replace_shift_labels(
+        np.array([0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+        np.array([0.0, 0.0], dtype=np.float32),
+    )
+
+    assert changed is True
+    np.testing.assert_allclose(actions, [0.0, 0.0, 0.0, 0.0, 0.0])
+
+
 def test_demo_shift_alignment_matches_model_shift_gate_indices():
     loader = DataLoader.__new__(DataLoader)
     loader.env = type("EnvStub", (), {"action_dim": 5, "gear_shift_threshold": 0.5})()
+    loader.shift_label_min_drive_gear = 2
     trajectory = [
         {"actualGear": 2, "actions_0": 0.0, "actions_1": 0.0, "actions_2": 0.0, "actions_3": 0.0, "actions_4": 0.0},
         {"actualGear": 3, "actions_0": 0.0, "actions_1": 0.0, "actions_2": 0.0, "actions_3": 1.0, "actions_4": 0.0},
@@ -241,6 +279,7 @@ def test_demo_shift_alignment_matches_model_shift_gate_indices():
 def test_demo_shift_alignment_detects_missing_shift_signal():
     loader = DataLoader.__new__(DataLoader)
     loader.env = type("EnvStub", (), {"action_dim": 5, "gear_shift_threshold": 0.5})()
+    loader.shift_label_min_drive_gear = 2
     trajectory = [
         {"actualGear": 2, "actions_0": 0.0, "actions_1": 0.0, "actions_2": 0.0, "actions_3": 0.0, "actions_4": 0.0},
         {"actualGear": 3, "actions_0": 0.0, "actions_1": 0.0, "actions_2": 0.0, "actions_3": 0.0, "actions_4": 0.0},
@@ -250,6 +289,24 @@ def test_demo_shift_alignment_detects_missing_shift_signal():
 
     assert stats["gear_up_events"] == 1
     assert stats["shift_up_signals"] == 0
+    assert stats["mismatches"] == 1
+
+
+def test_demo_shift_alignment_flags_neutral_transition_shift_noise():
+    loader = DataLoader.__new__(DataLoader)
+    loader.env = type("EnvStub", (), {"action_dim": 5, "gear_shift_threshold": 0.5})()
+    loader.shift_label_min_drive_gear = 2
+    trajectory = [
+        {"actualGear": 6, "actions_0": 0.0, "actions_1": 0.0, "actions_2": 0.0, "actions_3": 0.0, "actions_4": 0.0},
+        {"actualGear": 1, "actions_0": 0.0, "actions_1": 0.0, "actions_2": 0.0, "actions_3": 0.0, "actions_4": 1.0},
+        {"actualGear": 7, "actions_0": 0.0, "actions_1": 0.0, "actions_2": 0.0, "actions_3": 1.0, "actions_4": 0.0},
+    ]
+
+    stats = loader.validate_shift_action_alignment(trajectory)
+
+    assert stats["gear_up_events"] == 1
+    assert stats["gear_down_events"] == 0
+    assert stats["ignored_unstable_gear_frames"] == 1
     assert stats["mismatches"] == 1
 
 
@@ -266,6 +323,37 @@ def test_replay_buffer_iter_batches_visits_demo_dataset_once():
     visited_states = np.concatenate([batch[0].cpu().numpy().reshape(-1) for batch in batches])
     assert batch_sizes == [2, 2, 1]
     np.testing.assert_allclose(visited_states, [0, 1, 2, 3, 4])
+
+
+def test_sac_behavior_cloning_trains_against_demo_actions():
+    class FakeWriter:
+        def add_scalar(self, *args, **kwargs):
+            pass
+
+    algo = SAC(
+        state_dim=4,
+        action_dim=5,
+        device=torch.device("cpu"),
+        policy_hidden_units=[8],
+        q_hidden_units=[8],
+        log_interval=1,
+        seed=0,
+    )
+    states = torch.zeros((4, 4), dtype=torch.float32)
+    demo_actions = torch.zeros((4, 5), dtype=torch.float32)
+    demo_actions[:, 3] = 1.0
+    rewards = torch.zeros((4, 1), dtype=torch.float32)
+    dones = torch.zeros((4, 1), dtype=torch.float32)
+    batch = (states, demo_actions, rewards, states, dones)
+
+    stats = algo.update_behavior_cloning(
+        batch,
+        FakeWriter(),
+        action_weights=np.array([1.0, 1.0, 1.0, 25.0, 25.0], dtype=np.float32),
+        loss_coef=1.0,
+    )
+
+    assert stats["behavior_clone_loss"] > 0.0
 
 
 def test_load_history_reads_streaming_demo_file_and_ignores_partial_tail(tmp_path):
@@ -309,12 +397,20 @@ def test_gear_shift_reward_does_not_penalize_wrong_rpm_shift():
     assert env.get_gear_shift_reward(state) == 0.0
 
 
-def test_gear_shift_reward_penalizes_neutral_or_reverse():
+def test_gear_shift_reward_does_not_penalize_neutral():
     env = make_env_stub()
     state = {"RPM": 4000.0, "actualGear": 0, "shift_up": False, "shift_down": False}
 
+    assert env.get_gear_shift_reward(state) == 0.0
+    assert state["reverse_gear_penalty"] == 0.0
+
+
+def test_gear_shift_reward_penalizes_reverse():
+    env = make_env_stub()
+    state = {"RPM": 4000.0, "actualGear": -1, "shift_up": False, "shift_down": False}
+
     assert env.get_gear_shift_reward(state) == -0.001
-    assert state["neutral_reverse_gear_penalty"] == -0.001
+    assert state["reverse_gear_penalty"] == -0.001
 
 
 def test_gear_shift_reward_does_not_reward_shift_signal_before_threshold():
@@ -445,3 +541,35 @@ def test_vjoy_backend_maps_shift_down_to_button_three(monkeypatch):
 
     controls.set_controls(0.0, -1.0, -1.0, enable_gear_shift=True, shift_down=True)
     assert FakeVJoy.instance.positions[-1]["lButtons"] == car_control.VJOY_SHIFT_DOWN_BUTTON
+
+
+def test_vjoy_backend_accepts_configured_dll_path(monkeypatch, tmp_path):
+    class FakeVJoy:
+        def open(self):
+            return True
+
+        def close(self):
+            return True
+
+        def generateJoystickPosition(self, **kwargs):
+            return kwargs
+
+        def update(self, joystickPosition):
+            return True
+
+    dll_path = tmp_path / "vJoyInterface.dll"
+    dll_path.write_bytes(b"fake")
+    monkeypatch.delenv("VJOY_DLL_PATH", raising=False)
+    monkeypatch.setattr(car_control, "vJoy", FakeVJoy)
+
+    car_control.Controls(backend="vjoy", vjoy_dll_path=str(dll_path))
+
+    assert os.environ["VJOY_DLL_PATH"] == str(dll_path)
+
+
+def test_vjoy_dll_resolver_uses_env_var_path(tmp_path, monkeypatch):
+    dll_path = tmp_path / "vJoyInterface.dll"
+    dll_path.write_bytes(b"fake")
+    monkeypatch.setenv("VJOY_DLL_PATH", str(dll_path))
+
+    assert vjoy_module.resolve_vjoy_dll_path() == str(dll_path)

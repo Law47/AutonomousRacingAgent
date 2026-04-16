@@ -27,6 +27,10 @@ from AssettoCorsaEnv.ac_env import (
     TERMINAL_JUDGE_TIMEOUT,
 )
 from AssettoCorsaEnv.brake_map import BrakeMap
+from AssettoCorsaEnv.gear_shift_labels import (
+    DEFAULT_SHIFT_LABEL_MIN_DRIVE_GEAR,
+    infer_shift_from_state,
+)
 import Common.logging_config as logging_config
 
 logger = logging.getLogger(__name__)
@@ -153,11 +157,12 @@ def enrich_states_with_actions(
     env,
     recorded_states,
     previous_abs_controls=None,
-    previous_gear=None,
+    previous_stable_gear=None,
     history_tail=None,
+    shift_label_min_drive_gear=DEFAULT_SHIFT_LABEL_MIN_DRIVE_GEAR,
 ):
     if not recorded_states:
-        return [], previous_abs_controls, previous_gear, history_tail or []
+        return [], previous_abs_controls, previous_stable_gear, history_tail or []
 
     if history_tail is None:
         history_tail = []
@@ -173,7 +178,6 @@ def enrich_states_with_actions(
     for index, raw_state in enumerate(recorded_states):
         state = raw_state.copy()
         current_abs_controls = absolute_controls[index]
-        current_gear = int(state.get("actualGear", 0))
         model_actions = np.zeros(env.action_dim, dtype=np.float32)
 
         if previous_abs_controls is not None:
@@ -181,12 +185,12 @@ def enrich_states_with_actions(
                 previous_abs_controls,
                 current_abs_controls,
             )
-        if previous_gear is not None:
-            gear_delta = current_gear - previous_gear
-            if gear_delta > 0:
-                model_actions[3] = 1.0
-            elif gear_delta < 0:
-                model_actions[4] = 1.0
+        shift_actions, previous_stable_gear, _ = infer_shift_from_state(
+            state,
+            previous_stable_gear,
+            min_drive_gear=shift_label_min_drive_gear,
+        )
+        model_actions[3:5] = shift_actions
 
         for control_index in range(env.control_action_dim):
             state[f"current_action_abs_{control_index}"] = float(current_abs_controls[control_index])
@@ -200,10 +204,9 @@ def enrich_states_with_actions(
 
         processed_states.append(state)
         previous_abs_controls = current_abs_controls
-        previous_gear = current_gear
 
     history_tail = (history_tail + processed_states)[-PAST_ACTIONS_WINDOW:]
-    return processed_states, previous_abs_controls, previous_gear, history_tail
+    return processed_states, previous_abs_controls, previous_stable_gear, history_tail
 
 
 def initialize_streaming_demo_file(save_path, static_info):
@@ -241,22 +244,24 @@ def flush_recorded_states(
     save_path,
     pending_states,
     previous_abs_controls,
-    previous_gear,
+    previous_stable_gear,
     history_tail,
+    shift_label_min_drive_gear,
 ):
     if not pending_states:
-        return previous_abs_controls, previous_gear, history_tail, 0
+        return previous_abs_controls, previous_stable_gear, history_tail, 0
 
-    processed_states, previous_abs_controls, previous_gear, history_tail = enrich_states_with_actions(
+    processed_states, previous_abs_controls, previous_stable_gear, history_tail = enrich_states_with_actions(
         env,
         pending_states,
         previous_abs_controls=previous_abs_controls,
-        previous_gear=previous_gear,
+        previous_stable_gear=previous_stable_gear,
         history_tail=history_tail,
+        shift_label_min_drive_gear=shift_label_min_drive_gear,
     )
     saved_count = append_demo_chunk(save_path, processed_states)
     pending_states.clear()
-    return previous_abs_controls, previous_gear, history_tail, saved_count
+    return previous_abs_controls, previous_stable_gear, history_tail, saved_count
 
 
 def main() -> None:
@@ -270,6 +275,10 @@ def main() -> None:
     logging.getLogger().setLevel(logging.INFO)
 
     env = assettoCorsa.make_ac_env(cfg=config, work_dir=output_dir)
+    demo_config = getattr(config, "Demonstrations", None)
+    shift_label_min_drive_gear = int(
+        getattr(demo_config, "shift_label_min_drive_gear", DEFAULT_SHIFT_LABEL_MIN_DRIVE_GEAR)
+    )
     wait_for_record_start()
 
     env.client.reset(send_reset=False)
@@ -282,7 +291,7 @@ def main() -> None:
 
     recorded_states = []
     previous_abs_controls = None
-    previous_gear = None
+    previous_stable_gear = None
     history_tail = []
     total_saved_states = 0
     total_seen_states = 0
@@ -301,13 +310,14 @@ def main() -> None:
 
             should_flush = (capture_time - last_flush_time) >= args.flush_interval_s
             if should_flush:
-                previous_abs_controls, previous_gear, history_tail, saved_count = flush_recorded_states(
+                previous_abs_controls, previous_stable_gear, history_tail, saved_count = flush_recorded_states(
                     env,
                     save_path,
                     recorded_states,
                     previous_abs_controls,
-                    previous_gear,
+                    previous_stable_gear,
                     history_tail,
+                    shift_label_min_drive_gear,
                 )
                 total_saved_states += saved_count
                 last_flush_time = capture_time
@@ -321,13 +331,14 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.info("Recording interrupted by user")
     finally:
-        previous_abs_controls, previous_gear, history_tail, saved_count = flush_recorded_states(
+        previous_abs_controls, previous_stable_gear, history_tail, saved_count = flush_recorded_states(
             env,
             save_path,
             recorded_states,
             previous_abs_controls,
-            previous_gear,
+            previous_stable_gear,
             history_tail,
+            shift_label_min_drive_gear,
         )
         total_saved_states += saved_count
         env.client.close()

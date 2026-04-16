@@ -1,6 +1,7 @@
 import os
 import torch
 from torch.optim import Adam
+from torch.nn import functional as F
 
 from .base import Algorithm
 from discor.network import TwinnedStateActionFunction, GaussianPolicy
@@ -85,6 +86,46 @@ class SAC(Algorithm):
         self._learning_steps += 1
         stats = self.update_policy_and_entropy(batch, writer)
         self.update_q_functions(batch, writer)
+        return stats
+
+    def update_behavior_cloning(self, batch, writer, action_weights=None, loss_coef=1.0):
+        states, demo_actions, _, _, _ = batch
+
+        _, _, deterministic_actions = self._policy_net(states)
+        bc_loss = F.mse_loss(deterministic_actions, demo_actions, reduction='none')
+        if action_weights is not None:
+            action_weights = torch.as_tensor(
+                action_weights,
+                dtype=bc_loss.dtype,
+                device=bc_loss.device,
+            ).view(1, -1)
+            bc_loss = bc_loss * action_weights
+        bc_loss = bc_loss.mean() * float(loss_coef)
+
+        update_params(self._policy_optim, bc_loss)
+
+        stats = {
+            "behavior_clone_loss": bc_loss.detach().item(),
+            "behavior_clone_shift_up_mean": deterministic_actions[:, 3].detach().mean().item()
+            if self._action_dim >= 5
+            else 0.0,
+            "behavior_clone_shift_down_mean": deterministic_actions[:, 4].detach().mean().item()
+            if self._action_dim >= 5
+            else 0.0,
+        }
+        if self._learning_steps % self._log_interval == 0:
+            writer.add_scalar('loss/behavior_clone', stats["behavior_clone_loss"], self._learning_steps)
+            if self._action_dim >= 5:
+                writer.add_scalar(
+                    'stats/behavior_clone_shift_up_mean',
+                    stats["behavior_clone_shift_up_mean"],
+                    self._learning_steps,
+                )
+                writer.add_scalar(
+                    'stats/behavior_clone_shift_down_mean',
+                    stats["behavior_clone_shift_down_mean"],
+                    self._learning_steps,
+                )
         return stats
 
     def update_policy_and_entropy(self, batch, writer):

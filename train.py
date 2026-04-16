@@ -90,16 +90,31 @@ def maybe_load_demonstrations(agent: Agent, env, config) -> bool:
 
     total_transitions = 0
     log_steer_ratios = getattr(demo_config, "log_steer_ratios", False)
+    clean_shift_labels = getattr(demo_config, "clean_shift_labels", True)
+    shift_label_min_drive_gear = int(getattr(demo_config, "shift_label_min_drive_gear", 2))
     for data_path in data_paths:
         abs_data_path = os.path.abspath(data_path)
-        total_transitions += agent.load_pre_train_data(abs_data_path, env, log_steer_ratios=log_steer_ratios)
+        total_transitions += agent.load_pre_train_data(
+            abs_data_path,
+            env,
+            log_steer_ratios=log_steer_ratios,
+            clean_shift_labels=clean_shift_labels,
+            shift_label_min_drive_gear=shift_label_min_drive_gear,
+        )
 
     if total_transitions <= 0:
         raise ValueError("No demonstration transitions were loaded from the configured paths")
 
     pretrain_epochs = int(getattr(demo_config, "pretrain_epochs", 0))
     if pretrain_epochs > 0:
-        agent.pre_train_epochs(pretrain_epochs, num_samples=total_transitions)
+        agent.pre_train_epochs(
+            pretrain_epochs,
+            num_samples=total_transitions,
+            behavior_clone=getattr(demo_config, "behavior_clone", True),
+            behavior_clone_loss_coef=getattr(demo_config, "behavior_clone_loss_coef", 1.0),
+            behavior_clone_control_weight=getattr(demo_config, "behavior_clone_control_weight", 1.0),
+            behavior_clone_shift_weight=getattr(demo_config, "behavior_clone_shift_weight", 25.0),
+        )
         return True
 
     legacy_pretrain_steps = int(getattr(demo_config, "pretrain_steps", 0))

@@ -32,10 +32,12 @@ SHIFT_BUTTON_HOLD_UPDATES = 3
 
 
 class Controls(object):
-    def __init__(self, backend="vigem"):
+    def __init__(self, backend="vigem", vjoy_dll_path=None):
         self.backend = (backend or "vigem").lower()
         if self.backend not in ["vigem", "vjoy"]:
             raise ValueError(f"Unsupported control backend '{self.backend}'. Use 'vigem' or 'vjoy'.")
+        if vjoy_dll_path:
+            os.environ["VJOY_DLL_PATH"] = vjoy_dll_path
 
         self.onButtons = 0
         self._shift_up_hold_remaining = 0
@@ -51,8 +53,18 @@ class Controls(object):
         else:
             if vJoy is None:
                 raise RuntimeError("vJoy backend requested but vJoy module is unavailable")
-            self.vj = vJoy()
-            self.vj.open()
+            try:
+                self.vj = vJoy()
+            except Exception as exc:
+                raise RuntimeError(
+                    "vJoy backend requested but vJoyInterface.dll could not be loaded. "
+                    "Install vJoy or set VJOY_DLL_PATH to the full path of vJoyInterface.dll."
+                ) from exc
+            if not self.vj.open():
+                raise RuntimeError(
+                    "vJoy backend requested but vJoy device 1 could not be acquired. "
+                    "Check that vJoy is installed, enabled, and device 1 exists in Configure vJoy."
+                )
             logger.info("Using vJoy backend")
 
         # internal state

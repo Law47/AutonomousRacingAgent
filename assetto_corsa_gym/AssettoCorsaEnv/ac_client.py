@@ -61,6 +61,7 @@ class Client():
         self.config = config
         self.vjoy_executed_by_server = config.vjoy_executed_by_server
         self.control_backend = getattr(config, "control_backend", "vigem")
+        self.vjoy_dll_path = getattr(config, "vjoy_dll_path", None)
         self.server_host = config.ego_server_host_name
         self.server_port = config.ego_server_port
         self.simulation_management_server_host_name = config.simulation_management_server_host_name
@@ -68,7 +69,7 @@ class Client():
         self.state = ServerState()
         self.simulation_management = SimulationManagement(self.config)
         self.socket = None
-        self.controls = DriverControls(self.vjoy_executed_by_server, self.control_backend)
+        self.controls = DriverControls(self.vjoy_executed_by_server, self.control_backend, self.vjoy_dll_path)
         self.record_controls_from_client = getattr(config, "record_controls_from_client", False)
 
         # Joystick handler (only used if needed)
@@ -239,15 +240,16 @@ class ServerState(dict):
         self.update( eval(server_string) )
 
 class DriverControls(dict):
-    def __init__(self, vjoy_executed_by_server=False, control_backend="vigem"):
+    def __init__(self, vjoy_executed_by_server=False, control_backend="vigem", vjoy_dll_path=None):
         self.vjoy_executed_by_server = vjoy_executed_by_server
         self.control_backend = control_backend
+        self.vjoy_dll_path = vjoy_dll_path
 
         self.set_defaults()
 
         if not self.vjoy_executed_by_server:
             logger.warning(f"Controls will be executed locally and not by the server (backend={self.control_backend})")
-            self.local_controls = Controls(backend=self.control_backend)
+            self.local_controls = Controls(backend=self.control_backend, vjoy_dll_path=self.vjoy_dll_path)
 
     def set_defaults(self):
         # steer, acc and brake are in the range [-1, 1]

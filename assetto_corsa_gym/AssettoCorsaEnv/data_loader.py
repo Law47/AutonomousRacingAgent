@@ -10,6 +10,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 from AssettoCorsaEnv.brake_map import BrakeMap
+from AssettoCorsaEnv.gear_shift_labels import (
+    DEFAULT_SHIFT_LABEL_MIN_DRIVE_GEAR,
+    infer_shift_from_state,
+)
 
 def read_yml(f):
     with open(f, 'r') as file:
@@ -21,7 +25,14 @@ def seconds_to_mm_ss_mmm(seconds):
     return f"{minutes:2d}:{remaining_seconds:06.3f}"
 
 class DataLoader():
-    def __init__(self, env, data_set_path, log_steer_ratios=False):
+    def __init__(
+        self,
+        env,
+        data_set_path,
+        log_steer_ratios=False,
+        clean_shift_labels=True,
+        shift_label_min_drive_gear=DEFAULT_SHIFT_LABEL_MIN_DRIVE_GEAR,
+    ):
         self.env = env
 
         # Find all .pkl and .parquet files in the dataset path
@@ -35,7 +46,11 @@ class DataLoader():
         self.trajectory_number = 0
         self.current_step = 0
         self.prev_abs_actions = None
+        self.prev_shift_label_gear = None
         self.log_steer_ratios = log_steer_ratios
+        self.clean_shift_labels = bool(clean_shift_labels)
+        self.shift_label_min_drive_gear = int(shift_label_min_drive_gear)
+        self.shift_label_rewrites = 0
 
         # load the brake and steer maps from the env config!!! -> check if using another car
         brake_map_file = Path(env.ac_configs_path) / "cars" / env.config.car / 'brake_map.csv'
@@ -65,57 +80,83 @@ class DataLoader():
 
         return None
 
+    def infer_shift_actions_from_stable_gear(self, current_state):
+        shift_actions, self.prev_shift_label_gear, _ = infer_shift_from_state(
+            current_state,
+            self.prev_shift_label_gear,
+            min_drive_gear=self.shift_label_min_drive_gear,
+        )
+        return shift_actions
+
     def infer_shift_actions(self, current_state, previous_state):
         if previous_state is None:
             return np.zeros(2, dtype='float32')
 
-        current_gear = int(current_state.get("actualGear", 0))
-        previous_gear = int(previous_state.get("actualGear", current_gear))
-        gear_delta = current_gear - previous_gear
+        previous_stable_gear = int(previous_state.get("actualGear", 0))
+        shift_actions, _, _ = infer_shift_from_state(
+            current_state,
+            previous_stable_gear,
+            min_drive_gear=self.shift_label_min_drive_gear,
+        )
+        return shift_actions
 
-        if gear_delta > 0:
-            return np.array([1.0, 0.0], dtype='float32')
-        if gear_delta < 0:
-            return np.array([0.0, 1.0], dtype='float32')
-        return np.zeros(2, dtype='float32')
+    def replace_shift_labels(self, actions, shift_actions, threshold=None):
+        cleaned_actions = np.asarray(actions, dtype='float32').copy()
+        if cleaned_actions.shape[0] < 5:
+            return cleaned_actions, False
+
+        original_shift_actions = cleaned_actions[3:5].copy()
+        cleaned_actions[3:5] = shift_actions
+        if threshold is None:
+            threshold = float(getattr(self.env, "gear_shift_threshold", 0.5))
+        changed = (
+            bool(original_shift_actions[0] > threshold) != bool(shift_actions[0] > threshold)
+            or bool(original_shift_actions[1] > threshold) != bool(shift_actions[1] > threshold)
+        )
+        return cleaned_actions, changed
 
     def validate_shift_action_alignment(self, trajectory):
         threshold = float(getattr(self.env, "gear_shift_threshold", 0.5))
         stats = {
             "gear_up_events": 0,
             "gear_down_events": 0,
+            "ignored_unstable_gear_frames": 0,
             "shift_up_signals": 0,
             "shift_down_signals": 0,
             "mismatches": 0,
             "has_recorded_model_actions": False,
         }
+        previous_stable_gear = None
 
-        for index in range(1, len(trajectory)):
-            previous_state = trajectory[index - 1]
+        for index in range(len(trajectory)):
             current_state = trajectory[index]
             recorded_actions = self.get_recorded_model_actions(current_state)
+            shift_actions, previous_stable_gear, is_stable_drive_gear = infer_shift_from_state(
+                current_state,
+                previous_stable_gear,
+                min_drive_gear=self.shift_label_min_drive_gear,
+            )
+            if not is_stable_drive_gear:
+                stats["ignored_unstable_gear_frames"] += 1
+
             if recorded_actions is None or recorded_actions.shape[0] < 5:
                 continue
 
             stats["has_recorded_model_actions"] = True
-            current_gear = int(current_state.get("actualGear", 0))
-            previous_gear = int(previous_state.get("actualGear", current_gear))
-            gear_delta = current_gear - previous_gear
             shift_up_active = bool(recorded_actions[3] > threshold)
             shift_down_active = bool(recorded_actions[4] > threshold)
+            expected_shift_up = bool(shift_actions[0] > threshold)
+            expected_shift_down = bool(shift_actions[1] > threshold)
 
             stats["shift_up_signals"] += int(shift_up_active)
             stats["shift_down_signals"] += int(shift_down_active)
 
-            if gear_delta > 0:
+            if expected_shift_up:
                 stats["gear_up_events"] += 1
-                if not shift_up_active or shift_down_active:
-                    stats["mismatches"] += 1
-            elif gear_delta < 0:
+            if expected_shift_down:
                 stats["gear_down_events"] += 1
-                if not shift_down_active or shift_up_active:
-                    stats["mismatches"] += 1
-            elif shift_up_active or shift_down_active:
+
+            if shift_up_active != expected_shift_up or shift_down_active != expected_shift_down:
                 stats["mismatches"] += 1
 
         if not stats["has_recorded_model_actions"]:
@@ -125,7 +166,7 @@ class DataLoader():
         log_message = (
             "Demonstration shift alignment: gear_up_events=%s gear_down_events=%s "
             "shift_up_signals=%s shift_down_signals=%s mismatches=%s "
-            "model_threshold=%.3f"
+            "ignored_unstable_gear_frames=%s model_threshold=%.3f min_drive_gear=%s"
         )
         log_args = (
             stats["gear_up_events"],
@@ -133,7 +174,9 @@ class DataLoader():
             stats["shift_up_signals"],
             stats["shift_down_signals"],
             stats["mismatches"],
+            stats["ignored_unstable_gear_frames"],
             threshold,
+            self.shift_label_min_drive_gear,
         )
         if stats["mismatches"]:
             logger.warning(log_message, *log_args)
@@ -176,6 +219,8 @@ class DataLoader():
             self.trajectory, self.static_info = self.env.load_history(load_path)
             self.trajectory_number += 1
             self.current_step = 0
+            self.prev_shift_label_gear = None
+            self.shift_label_rewrites = 0
             self.validate_shift_action_alignment(self.trajectory)
             if self.log_steer_ratios:
                 self.compute_steer_ratio_statistics(self.trajectory)
@@ -188,6 +233,7 @@ class DataLoader():
         history = self.trajectory[:self.current_step] # get the history seen so far
         previous_state = self.trajectory[self.current_step - 1] if self.current_step > 0 else None
         current_abs_actions = self.get_absolute_actions_from_state(state)
+        shift_actions = self.infer_shift_actions_from_stable_gear(state)
 
         if self.current_step == 0:
             self.prev_abs_actions = current_abs_actions
@@ -195,9 +241,11 @@ class DataLoader():
         recorded_model_actions = self.get_recorded_model_actions(state)
         if recorded_model_actions is not None:
             actions = recorded_model_actions
+            if self.clean_shift_labels:
+                actions, changed = self.replace_shift_labels(actions, shift_actions)
+                self.shift_label_rewrites += int(changed)
         else:
             controls_actions = self.env.inverse_preprocess_actions(self.prev_abs_actions, current_abs_actions)
-            shift_actions = self.infer_shift_actions(state, previous_state)
             actions = self.pad_model_actions(np.concatenate([controls_actions, shift_actions]))
         self.prev_abs_actions = current_abs_actions
 

@@ -28,10 +28,16 @@ SAC:
 
 Demonstrations:
   enabled: True
-  data_path: "C:\\Users\\Leo\\Documents\\Github\\AutonomousRacingAgent\\demonstrations\\session_01"
+  data_path: "C:\\Users\\Leo\\Documents\\Github\\AutonomousRacingAgent\\demonstrations\\session_03"
   data_paths: []
-  pretrain_epochs: 5
+  pretrain_epochs: 100
   log_steer_ratios: False
+  clean_shift_labels: True
+  shift_label_min_drive_gear: 2
+  behavior_clone: True
+  behavior_clone_loss_coef: 1.0
+  behavior_clone_control_weight: 1.0
+  behavior_clone_shift_weight: 100.0
 
 AssettoCorsa:
   ego_sampling_freq: 25
@@ -42,6 +48,7 @@ AssettoCorsa:
   opponents_server_port: 2346
   simulation_management_server_port: 2347
   control_backend: "vigem"
+  vjoy_dll_path: null
   use_relative_actions: True
   enable_sensors: True
   vjoy_executed_by_server: False
@@ -72,7 +79,7 @@ AssettoCorsa:
     use_reference_line_in_reward: True
     penalize_actions_diff: False
     penalize_actions_diff_coef: 0.1
-    neutral_reverse_gear_step_penalty: 0.001
+    reverse_gear_step_penalty: 0.1
     enable_out_of_track_penalty: True
     out_of_track_penalty_start: 0.075
     out_of_track_penalty_end: 0.5

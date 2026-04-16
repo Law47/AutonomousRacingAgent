@@ -333,11 +333,24 @@ class Agent:
             total_time=time.time() - self._start_time,
         )
 
-    def load_pre_train_data(self, trajs_path, env, log_steer_ratios=False):
+    def load_pre_train_data(
+        self,
+        trajs_path,
+        env,
+        log_steer_ratios=False,
+        clean_shift_labels=True,
+        shift_label_min_drive_gear=2,
+    ):
         total_added_episodes = 0
 
         buffer_size_before = len(self._replay_buffer)
-        env_data = DataLoader(env, trajs_path, log_steer_ratios=log_steer_ratios)
+        env_data = DataLoader(
+            env,
+            trajs_path,
+            log_steer_ratios=log_steer_ratios,
+            clean_shift_labels=clean_shift_labels,
+            shift_label_min_drive_gear=shift_label_min_drive_gear,
+        )
         for ep in tqdm(range(env_data.trajectories_count)[:]):
             state = env_data.reset()
 
@@ -361,6 +374,13 @@ class Agent:
                 state = next_state
                 if episode_done:
                     break
+            if getattr(env_data, "shift_label_rewrites", 0):
+                load_path = env_data.trajectories_paths[env_data.trajectory_number - 1]
+                logger.info(
+                    "Cleaned %s recorded shift-label frames while loading %s",
+                    env_data.shift_label_rewrites,
+                    load_path,
+                )
         added_transitions = len(self._replay_buffer) - buffer_size_before
         self._demo_transition_count += added_transitions
         logger.info(
@@ -372,7 +392,15 @@ class Agent:
         )
         return added_transitions
 
-    def pre_train_epochs(self, num_epochs, num_samples=None):
+    def pre_train_epochs(
+        self,
+        num_epochs,
+        num_samples=None,
+        behavior_clone=False,
+        behavior_clone_loss_coef=1.0,
+        behavior_clone_control_weight=1.0,
+        behavior_clone_shift_weight=25.0,
+    ):
         if len(self._replay_buffer) == 0:
             raise ValueError("Cannot pre-train without demonstration data in the replay buffer")
 
@@ -389,16 +417,30 @@ class Agent:
 
         total_updates = 0
         self._algo.update_entropy = False
+        if behavior_clone and not hasattr(self._algo, "update_behavior_cloning"):
+            raise ValueError("Configured demonstration behavior cloning, but the selected algorithm does not support it")
+
+        action_weights = None
+        if behavior_clone:
+            action_dim = self._env.action_space.shape[0]
+            action_weights = np.full((action_dim,), float(behavior_clone_control_weight), dtype=np.float32)
+            if action_dim >= 5:
+                action_weights[3:5] = float(behavior_clone_shift_weight)
+
         logger.info(
             "Pre-training from demonstrations for %s epochs over %s samples "
-            "(batch_size=%s)",
+            "(batch_size=%s behavior_clone=%s bc_loss_coef=%.3f bc_shift_weight=%.3f)",
             num_epochs,
             num_samples,
             self._batch_size,
+            behavior_clone,
+            behavior_clone_loss_coef,
+            behavior_clone_shift_weight,
         )
         try:
             for epoch in range(num_epochs):
                 epoch_updates = 0
+                epoch_bc_loss = []
                 progress = tqdm(
                     self._replay_buffer.iter_batches(
                         self._batch_size,
@@ -410,13 +452,26 @@ class Agent:
                 )
                 for batch in progress:
                     self.update_model_from_batch(batch)
+                    if behavior_clone:
+                        bc_stats = self._algo.update_behavior_cloning(
+                            batch,
+                            self._writer,
+                            action_weights=action_weights,
+                            loss_coef=behavior_clone_loss_coef,
+                        )
+                        if bc_stats:
+                            epoch_bc_loss.append(bc_stats["behavior_clone_loss"])
                     epoch_updates += 1
                     total_updates += 1
+                bc_loss_msg = ""
+                if epoch_bc_loss:
+                    bc_loss_msg = f" behavior_clone_loss={np.mean(epoch_bc_loss):.6f}"
                 logger.info(
-                    "Finished demonstration epoch %s/%s with %s updates",
+                    "Finished demonstration epoch %s/%s with %s updates%s",
                     epoch + 1,
                     num_epochs,
                     epoch_updates,
+                    bc_loss_msg,
                 )
         finally:
             self._algo.update_entropy = True
