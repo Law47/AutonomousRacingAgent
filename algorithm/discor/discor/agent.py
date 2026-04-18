@@ -14,6 +14,8 @@ import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+AGENT_TRAINING_STATE_FILE = "agent_training_state.pkl"
+
 import time
 
 class Agent:
@@ -21,7 +23,7 @@ class Agent:
                  batch_size=256, memory_size=1_000_000,
                  update_interval=1, start_steps=10000, log_interval=10, checkpoint_freq=0,
                  eval_interval=5000, num_eval_episodes=5, seed=0, use_offline_buffer=False, offline_buffer_size=1_000_000,
-                 wandb_logger=None, save_final_buffer=False):
+                 wandb_logger=None, save_final_buffer=False, training_dashboard=None):
 
         # Environment.
         self._env = env
@@ -29,6 +31,7 @@ class Agent:
         self.checkpoint_freq = checkpoint_freq
         self.wandb_logger = wandb_logger
         self.save_final_buffer = save_final_buffer
+        self.training_dashboard = training_dashboard
 
         self._env.seed(seed)
         self._test_env.seed(2**31-1-seed)
@@ -86,8 +89,64 @@ class Agent:
         logger.info(f'nstep: {self._algo.nstep}')
         logger.info(f'memory_size: {memory_size}')
 
+    def _agent_training_state(self):
+        return {
+            "format_version": 1,
+            "steps": self._steps,
+            "episodes": self._episodes,
+            "demo_transition_count": self._demo_transition_count,
+            "best_lap_time": self.best_lap_time,
+            "best_reward": self.best_reward,
+            "episodes_stats": self.episodes_stats,
+        }
+
+    def save_training_state(self, path):
+        state_path = os.path.join(path, AGENT_TRAINING_STATE_FILE)
+        tmp_path = state_path + ".tmp"
+        try:
+            with open(tmp_path, "wb") as f:
+                pickle.dump(self._agent_training_state(), f, protocol=pickle.HIGHEST_PROTOCOL)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, state_path)
+            logger.info("saved agent training state to %s", state_path)
+        except Exception:
+            logger.exception("Failed to save agent training state to %s", state_path)
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                logger.exception("Failed to remove temp agent state at %s", tmp_path)
+
+    def load_training_state(self, path):
+        state_path = os.path.join(path, AGENT_TRAINING_STATE_FILE)
+        if not os.path.exists(state_path):
+            logger.warning(
+                "%s not found in %s; agent counters will be inferred from replay buffer when available.",
+                AGENT_TRAINING_STATE_FILE,
+                path,
+            )
+            return False
+
+        with open(state_path, "rb") as f:
+            state = pickle.load(f)
+        self._steps = int(state.get("steps", self._steps))
+        self._episodes = int(state.get("episodes", self._episodes))
+        self._demo_transition_count = int(state.get("demo_transition_count", self._demo_transition_count))
+        self.best_lap_time = float(state.get("best_lap_time", self.best_lap_time))
+        self.best_reward = float(state.get("best_reward", self.best_reward))
+        self.episodes_stats = state.get("episodes_stats", self.episodes_stats)
+        logger.info(
+            "loaded agent training state from %s. steps=%s episodes=%s",
+            state_path,
+            self._steps,
+            self._episodes,
+        )
+        return True
+
     def save(self, path, save_buffer=True):
         self._algo.save_models(path)
+        self.save_training_state(path)
         if save_buffer:
             replay_buffer_path = os.path.join(path, 'replay_buffer.pkl')
             tmp_path = replay_buffer_path + ".tmp"
@@ -107,13 +166,18 @@ class Agent:
                     logger.exception("Failed to remove temp replay buffer at %s", tmp_path)
         logger.info("saved models to {}".format(path))
 
-    def load(self, path, load_buffer=True):
+    def load(self, path, load_buffer=True, load_training_state=True):
         try:
-            self._algo.load_models(path)
+            self._algo.load_models(path, load_training_state=load_training_state)
         except ValueError:
             logger.exception("Unable to load model from %s", path)
             raise
         logger.info(f"loaded model from {path}")
+        if load_training_state:
+            loaded_agent_state = self.load_training_state(path)
+        else:
+            loaded_agent_state = False
+            logger.info("Skipping agent training-state load; loaded network weights only from %s", path)
         if load_buffer:
             replay_buffer_path = os.path.join(path, 'replay_buffer.pkl')
             if os.path.exists(replay_buffer_path):
@@ -135,7 +199,8 @@ class Agent:
                         "start a fresh run or load weights without the old buffer."
                     )
                 self._replay_buffer = loaded_replay_buffer
-                self._steps = self._replay_buffer._n
+                if not loaded_agent_state:
+                    self._steps = self._replay_buffer._n
                 logger.info(f"loaded buffer from {path}. Number of steps: {len(self._replay_buffer)}")
             else:
                 logger.warning("replay_buffer.pkl not found in %s; continuing with model weights only", path)
@@ -151,6 +216,8 @@ class Agent:
                     self.evaluate()
         finally:
             self.save(os.path.join(self._model_dir, 'final'), save_buffer=self.save_final_buffer)
+            if self.training_dashboard:
+                self.training_dashboard.close()
 
     def update_model(self):
         train_stats = None
@@ -207,6 +274,7 @@ class Agent:
                 next_state, reward, done, info = self._env.step(action=None)  # action is already applied
                 step_perf.append(time.perf_counter() - step_start_time)
                 step_start_time = time.perf_counter()
+                self._update_training_dashboard(action, reward, info, train_stats, episode_steps + 1)
 
                 # Set done=True only when the agent fails, ignoring done signal
                 # if the agent reach time horizons.
@@ -318,6 +386,7 @@ class Agent:
             lambda: self._test_env.close(),
             lambda: self._writer.close(),
             lambda: self.wandb_logger.finish() if self.wandb_logger else None,
+            lambda: self.training_dashboard.close() if self.training_dashboard else None,
         ):
             try:
                 closer()
@@ -478,6 +547,29 @@ class Agent:
 
         logger.info("Finished demonstration pre-training with %s total updates", total_updates)
         return total_updates
+
+    def _update_training_dashboard(self, action, reward, info, train_stats, episode_step):
+        if not self.training_dashboard:
+            return
+
+        try:
+            self.training_dashboard.update(
+                step=self._steps + 1,
+                episode=self._episodes,
+                episode_step=episode_step,
+                action=action,
+                reward=reward,
+                env_state=getattr(self._env, "state", None),
+                info=info,
+                train_stats=train_stats,
+            )
+        except Exception:
+            logger.exception("Disabling live training dashboard after an update failure.")
+            try:
+                self.training_dashboard.close()
+            except Exception:
+                pass
+            self.training_dashboard = None
 
     def pre_train(self, num_updates=None):
         self._algo.update_entropy = False

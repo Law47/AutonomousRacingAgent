@@ -772,11 +772,16 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
     def get_reward(self, state, actions_diff):
         speed = 3.6 * np.array(state['speed'])
         dist_to_border = state["dist_to_border"]
+        is_reverse_gear = self.is_reverse_gear(state)
 
         r = speed
         if self.use_reference_line_in_reward:
             r *= ( 1.0 - (np.abs( state["gap"]) / 12.00))
         r /= 300. # normalize
+        if is_reverse_gear:
+            # AC reports reverse as gear 0 in this setup. Do not grant any
+            # positive driving/racing-line reward while the car is in reverse.
+            r = np.zeros_like(r)
 
         if self.penalize_actions_diff:
             action_difference_penalty = np.linalg.norm(actions_diff, ord=2)
@@ -786,11 +791,12 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         r = r.reshape(-1)  # [N, 1] -> [N]
         return r
 
-    def get_gear_shift_reward(self, state):
-        gear = int(state.get("actualGear", 0))
+    def is_reverse_gear(self, state):
+        return int(state.get("actualGear", 1)) <= 0
 
+    def get_gear_shift_reward(self, state):
         reward = 0.0
-        if gear < 0:
+        if self.is_reverse_gear(state):
             reward -= self.reverse_gear_step_penalty
 
         state["gear_shift_reward"] = reward

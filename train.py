@@ -59,6 +59,23 @@ def parse_args() -> argparse.Namespace:
         help="Load model weights but skip replay buffer (useful for corrupted/incompatible buffers)",
     )
     parser.add_argument("--test", action="store_true", help="Run eval instead of training")
+    parser.add_argument(
+        "--display",
+        action="store_true",
+        help="Open a live matplotlib dashboard for rewards, penalties, model outputs, and controls",
+    )
+    parser.add_argument(
+        "--display_history",
+        type=int,
+        default=500,
+        help="Number of recent training steps to keep in the live dashboard",
+    )
+    parser.add_argument(
+        "--display_interval",
+        type=int,
+        default=5,
+        help="Refresh the live dashboard every N training steps",
+    )
     parser.add_argument("overrides", nargs=argparse.REMAINDER, help="OmegaConf dotlist overrides")
     return parser.parse_args()
 
@@ -130,6 +147,25 @@ def maybe_load_demonstrations(agent: Agent, env, config) -> bool:
     return False
 
 
+def build_training_dashboard(args):
+    if not args.display:
+        return None
+
+    try:
+        from Common.training_dashboard import TrainingDashboard
+
+        dashboard = TrainingDashboard(
+            history=args.display_history,
+            update_interval_steps=args.display_interval,
+        )
+        if not dashboard.enabled:
+            return None
+        return dashboard
+    except Exception:
+        logger.exception("Unable to start live training dashboard. Continuing without it.")
+        return None
+
+
 def main() -> None:
     args = parse_args()
 
@@ -152,6 +188,7 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Using device: %s", device)
+    training_dashboard = build_training_dashboard(args)
 
     algo = SAC(
         state_dim=env.observation_space.shape[0],
@@ -169,6 +206,7 @@ def main() -> None:
         device=device,
         seed=config.seed,
         wandb_logger=None,
+        training_dashboard=training_dashboard,
         **config.Agent,
     )
 
@@ -176,12 +214,23 @@ def main() -> None:
         load_path = os.path.abspath(args.load_path)
         if not load_path.endswith(os.sep):
             load_path += os.sep
-        agent.load(load_path, load_buffer=(not args.test and not args.load_weights_only))
+        agent.load(
+            load_path,
+            load_buffer=(not args.test and not args.load_weights_only),
+            load_training_state=(not args.load_weights_only),
+        )
 
     if not args.test:
-        did_demo_pretrain = maybe_load_demonstrations(agent, env, config)
-        if not did_demo_pretrain:
+        if args.load_path:
+            logger.info(
+                "Skipping demonstration pre-training because --load_path was provided. "
+                "Loaded/continued training runs should resume from the checkpoint state instead of replaying demos."
+            )
             wait_for_start()
+        else:
+            did_demo_pretrain = maybe_load_demonstrations(agent, env, config)
+            if not did_demo_pretrain:
+                wait_for_start()
 
     if args.test:
         env.set_eval_mode()

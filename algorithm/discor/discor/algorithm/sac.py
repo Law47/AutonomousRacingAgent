@@ -12,6 +12,8 @@ from discor.utils import disable_gradients, soft_update, update_params, \
 import logging
 logger = logging.getLogger(__name__)
 
+SAC_TRAINING_STATE_FILE = "sac_training_state.pth"
+
 class SAC(Algorithm):
 
     def __init__(self, state_dim, action_dim, device, gamma=0.99, nstep=1,
@@ -246,13 +248,75 @@ class SAC(Algorithm):
 
         return q1_loss + q2_loss, mean_q1, mean_q2
 
+    def _optimizer_to_device(self, optimizer):
+        for state in optimizer.state.values():
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    state[key] = value.to(self._device)
+
+    def save_training_state(self, save_dir):
+        state = {
+            "format_version": 1,
+            "learning_steps": self._learning_steps,
+            "log_alpha": self._log_alpha.detach().cpu(),
+            "alpha": self._alpha.detach().cpu(),
+            "policy_optimizer": self._policy_optim.state_dict(),
+            "q_optimizer": self._q_optim.state_dict(),
+            "alpha_optimizer": self._alpha_optim.state_dict(),
+            "target_entropy": self._target_entropy,
+            "target_update_coef": self._target_update_coef,
+            "update_entropy": self.update_entropy,
+        }
+        torch.save(state, os.path.join(save_dir, SAC_TRAINING_STATE_FILE))
+
+    def load_training_state(self, load_dir):
+        state_path = os.path.join(load_dir, SAC_TRAINING_STATE_FILE)
+        if not os.path.exists(state_path):
+            logger.warning(
+                "%s not found in %s; loaded model weights only. "
+                "Optimizer state, entropy temperature, and SAC learning step will start fresh.",
+                SAC_TRAINING_STATE_FILE,
+                load_dir,
+            )
+            return False
+
+        state = torch.load(state_path, map_location=self._device)
+        self._learning_steps = int(state.get("learning_steps", self._learning_steps))
+
+        loaded_log_alpha = state.get("log_alpha", None)
+        if loaded_log_alpha is not None:
+            loaded_log_alpha = loaded_log_alpha.to(self._device).view_as(self._log_alpha)
+            self._log_alpha.data.copy_(loaded_log_alpha)
+        self._alpha = self._log_alpha.detach().exp()
+
+        if "policy_optimizer" in state:
+            self._policy_optim.load_state_dict(state["policy_optimizer"])
+            self._optimizer_to_device(self._policy_optim)
+        if "q_optimizer" in state:
+            self._q_optim.load_state_dict(state["q_optimizer"])
+            self._optimizer_to_device(self._q_optim)
+        if "alpha_optimizer" in state:
+            self._alpha_optim.load_state_dict(state["alpha_optimizer"])
+            self._optimizer_to_device(self._alpha_optim)
+
+        self._target_entropy = float(state.get("target_entropy", self._target_entropy))
+        self._target_update_coef = float(state.get("target_update_coef", self._target_update_coef))
+        self.update_entropy = bool(state.get("update_entropy", self.update_entropy))
+        logger.info("Loaded SAC training state from %s", state_path)
+        return True
+
     def save_models(self, save_dir):
         super().save_models(save_dir)
         self._policy_net.save(os.path.join(save_dir, 'policy_net.pth'))
         self._online_q_net.save(os.path.join(save_dir, 'online_q_net.pth'))
         self._target_q_net.save(os.path.join(save_dir, 'target_q_net.pth'))
+        self.save_training_state(save_dir)
 
-    def load_models(self, load_dir):
+    def load_models(self, load_dir, load_training_state=True):
         self._policy_net.load(os.path.join(load_dir, 'policy_net.pth'))
         self._online_q_net.load(os.path.join(load_dir, 'online_q_net.pth'))
         self._target_q_net.load(os.path.join(load_dir, 'target_q_net.pth'))
+        if load_training_state:
+            self.load_training_state(load_dir)
+        else:
+            logger.info("Skipping SAC training-state load; loaded network weights only from %s", load_dir)

@@ -95,6 +95,7 @@ from AssettoCorsaEnv.gear_shift_labels import infer_shift_from_state
 from AssettoCorsaEnv import vjoy as vjoy_module
 from AssettoCorsaPlugin.plugins.sensors_par import car_control
 from discor.replay_buffer import ReplayBuffer
+from discor.agent import Agent
 from discor.algorithm.sac import SAC
 from recordDemo import PeriodicResetSchedule, parse_periodic_reset_schedule
 
@@ -111,6 +112,47 @@ class FakeClient:
 
     def respond_to_server(self):
         self.responded = True
+
+
+class ShapeOnlySpace:
+    def __init__(self, shape):
+        self.shape = shape
+
+    def sample(self):
+        return np.zeros(self.shape, dtype=np.float32)
+
+
+class DummyAgentEnv:
+    def __init__(self, state_dim=4, action_dim=5):
+        self.observation_space = ShapeOnlySpace((state_dim,))
+        self.action_space = ShapeOnlySpace((action_dim,))
+        self._max_episode_steps = 100
+
+    def seed(self, seed=None):
+        pass
+
+    def close(self):
+        return {}
+
+
+class FakeWriter:
+    def add_scalar(self, *args, **kwargs):
+        pass
+
+    def close(self):
+        pass
+
+
+class FakeDashboard:
+    def __init__(self):
+        self.updates = []
+        self.closed = False
+
+    def update(self, **kwargs):
+        self.updates.append(kwargs)
+
+    def close(self):
+        self.closed = True
 
 
 def make_env_stub(cooldown_steps=0):
@@ -327,10 +369,6 @@ def test_replay_buffer_iter_batches_visits_demo_dataset_once():
 
 
 def test_sac_behavior_cloning_trains_against_demo_actions():
-    class FakeWriter:
-        def add_scalar(self, *args, **kwargs):
-            pass
-
     algo = SAC(
         state_dim=4,
         action_dim=5,
@@ -355,6 +393,176 @@ def test_sac_behavior_cloning_trains_against_demo_actions():
     )
 
     assert stats["behavior_clone_loss"] > 0.0
+
+
+def test_sac_save_load_restores_optimizer_alpha_and_learning_step(tmp_path):
+    writer = FakeWriter()
+    algo = SAC(
+        state_dim=4,
+        action_dim=5,
+        device=torch.device("cpu"),
+        policy_hidden_units=[8],
+        q_hidden_units=[8],
+        log_interval=100,
+        seed=0,
+    )
+    states = torch.randn((4, 4), dtype=torch.float32)
+    actions = torch.tanh(torch.randn((4, 5), dtype=torch.float32))
+    rewards = torch.randn((4, 1), dtype=torch.float32)
+    next_states = torch.randn((4, 4), dtype=torch.float32)
+    dones = torch.zeros((4, 1), dtype=torch.float32)
+    batch = (states, actions, rewards, next_states, dones)
+
+    algo.update_online_networks(batch, writer)
+    algo.save_models(str(tmp_path))
+
+    loaded = SAC(
+        state_dim=4,
+        action_dim=5,
+        device=torch.device("cpu"),
+        policy_hidden_units=[8],
+        q_hidden_units=[8],
+        log_interval=100,
+        seed=1,
+    )
+    loaded.load_models(str(tmp_path))
+
+    assert loaded._learning_steps == algo._learning_steps
+    assert torch.allclose(loaded._log_alpha, algo._log_alpha)
+    assert torch.allclose(loaded._alpha, algo._alpha)
+    assert loaded._policy_optim.state_dict()["state"]
+    assert loaded._q_optim.state_dict()["state"]
+    assert loaded._alpha_optim.state_dict()["state"]
+
+
+def test_agent_save_load_restores_training_state_without_replay_buffer(tmp_path):
+    env = DummyAgentEnv()
+    save_dir = tmp_path / "save"
+    load_dir = tmp_path / "load"
+    algo = SAC(
+        state_dim=4,
+        action_dim=5,
+        device=torch.device("cpu"),
+        policy_hidden_units=[8],
+        q_hidden_units=[8],
+        log_interval=100,
+        seed=0,
+    )
+    agent = Agent(
+        env=env,
+        test_env=env,
+        algo=algo,
+        log_dir=str(tmp_path / "agent"),
+        device=torch.device("cpu"),
+        batch_size=2,
+        memory_size=8,
+        start_steps=1,
+        eval_interval=0,
+        num_eval_episodes=1,
+    )
+    agent._writer.close()
+    agent._writer = FakeWriter()
+    agent._steps = 123
+    agent._episodes = 7
+    agent._demo_transition_count = 11
+    agent.best_lap_time = 95.5
+    agent.best_reward = 42.0
+
+    agent.save(str(save_dir), save_buffer=False)
+
+    loaded_agent = Agent(
+        env=env,
+        test_env=env,
+        algo=SAC(
+            state_dim=4,
+            action_dim=5,
+            device=torch.device("cpu"),
+            policy_hidden_units=[8],
+            q_hidden_units=[8],
+            log_interval=100,
+            seed=1,
+        ),
+        log_dir=str(load_dir),
+        device=torch.device("cpu"),
+        batch_size=2,
+        memory_size=8,
+        start_steps=1,
+        eval_interval=0,
+        num_eval_episodes=1,
+    )
+    loaded_agent._writer.close()
+    loaded_agent._writer = FakeWriter()
+    loaded_agent.load(str(save_dir), load_buffer=True)
+
+    assert loaded_agent._steps == 123
+    assert loaded_agent._episodes == 7
+    assert loaded_agent._demo_transition_count == 11
+    assert loaded_agent.best_lap_time == 95.5
+    assert loaded_agent.best_reward == 42.0
+
+
+def test_agent_training_dashboard_receives_step_metrics(tmp_path):
+    env = DummyAgentEnv()
+    env.state = {
+        "reward": 0.25,
+        "speed": 42.0,
+        "RPM": 7200.0,
+        "actualGear": 4,
+        "gap": -0.8,
+        "out_of_track": 0.0,
+        "reverse_gear_penalty": 0.0,
+        "out_of_track_penalty": -0.1,
+        "current_action_abs_0": 0.2,
+        "current_action_abs_1": 0.8,
+        "current_action_abs_2": -1.0,
+        "shift_up": True,
+        "shift_down": False,
+    }
+    dashboard = FakeDashboard()
+    agent = Agent(
+        env=env,
+        test_env=env,
+        algo=SAC(
+            state_dim=4,
+            action_dim=5,
+            device=torch.device("cpu"),
+            policy_hidden_units=[8],
+            q_hidden_units=[8],
+            log_interval=100,
+            seed=0,
+        ),
+        log_dir=str(tmp_path / "agent_dashboard"),
+        device=torch.device("cpu"),
+        batch_size=2,
+        memory_size=8,
+        start_steps=1,
+        eval_interval=0,
+        num_eval_episodes=1,
+        training_dashboard=dashboard,
+    )
+    agent._writer.close()
+    agent._writer = FakeWriter()
+    agent._steps = 41
+    agent._episodes = 3
+    action = np.array([0.1, 0.2, -0.3, 0.9, -0.1], dtype=np.float32)
+
+    agent._update_training_dashboard(
+        action=action,
+        reward=0.25,
+        info={"terminated": False},
+        train_stats={"policy_loss": 1.5, "alpha": 0.75},
+        episode_step=9,
+    )
+
+    assert len(dashboard.updates) == 1
+    update = dashboard.updates[0]
+    assert update["step"] == 42
+    assert update["episode"] == 3
+    assert update["episode_step"] == 9
+    np.testing.assert_allclose(update["action"], action)
+    assert update["reward"] == 0.25
+    assert update["env_state"] is env.state
+    assert update["train_stats"]["policy_loss"] == 1.5
 
 
 def test_periodic_reset_schedule_lerps_period_by_recorded_steps():
@@ -417,7 +625,7 @@ def test_gear_shift_reward_does_not_penalize_wrong_rpm_shift():
 
 def test_gear_shift_reward_does_not_penalize_neutral():
     env = make_env_stub()
-    state = {"RPM": 4000.0, "actualGear": 0, "shift_up": False, "shift_down": False}
+    state = {"RPM": 4000.0, "actualGear": 1, "shift_up": False, "shift_down": False}
 
     assert env.get_gear_shift_reward(state) == 0.0
     assert state["reverse_gear_penalty"] == 0.0
@@ -425,9 +633,24 @@ def test_gear_shift_reward_does_not_penalize_neutral():
 
 def test_gear_shift_reward_penalizes_reverse():
     env = make_env_stub()
-    state = {"RPM": 4000.0, "actualGear": -1, "shift_up": False, "shift_down": False}
+    state = {"RPM": 4000.0, "actualGear": 0, "shift_up": False, "shift_down": False}
 
     assert env.get_gear_shift_reward(state) == -0.001
+    assert state["reverse_gear_penalty"] == -0.001
+
+
+def test_reverse_gear_zeroes_positive_base_reward_and_keeps_penalty():
+    env = make_env_stub()
+    state = {
+        "speed": 80.0,
+        "dist_to_border": 5.0,
+        "gap": 0.0,
+        "actualGear": 0,
+    }
+
+    reward = env.get_reward(state, np.zeros(3, dtype=np.float32))
+
+    np.testing.assert_allclose(reward, [-0.001])
     assert state["reverse_gear_penalty"] == -0.001
 
 
