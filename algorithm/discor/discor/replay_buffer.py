@@ -111,6 +111,66 @@ class ReplayBuffer:
         self._n = min(self._n + 1, self._memory_size)
         self._p = (self._p + 1) % self._memory_size
 
+    def extend_transitions(self, states, actions, rewards, next_states, dones):
+        states = np.asarray(states, dtype=np.float32)
+        actions = np.asarray(actions, dtype=np.float32)
+        rewards = np.asarray(rewards, dtype=np.float32).reshape(-1, 1)
+        next_states = np.asarray(next_states, dtype=np.float32)
+        dones = np.asarray(dones, dtype=np.float32).reshape(-1, 1)
+
+        transition_count = states.shape[0]
+        if transition_count == 0:
+            return 0
+
+        if actions.shape[0] != transition_count or rewards.shape[0] != transition_count \
+                or next_states.shape[0] != transition_count or dones.shape[0] != transition_count:
+            raise ValueError("Cached transition arrays must all have the same first dimension")
+
+        if transition_count > self._memory_size:
+            states = states[-self._memory_size:]
+            actions = actions[-self._memory_size:]
+            rewards = rewards[-self._memory_size:]
+            next_states = next_states[-self._memory_size:]
+            dones = dones[-self._memory_size:]
+            transition_count = self._memory_size
+
+        first_chunk = min(transition_count, self._memory_size - self._p)
+        second_chunk = transition_count - first_chunk
+
+        self._states[self._p:self._p + first_chunk, ...] = states[:first_chunk]
+        self._actions[self._p:self._p + first_chunk, ...] = actions[:first_chunk]
+        self._rewards[self._p:self._p + first_chunk, ...] = rewards[:first_chunk]
+        self._next_states[self._p:self._p + first_chunk, ...] = next_states[:first_chunk]
+        self._dones[self._p:self._p + first_chunk, ...] = dones[:first_chunk]
+
+        if second_chunk:
+            self._states[:second_chunk, ...] = states[first_chunk:]
+            self._actions[:second_chunk, ...] = actions[first_chunk:]
+            self._rewards[:second_chunk, ...] = rewards[first_chunk:]
+            self._next_states[:second_chunk, ...] = next_states[first_chunk:]
+            self._dones[:second_chunk, ...] = dones[first_chunk:]
+
+        self._n = min(self._n + transition_count, self._memory_size)
+        self._p = (self._p + transition_count) % self._memory_size
+        if self._nstep != 1:
+            self._nstep_buffer.reset()
+        return transition_count
+
+    def get_recent_transitions(self, count):
+        count = min(int(count), self._n, self._memory_size)
+        if count <= 0:
+            return None
+
+        start = (self._p - count) % self._memory_size
+        idxes = (start + np.arange(count)) % self._memory_size
+        return {
+            "states": self._states[idxes].copy(),
+            "actions": self._actions[idxes].copy(),
+            "rewards": self._rewards[idxes].copy(),
+            "next_states": self._next_states[idxes].copy(),
+            "dones": self._dones[idxes].copy(),
+        }
+
     def sample(self, batch_size, device=torch.device('cpu')):
         assert isinstance(batch_size, int) and batch_size > 0
 
@@ -176,6 +236,16 @@ class EnsembleBuffer(ReplayBuffer):
             super().append(state, action, reward, next_state, terminated, episode_done)
         else:
             self._offline.append(state, action, reward, next_state, terminated, episode_done)
+
+    def extend_transitions(self, states, actions, rewards, next_states, dones):
+        if self._online:
+            return super().extend_transitions(states, actions, rewards, next_states, dones)
+        return self._offline.extend_transitions(states, actions, rewards, next_states, dones)
+
+    def get_recent_transitions(self, count):
+        if self._online:
+            return super().get_recent_transitions(count)
+        return self._offline.get_recent_transitions(count)
 
     def __len__(self):
         offline_len = len(self._offline)

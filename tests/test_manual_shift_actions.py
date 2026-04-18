@@ -96,6 +96,7 @@ from AssettoCorsaEnv import vjoy as vjoy_module
 from AssettoCorsaPlugin.plugins.sensors_par import car_control
 from discor.replay_buffer import ReplayBuffer
 from discor.agent import Agent
+import discor.agent as agent_module
 from discor.algorithm.sac import SAC
 from recordDemo import PeriodicResetSchedule, parse_periodic_reset_schedule
 
@@ -153,6 +154,11 @@ class FakeDashboard:
 
     def close(self):
         self.closed = True
+
+
+class DummyAlgo:
+    gamma = 0.99
+    nstep = 1
 
 
 def make_env_stub(cooldown_steps=0):
@@ -368,6 +374,24 @@ def test_replay_buffer_iter_batches_visits_demo_dataset_once():
     np.testing.assert_allclose(visited_states, [0, 1, 2, 3, 4])
 
 
+def test_replay_buffer_bulk_extend_and_recent_transitions_round_trip():
+    buffer = ReplayBuffer(memory_size=3, state_shape=(1,), action_shape=(5,), gamma=0.99, nstep=1)
+    states = np.arange(4, dtype=np.float32).reshape(-1, 1)
+    actions = np.tile(np.arange(5, dtype=np.float32), (4, 1))
+    rewards = np.arange(4, dtype=np.float32).reshape(-1, 1)
+    next_states = states + 10.0
+    dones = np.array([[0.0], [0.0], [1.0], [0.0]], dtype=np.float32)
+
+    added = buffer.extend_transitions(states, actions, rewards, next_states, dones)
+    recent = buffer.get_recent_transitions(3)
+
+    assert added == 3
+    assert len(buffer) == 3
+    np.testing.assert_allclose(recent["states"].reshape(-1), [1.0, 2.0, 3.0])
+    np.testing.assert_allclose(recent["rewards"].reshape(-1), [1.0, 2.0, 3.0])
+    np.testing.assert_allclose(recent["next_states"].reshape(-1), [11.0, 12.0, 13.0])
+
+
 def test_sac_behavior_cloning_trains_against_demo_actions():
     algo = SAC(
         state_dim=4,
@@ -499,6 +523,86 @@ def test_agent_save_load_restores_training_state_without_replay_buffer(tmp_path)
     assert loaded_agent._demo_transition_count == 11
     assert loaded_agent.best_lap_time == 95.5
     assert loaded_agent.best_reward == 42.0
+
+
+def test_agent_demo_cache_reuses_preprocessed_transitions(tmp_path, monkeypatch):
+    demo_dir = tmp_path / "demos"
+    demo_dir.mkdir()
+    demo_file = demo_dir / "episode.pkl"
+    demo_file.write_bytes(b"demo")
+    cache_dir = tmp_path / "cache"
+
+    class FakeDataLoader:
+        reset_calls = 0
+
+        def __init__(self, env, data_set_path, **kwargs):
+            self.env = env
+            self.trajectories_paths = [str(demo_file)]
+            self.trajectories_count = 1
+            self.trajectory_number = 0
+            self.trajectory = [0, 1, 2]
+            self.current_step = 0
+            self.shift_label_rewrites = 0
+
+        def reset(self):
+            type(self).reset_calls += 1
+            self.trajectory_number = 1
+            self.current_step = 0
+            return np.full((4,), 0.0, dtype=np.float32)
+
+        def act(self):
+            self.current_step += 1
+            return np.full((5,), float(self.current_step), dtype=np.float32)
+
+        def step(self, action):
+            next_state = np.full((4,), float(self.current_step), dtype=np.float32)
+            reward = float(self.current_step)
+            done = self.current_step >= len(self.trajectory) - 1
+            return next_state, reward, done, {"terminated": False}
+
+    monkeypatch.setattr(agent_module, "DataLoader", FakeDataLoader)
+
+    env = DummyAgentEnv()
+    env.config = type("Config", (), {"car": "car", "track": "track"})()
+    first_agent = Agent(
+        env=env,
+        test_env=env,
+        algo=DummyAlgo(),
+        log_dir=str(tmp_path / "first_agent"),
+        device=torch.device("cpu"),
+        batch_size=2,
+        memory_size=8,
+        start_steps=1,
+        eval_interval=0,
+        num_eval_episodes=1,
+    )
+    first_agent._writer.close()
+    first_agent._writer = FakeWriter()
+
+    first_added = first_agent.load_pre_train_data(str(demo_dir), env, use_cache=True, cache_dir=cache_dir)
+
+    second_agent = Agent(
+        env=env,
+        test_env=env,
+        algo=DummyAlgo(),
+        log_dir=str(tmp_path / "second_agent"),
+        device=torch.device("cpu"),
+        batch_size=2,
+        memory_size=8,
+        start_steps=1,
+        eval_interval=0,
+        num_eval_episodes=1,
+    )
+    second_agent._writer.close()
+    second_agent._writer = FakeWriter()
+
+    second_added = second_agent.load_pre_train_data(str(demo_dir), env, use_cache=True, cache_dir=cache_dir)
+
+    assert first_added == 2
+    assert second_added == 2
+    assert FakeDataLoader.reset_calls == 1
+    np.testing.assert_allclose(second_agent._replay_buffer._states[:2], first_agent._replay_buffer._states[:2])
+    assert list(cache_dir.glob("demo_replay_*.npz"))
 
 
 def test_agent_training_dashboard_receives_step_metrics(tmp_path):

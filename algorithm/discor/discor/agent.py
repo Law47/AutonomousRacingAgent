@@ -5,6 +5,8 @@ from torch.utils.tensorboard import SummaryWriter
 import pickle
 from pathlib import Path
 from tqdm import tqdm
+import hashlib
+import json
 
 from discor.replay_buffer import ReplayBuffer, EnsembleBuffer
 from discor.utils import RunningMeanStats
@@ -15,6 +17,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 AGENT_TRAINING_STATE_FILE = "agent_training_state.pkl"
+DEMO_REPLAY_CACHE_VERSION = 1
 
 import time
 
@@ -409,6 +412,8 @@ class Agent:
         log_steer_ratios=False,
         clean_shift_labels=True,
         shift_label_min_drive_gear=2,
+        use_cache=True,
+        cache_dir=None,
     ):
         total_added_episodes = 0
 
@@ -420,6 +425,28 @@ class Agent:
             clean_shift_labels=clean_shift_labels,
             shift_label_min_drive_gear=shift_label_min_drive_gear,
         )
+
+        cache_path, cache_metadata = self._build_demo_cache_metadata(
+            trajs_path,
+            env,
+            env_data,
+            log_steer_ratios=log_steer_ratios,
+            clean_shift_labels=clean_shift_labels,
+            shift_label_min_drive_gear=shift_label_min_drive_gear,
+            cache_dir=cache_dir,
+        )
+        if use_cache:
+            cached_transitions = self._try_load_demo_cache(cache_path, cache_metadata)
+            if cached_transitions:
+                self._demo_transition_count += cached_transitions
+                logger.info(
+                    "Loaded %s cached demonstration transitions from %s. Buffer size: %s",
+                    cached_transitions,
+                    cache_path,
+                    len(self._replay_buffer),
+                )
+                return cached_transitions
+
         for ep in tqdm(range(env_data.trajectories_count)[:]):
             state = env_data.reset()
 
@@ -452,6 +479,8 @@ class Agent:
                 )
         added_transitions = len(self._replay_buffer) - buffer_size_before
         self._demo_transition_count += added_transitions
+        if use_cache and added_transitions > 0:
+            self._save_demo_cache(cache_path, cache_metadata, added_transitions)
         logger.info(
             "Loaded %s demonstration episodes from %s. Added %s transitions. Buffer size: %s",
             total_added_episodes,
@@ -460,6 +489,113 @@ class Agent:
             len(self._replay_buffer),
         )
         return added_transitions
+
+    def _build_demo_cache_metadata(
+        self,
+        trajs_path,
+        env,
+        env_data,
+        log_steer_ratios=False,
+        clean_shift_labels=True,
+        shift_label_min_drive_gear=2,
+        cache_dir=None,
+    ):
+        trajectory_files = []
+        for path in env_data.trajectories_paths:
+            file_path = Path(path)
+            stat = file_path.stat()
+            trajectory_files.append(
+                {
+                    "path": str(file_path.resolve()),
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                }
+            )
+
+        reward_config = getattr(getattr(env, "config", None), "Rewards", None)
+        metadata = {
+            "format_version": DEMO_REPLAY_CACHE_VERSION,
+            "trajs_path": str(Path(trajs_path).resolve()),
+            "trajectory_files": trajectory_files,
+            "state_shape": tuple(self._env.observation_space.shape),
+            "action_shape": tuple(self._env.action_space.shape),
+            "gamma": float(self._algo.gamma),
+            "nstep": int(self._algo.nstep),
+            "clean_shift_labels": bool(clean_shift_labels),
+            "shift_label_min_drive_gear": int(shift_label_min_drive_gear),
+            "log_steer_ratios": bool(log_steer_ratios),
+            "use_reference_line_in_reward": bool(getattr(env, "use_reference_line_in_reward", False)),
+            "penalize_actions_diff": bool(getattr(env, "penalize_actions_diff", False)),
+            "penalize_actions_diff_coef": float(getattr(env, "penalize_actions_diff_coef", 0.0)),
+            "reverse_gear_step_penalty": float(getattr(env, "reverse_gear_step_penalty", 0.0)),
+            "enable_out_of_track_penalty": bool(getattr(env, "enable_out_of_track_penalty", False)),
+            "out_of_track_penalty_start": float(getattr(env, "out_of_track_penalty_start", 0.0)),
+            "out_of_track_penalty_end": float(getattr(env, "out_of_track_penalty_end", 0.0)),
+            "out_of_track_penalty_ramp_steps": int(getattr(env, "out_of_track_penalty_ramp_steps", 0)),
+            "gear_shift_threshold": float(getattr(env, "gear_shift_threshold", 0.0)),
+            "car": str(getattr(getattr(env, "config", None), "car", "")),
+            "track": str(getattr(getattr(env, "config", None), "track", "")),
+            "reward_config_present": reward_config is not None,
+        }
+        signature = hashlib.sha256(json.dumps(metadata, sort_keys=True).encode("utf-8")).hexdigest()
+        metadata["signature"] = signature
+
+        cache_root = Path(cache_dir) if cache_dir else Path(trajs_path) / ".pretrain_cache"
+        cache_path = cache_root / f"demo_replay_{signature[:16]}.npz"
+        return cache_path, metadata
+
+    def _try_load_demo_cache(self, cache_path, expected_metadata):
+        if not cache_path.exists():
+            return 0
+
+        try:
+            with np.load(cache_path, allow_pickle=False) as cache:
+                metadata = json.loads(str(cache["metadata"].item()))
+                if metadata.get("signature") != expected_metadata.get("signature"):
+                    logger.info("Ignoring stale demonstration cache at %s", cache_path)
+                    return 0
+
+                loaded_count = self._replay_buffer.extend_transitions(
+                    cache["states"],
+                    cache["actions"],
+                    cache["rewards"],
+                    cache["next_states"],
+                    cache["dones"],
+                )
+                return loaded_count
+        except Exception:
+            logger.exception("Failed to load demonstration cache from %s; rebuilding it.", cache_path)
+            return 0
+
+    def _save_demo_cache(self, cache_path, metadata, added_transitions):
+        transitions = self._replay_buffer.get_recent_transitions(added_transitions)
+        if not transitions:
+            return
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        try:
+            with open(tmp_path, "wb") as f:
+                np.savez(
+                    f,
+                    metadata=np.array(json.dumps(metadata, sort_keys=True)),
+                    **transitions,
+                )
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, cache_path)
+            logger.info(
+                "Saved %s preprocessed demonstration transitions to cache: %s",
+                added_transitions,
+                cache_path,
+            )
+        except Exception:
+            logger.exception("Failed to save demonstration cache to %s", cache_path)
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                logger.exception("Failed to remove temp demonstration cache at %s", tmp_path)
 
     def pre_train_epochs(
         self,

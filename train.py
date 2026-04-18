@@ -67,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--display_history",
         type=int,
-        default=500,
+        default=200,
         help="Number of recent training steps to keep in the live dashboard",
     )
     parser.add_argument(
@@ -109,6 +109,8 @@ def maybe_load_demonstrations(agent: Agent, env, config) -> bool:
     log_steer_ratios = getattr(demo_config, "log_steer_ratios", False)
     clean_shift_labels = getattr(demo_config, "clean_shift_labels", True)
     shift_label_min_drive_gear = int(getattr(demo_config, "shift_label_min_drive_gear", 2))
+    cache_enabled = bool(getattr(demo_config, "cache_enabled", True))
+    cache_dir = getattr(demo_config, "cache_dir", None)
     for data_path in data_paths:
         abs_data_path = os.path.abspath(data_path)
         total_transitions += agent.load_pre_train_data(
@@ -117,6 +119,8 @@ def maybe_load_demonstrations(agent: Agent, env, config) -> bool:
             log_steer_ratios=log_steer_ratios,
             clean_shift_labels=clean_shift_labels,
             shift_label_min_drive_gear=shift_label_min_drive_gear,
+            use_cache=cache_enabled,
+            cache_dir=cache_dir,
         )
 
     if total_transitions <= 0:

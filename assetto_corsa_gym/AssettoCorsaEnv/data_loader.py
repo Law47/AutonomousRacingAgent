@@ -15,6 +15,8 @@ from AssettoCorsaEnv.gear_shift_labels import (
     infer_shift_from_state,
 )
 
+PAST_ACTIONS_WINDOW = 3
+
 def read_yml(f):
     with open(f, 'r') as file:
         return yaml.safe_load(file)
@@ -230,7 +232,8 @@ class DataLoader():
 
     def read_step(self):
         state = self.trajectory[self.current_step]
-        history = self.trajectory[:self.current_step] # get the history seen so far
+        history_start = max(0, self.current_step - PAST_ACTIONS_WINDOW)
+        history = self.trajectory[history_start:self.current_step]
         previous_state = self.trajectory[self.current_step - 1] if self.current_step > 0 else None
         current_abs_actions = self.get_absolute_actions_from_state(state)
         shift_actions = self.infer_shift_actions_from_stable_gear(state)

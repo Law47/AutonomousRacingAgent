@@ -255,7 +255,8 @@ def enrich_states_with_actions(
         state["shift_up"] = bool(model_actions[3] > 0.5)
         state["shift_down"] = bool(model_actions[4] > 0.5)
 
-        _, actions_diff = env.get_obs(state, history_tail + processed_states)
+        recent_history = history_tail + processed_states[-PAST_ACTIONS_WINDOW:]
+        _, actions_diff = env.get_obs(state, recent_history)
         state["reward"] = env.get_reward(state, actions_diff).item()
 
         processed_states.append(state)

@@ -19,29 +19,21 @@ class TrainingDashboard:
         ("reverse_gear_penalty", "reverse gear penalty"),
         ("out_of_track_penalty", "off-track penalty"),
     )
-    _MODEL_OUTPUT_SERIES = (
-        ("model_steer", "steer out"),
-        ("model_throttle", "throttle out"),
-        ("model_brake", "brake out"),
-        ("model_shift_up", "shift up out"),
-        ("model_shift_down", "shift down out"),
-    )
     _APPLIED_CONTROL_SERIES = (
         ("applied_steer", "applied steer"),
         ("applied_throttle", "applied throttle"),
         ("applied_brake", "applied brake"),
+    )
+    _SHIFT_UP_SERIES = (
+        ("shift_up_signal", "shift up signal"),
         ("shift_up_pulse", "shift up pulse"),
+    )
+    _SHIFT_DOWN_SERIES = (
+        ("shift_down_signal", "shift down signal"),
         ("shift_down_pulse", "shift down pulse"),
     )
-    _VEHICLE_INPUT_SERIES = (
-        ("speed_scaled", "speed / 300 kph"),
-        ("rpm_scaled", "rpm / 10000"),
-        ("gear_scaled", "gear / 8"),
-        ("gap_scaled", "gap / 12 m"),
-        ("out_of_track", "out of track"),
-    )
 
-    def __init__(self, history=500, update_interval_steps=5, title="Training Dashboard"):
+    def __init__(self, history=200, update_interval_steps=5, title="Training Dashboard"):
         self.history = max(int(history), 2)
         self.update_interval_steps = max(int(update_interval_steps), 1)
         self.title = title
@@ -113,18 +105,18 @@ class TrainingDashboard:
                 "ylim": None,
             },
             {
-                "title": "Raw Model Outputs",
-                "series": self._MODEL_OUTPUT_SERIES,
-                "ylim": (-1.05, 1.05),
-            },
-            {
                 "title": "Applied Controls",
                 "series": self._APPLIED_CONTROL_SERIES,
                 "ylim": (-1.05, 1.05),
             },
             {
-                "title": "Vehicle Inputs (Scaled)",
-                "series": self._VEHICLE_INPUT_SERIES,
+                "title": "Shift Up",
+                "series": self._SHIFT_UP_SERIES,
+                "ylim": (-1.05, 1.05),
+            },
+            {
+                "title": "Shift Down",
+                "series": self._SHIFT_DOWN_SERIES,
                 "ylim": (-1.05, 1.05),
             },
         )
@@ -216,7 +208,6 @@ class TrainingDashboard:
     def _extract_metrics(self, action, reward, state):
         action_values = self._action_values(action, state)
         applied = self._applied_controls(state)
-        speed_kmh = self._to_float(state.get("speed"), default=np.nan) * 3.6
         reward_value = self._to_float(reward, state.get("reward", np.nan))
         reverse_gear_penalty = self._to_float(state.get("reverse_gear_penalty"), 0.0)
         out_of_track_penalty = self._to_float(state.get("out_of_track_penalty"), 0.0)
@@ -227,21 +218,13 @@ class TrainingDashboard:
             "base_reward_estimate": base_reward_estimate,
             "reverse_gear_penalty": reverse_gear_penalty,
             "out_of_track_penalty": out_of_track_penalty,
-            "model_steer": action_values[0],
-            "model_throttle": action_values[1],
-            "model_brake": action_values[2],
-            "model_shift_up": action_values[3],
-            "model_shift_down": action_values[4],
             "applied_steer": applied[0],
             "applied_throttle": applied[1],
             "applied_brake": applied[2],
+            "shift_up_signal": action_values[3],
+            "shift_down_signal": action_values[4],
             "shift_up_pulse": self._to_float(state.get("shift_up"), 0.0),
             "shift_down_pulse": self._to_float(state.get("shift_down"), 0.0),
-            "speed_scaled": self._scale(speed_kmh, 300.0),
-            "rpm_scaled": self._scale(state.get("RPM"), 10000.0),
-            "gear_scaled": self._scale(state.get("actualGear"), 8.0),
-            "gap_scaled": self._scale(state.get("gap"), 12.0),
-            "out_of_track": self._to_float(state.get("out_of_track"), 0.0),
         }
 
     def _action_values(self, action, state):
