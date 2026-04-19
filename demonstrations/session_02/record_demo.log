@@ -1,0 +1,137 @@
+2026-04-15 21:52:52,613[INFO] AssettoCorsaEnv.ac_env Setting track monza
+2026-04-15 21:54:50,282[INFO] AssettoCorsaEnv.ac_env Setting track monza
+2026-04-15 21:54:50,282[WARNING] AssettoCorsaEnv.ac_client Controls will be executed locally and not by the server (backend=vigem)
+2026-04-15 21:54:50,313[INFO] AssettoCorsaPlugin.plugins.sensors_par.car_control Using ViGEmBus backend (vgamepad)
+2026-04-15 21:54:52,494[INFO] AssettoCorsaEnv.track Track loaded from: F:\Downloads\AgentShiftAddon\assetto_corsa_gym\AssettoCorsaEnv\../AssettoCorsaConfigs\tracks\monza.csv Found 3760 segments downsampled by 10= 376 segments
+2026-04-15 21:54:52,494[INFO] AssettoCorsaEnv.reference_lap Reference Lap. Loading: F:\Downloads\AgentShiftAddon\assetto_corsa_gym\AssettoCorsaEnv\../AssettoCorsaConfigs\tracks\monza-racing_line.csv
+2026-04-15 21:54:52,500[INFO] AssettoCorsaEnv.reference_lap Calculating curvature
+2026-04-15 21:54:52,526[INFO] AssettoCorsaEnv.sensors_ray_casting spatial_hash len 60
+2026-04-15 21:54:52,528[INFO] AssettoCorsaEnv.ac_env Adding previous obs to state 25*3 = 100
+2026-04-15 21:54:52,528[INFO] AssettoCorsaEnv.ac_env state_dim 125
+2026-04-15 21:54:52,528[INFO] AssettoCorsaEnv.ac_env action_space: Box(-1.0, 1.0, (5,), float32)
+2026-04-15 22:10:43,538[INFO] AssettoCorsaEnv.ac_client AC Client. Listening at host: localhost port: 2345
+2026-04-15 22:10:43,560[INFO] AssettoCorsaEnv.ac_client Client connected on 2345
+2026-04-15 22:10:43,831[INFO] __main__ Initialized streaming demonstration file at F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-15 22:10:43,831[INFO] __main__ Recording demonstration to F:\Downloads\AgentShiftAddon\demonstrations\session_02
+2026-04-15 22:15:44,948[INFO] __main__ Flushed 7501 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-15 22:20:44,977[INFO] __main__ Flushed 7491 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-15 22:25:44,907[INFO] __main__ Flushed 7490 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-15 22:30:44,913[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-15 22:35:44,932[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-15 22:40:44,962[INFO] __main__ Flushed 7463 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-15 22:45:45,103[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-15 22:50:45,006[INFO] __main__ Flushed 7489 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-15 22:55:45,038[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-15 23:00:45,099[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-15 23:05:45,128[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-15 23:10:45,248[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-15 23:15:45,182[INFO] __main__ Flushed 7489 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-15 23:20:45,219[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-15 23:25:45,245[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-15 23:30:45,365[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-15 23:35:45,302[INFO] __main__ Flushed 7490 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-15 23:40:45,325[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-15 23:45:45,373[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-15 23:50:45,469[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-15 23:55:45,385[INFO] __main__ Flushed 7488 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 00:00:45,431[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 00:05:45,409[INFO] __main__ Flushed 7491 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 00:10:45,534[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 00:15:45,498[INFO] __main__ Flushed 7490 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 00:20:45,470[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 00:25:45,562[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 00:30:45,629[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 00:35:45,587[INFO] __main__ Flushed 7491 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 00:40:45,595[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 00:45:45,622[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 00:50:45,671[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 00:55:45,813[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 01:00:45,747[INFO] __main__ Flushed 7489 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 01:05:46,090[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 01:10:46,152[INFO] __main__ Flushed 7484 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 01:15:46,337[INFO] __main__ Flushed 7484 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 01:20:46,235[INFO] __main__ Flushed 7480 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 01:25:46,251[INFO] __main__ Flushed 7484 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 01:30:45,928[INFO] __main__ Flushed 7484 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 01:35:46,021[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 01:40:46,152[INFO] __main__ Flushed 7491 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 01:45:45,990[INFO] __main__ Flushed 7488 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 01:50:46,141[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 01:55:46,778[INFO] __main__ Flushed 7489 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 02:00:46,142[INFO] __main__ Flushed 7475 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 02:05:46,088[INFO] __main__ Flushed 7491 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 02:10:46,116[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 02:15:46,201[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 02:20:46,148[INFO] __main__ Flushed 7490 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 02:25:46,203[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 02:30:46,372[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 02:35:48,068[INFO] __main__ Flushed 7489 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 02:40:46,331[INFO] __main__ Flushed 7446 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 02:45:46,242[INFO] __main__ Flushed 7489 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 02:50:46,258[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 02:55:46,299[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 03:00:46,370[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 03:05:46,334[INFO] __main__ Flushed 7491 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 03:10:46,347[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 03:15:47,637[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 03:20:46,466[INFO] __main__ Flushed 7461 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 03:25:46,417[INFO] __main__ Flushed 7491 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 03:30:46,457[INFO] __main__ Flushed 7494 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 03:35:46,491[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 03:40:46,481[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 03:45:46,566[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 03:50:46,569[INFO] __main__ Flushed 7491 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 03:55:46,559[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 04:00:46,593[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 04:05:46,678[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 04:10:47,127[INFO] __main__ Flushed 7491 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 04:15:46,617[INFO] __main__ Flushed 7480 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 04:20:46,630[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 04:25:46,761[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 04:30:46,692[INFO] __main__ Flushed 7489 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 04:35:46,701[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 04:40:46,714[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 04:45:46,806[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 04:50:46,764[INFO] __main__ Flushed 7491 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 04:55:46,777[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 05:00:46,798[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 05:05:46,880[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 05:10:46,842[INFO] __main__ Flushed 7490 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 05:15:46,851[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 05:20:46,890[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 05:25:46,890[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 05:30:46,987[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 05:35:46,931[INFO] __main__ Flushed 7490 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 05:40:46,928[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 05:45:46,971[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 05:50:47,098[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 05:55:47,007[INFO] __main__ Flushed 7490 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 06:00:47,015[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 06:05:47,073[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 06:10:47,182[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 06:15:47,116[INFO] __main__ Flushed 7490 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 06:20:47,160[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 06:25:47,196[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 06:30:47,295[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 06:35:47,248[INFO] __main__ Flushed 7490 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 06:40:47,291[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 06:45:47,288[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 06:50:47,398[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 06:55:47,344[INFO] __main__ Flushed 7490 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 07:00:47,386[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 07:05:47,424[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 07:10:47,470[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 07:15:47,543[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 07:20:47,472[INFO] __main__ Flushed 7490 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 07:25:47,494[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 07:30:47,530[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 07:35:47,665[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 07:40:47,578[INFO] __main__ Flushed 7490 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 07:45:47,610[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 07:50:47,654[INFO] __main__ Flushed 7492 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 07:55:47,763[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 08:00:47,696[INFO] __main__ Flushed 7489 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 08:05:47,737[INFO] __main__ Flushed 7493 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 08:10:47,923[INFO] __main__ Flushed 7465 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl
+2026-04-16 08:11:39,216[INFO] __main__ Stop key detected. Finishing recording.
+2026-04-16 08:11:39,380[INFO] __main__ Flushed 1299 recorded states to F:\Downloads\AgentShiftAddon\demonstrations\session_02\20260415_221043.821_demo.pkl

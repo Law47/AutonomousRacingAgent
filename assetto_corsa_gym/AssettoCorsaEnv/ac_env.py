@@ -312,6 +312,9 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             "penalize_actions_diff_coef",
             getattr(self.config, "penalize_actions_diff_coef", 0.1),
         )
+        self.enforce_mutually_exclusive_pedals = bool(
+            getattr(self.config, "enforce_mutually_exclusive_pedals", True)
+        )
         self.neutral_reverse_gear_step_penalty = getattr(
             reward_config,
             "neutral_reverse_gear_step_penalty",
@@ -361,6 +364,13 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             gear_shift_config,
             "cooldown_s",
             getattr(self.config, "gear_shift_cooldown_s", 0.30),
+        )
+        self.prevent_reverse_downshift = bool(
+            getattr(
+                gear_shift_config,
+                "prevent_reverse_downshift",
+                getattr(self.config, "prevent_reverse_downshift", True),
+            )
         )
 
         # from the config
@@ -502,6 +512,14 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             if self.config.enable_task_id_in_obs:
                 logger.info(f"task_id: {self.current_task_id} num_tasks: {self.tasks_ids.get_number_of_tasks()}")
 
+        logger.info(
+            "Pedal exclusivity enabled=%s (strict no-overlap mode)",
+            self.enforce_mutually_exclusive_pedals,
+        )
+        logger.info(
+            "Reverse downshift guard enabled=%s",
+            self.prevent_reverse_downshift,
+        )
         logger.info(f"state_dim {self.state_dim}")
         logger.info(f"action_space: {self.action_space}")
 
@@ -542,10 +560,26 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         return np.clip(actions, -1.0, 1.0)
 
     def decode_shift_actions(self, actions):
-        return self.shift_gate.update(
+        shift_up, shift_down = self.shift_gate.update(
             float(actions[SHIFT_UP_ACTION_INDEX]),
             float(actions[SHIFT_DOWN_ACTION_INDEX]),
         )
+        return self._filter_shift_actions(shift_up, shift_down)
+
+    def _get_current_gear(self):
+        if hasattr(self.client, "state"):
+            return int(self.client.state.get("actualGear", 0))
+        return 0
+
+    def _filter_shift_actions(self, shift_up, shift_down):
+        if not shift_down or not self.prevent_reverse_downshift:
+            return shift_up, shift_down
+
+        current_gear = self._get_current_gear()
+        if current_gear <= 1:
+            return shift_up, False
+
+        return shift_up, shift_down
 
     def preprocess_actions(self, actions, current_actions):
         control_actions = np.asarray(actions, dtype=np.float32).reshape(-1)[:self.control_action_dim]
@@ -556,9 +590,13 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             new_actions = current_actions + control_actions * self.adjusted_controls_rate_limit[:, 1]
         else:
             new_actions = control_actions
-        return np.clip(new_actions, self.controls_min_values, self.controls_max_values)
+        new_actions = np.clip(new_actions, self.controls_min_values, self.controls_max_values)
+        return self._enforce_mutually_exclusive_pedals(new_actions)
 
     def inverse_preprocess_actions(self, prev_abs_actions, current_abs_actions):
+        prev_abs_actions = self._enforce_mutually_exclusive_pedals(np.array(prev_abs_actions, copy=True))
+        current_abs_actions = self._enforce_mutually_exclusive_pedals(np.array(current_abs_actions, copy=True))
+
         if self.use_relative_actions:
             # Use the adjusted rate limit's upper bound for each channel.
             max_delta = self.adjusted_controls_rate_limit[:, 1]
@@ -566,6 +604,21 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             return np.clip(actions, -1.0, 1.0)
         else:
             return np.clip(current_abs_actions, self.controls_min_values, self.controls_max_values)
+
+    def _enforce_mutually_exclusive_pedals(self, actions):
+        if not self.enforce_mutually_exclusive_pedals:
+            return actions
+
+        pedal_level = (actions[1] + 1.0) * 0.5
+        brake_level = (actions[2] + 1.0) * 0.5
+
+        if pedal_level > 0.0 and brake_level > 0.0:
+            if pedal_level >= brake_level:
+                actions[2] = -1.0
+            else:
+                actions[1] = -1.0
+
+        return actions
 
     def set_actions(self, actions):
         """
@@ -577,6 +630,15 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             self.shift_up_count += 1
         if shift_down:
             self.shift_down_count += 1
+        if shift_up or shift_down:
+            logger.debug(
+                "Shift pulse emitted: up=%s down=%s gear=%s raw_up=%.3f raw_down=%.3f",
+                int(shift_up),
+                int(shift_down),
+                self._get_current_gear(),
+                float(model_actions[SHIFT_UP_ACTION_INDEX]),
+                float(model_actions[SHIFT_DOWN_ACTION_INDEX]),
+            )
 
         # get state from the sim
         self.raw_actions = model_actions.copy()
@@ -631,8 +693,12 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         self.state["reward"] = self.get_reward(self.state, actions_diff).item()
 
         if (self.ep_steps % 50) == 0:
+            current_gear = int(state.get("actualGear", 0))
             logger.debug(f't: {self.ep_steps} speed: {state["speed"]:.2f}, oot: {state["out_of_track"]} '
                          f's: {self.actions[0]:.2f} a: {self.actions[1]:.2f} b: {self.actions[2]:.2f} '
+                         f'gear: {current_gear:d} '
+                         f'sig_up: {self.raw_actions[SHIFT_UP_ACTION_INDEX]:.2f} '
+                         f'sig_down: {self.raw_actions[SHIFT_DOWN_ACTION_INDEX]:.2f} '
                          f'su: {int(self.state["shift_up"])} sd: {int(self.state["shift_down"])} '
                          f'reward: {state["reward"]:.3f} '
                          f'done: {state["done"]:.0f} LapDist: {state["LapDist"]:.0f} gap: {state["gap"]:.1f} '

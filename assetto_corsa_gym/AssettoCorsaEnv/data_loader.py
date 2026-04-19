@@ -153,6 +153,17 @@ class DataLoader():
         padded_actions[:actions.shape[0]] = actions
         return padded_actions
 
+    def compose_model_actions(self, state, previous_state, current_abs_actions):
+        controls_actions = self.env.inverse_preprocess_actions(self.prev_abs_actions, current_abs_actions)
+
+        recorded_model_actions = self.get_recorded_model_actions(state)
+        if recorded_model_actions is not None and recorded_model_actions.shape[0] >= 5:
+            shift_actions = recorded_model_actions[3:5]
+        else:
+            shift_actions = self.infer_shift_actions(state, previous_state)
+
+        return self.pad_model_actions(np.concatenate([controls_actions, shift_actions]))
+
     def compute_steer_ratio_statistics(self, trajectory):
         # trajectory is a list of dictionaries
         lap_data = defaultdict(list)
@@ -192,13 +203,7 @@ class DataLoader():
         if self.current_step == 0:
             self.prev_abs_actions = current_abs_actions
 
-        recorded_model_actions = self.get_recorded_model_actions(state)
-        if recorded_model_actions is not None:
-            actions = recorded_model_actions
-        else:
-            controls_actions = self.env.inverse_preprocess_actions(self.prev_abs_actions, current_abs_actions)
-            shift_actions = self.infer_shift_actions(state, previous_state)
-            actions = self.pad_model_actions(np.concatenate([controls_actions, shift_actions]))
+        actions = self.compose_model_actions(state, previous_state, current_abs_actions)
         self.prev_abs_actions = current_abs_actions
 
         # abs values or relative

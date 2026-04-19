@@ -102,6 +102,7 @@ class FakeClient:
     def __init__(self):
         self.controls = FakeControls()
         self.responded = False
+        self.state = {}
 
     def respond_to_server(self):
         self.responded = True
@@ -126,6 +127,8 @@ def make_env_stub(cooldown_steps=0):
     env.shift_gate = GearShiftGate(cooldown_steps=cooldown_steps)
     env.shift_up_count = 0
     env.shift_down_count = 0
+    env.enforce_mutually_exclusive_pedals = True
+    env.prevent_reverse_downshift = True
     env.use_reference_line_in_reward = False
     env.penalize_actions_diff = False
     env.neutral_reverse_gear_step_penalty = 0.001
@@ -177,11 +180,21 @@ def test_env_action_space_and_preprocess_are_split():
 
     assert env.action_space.shape == (5,)
     assert controls.shape == (3,)
-    np.testing.assert_allclose(controls, [0.5, -0.75, -0.25])
+    np.testing.assert_allclose(controls, [0.5, -1.0, -0.25])
+
+
+def test_env_preprocess_keeps_only_more_extreme_pedal():
+    env = make_env_stub()
+    env.current_actions = np.array([0.0, -1.0, -1.0], dtype=np.float32)
+
+    controls = env.preprocess_actions(np.array([0.0, 1.0, 0.2, 0.0, 0.0], dtype=np.float32), env.current_actions)
+
+    np.testing.assert_allclose(controls, [0.0, 0.0, -1.0])
 
 
 def test_env_set_actions_forwards_decoded_shift_pulse():
     env = make_env_stub()
+    env.client.state["actualGear"] = 3
 
     env.set_actions(np.array([0.0, 0.0, 0.0, 0.9, 0.0], dtype=np.float32))
 
@@ -190,6 +203,16 @@ def test_env_set_actions_forwards_decoded_shift_pulse():
     assert env.client.controls["shift_up"] is True
     assert env.client.controls["shift_down"] is False
     np.testing.assert_allclose(env.raw_actions, [0.0, 0.0, 0.0, 0.9, 0.0])
+
+
+def test_env_set_actions_blocks_downshift_into_reverse():
+    env = make_env_stub()
+    env.client.state["actualGear"] = 1
+
+    env.set_actions(np.array([0.0, 0.0, 0.0, 0.0, 0.9], dtype=np.float32))
+
+    assert env.client.controls["shift_up"] is False
+    assert env.client.controls["shift_down"] is False
 
 
 def test_offline_loader_pads_old_three_control_actions_to_model_shape():
@@ -210,6 +233,27 @@ def test_offline_loader_prefers_recorded_five_action_demo_tensor():
     )
 
     np.testing.assert_allclose(recorded, [0.1, -0.2, 0.3, 1.0, 0.0])
+
+
+def test_offline_loader_rebuilds_controls_but_preserves_recorded_shift_signals():
+    loader = DataLoader.__new__(DataLoader)
+    loader.prev_abs_actions = np.array([0.0, -1.0, -1.0], dtype=np.float32)
+    loader.env = type(
+        "EnvStub",
+        (),
+        {
+            "action_dim": 5,
+            "inverse_preprocess_actions": lambda self, prev_abs, current_abs: np.array([0.2, -1.0, 0.4], dtype=np.float32),
+        },
+    )()
+
+    actions = loader.compose_model_actions(
+        {"actions_0": 0.9, "actions_1": 0.9, "actions_2": 0.9, "actions_3": 1.0, "actions_4": 0.0},
+        {"actualGear": 2},
+        np.array([0.0, 0.0, 0.0], dtype=np.float32),
+    )
+
+    np.testing.assert_allclose(actions, [0.2, -1.0, 0.4, 1.0, 0.0])
 
 
 def test_offline_loader_infers_shift_up_from_gear_delta():

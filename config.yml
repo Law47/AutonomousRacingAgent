@@ -57,6 +57,7 @@ AssettoCorsa:
   use_ac_out_of_track: True
   add_previous_obs_to_state: True
   use_target_speed: False
+  enforce_mutually_exclusive_pedals: True
   screen_capture_enable: False
   final_image_width: 320
   final_image_height: 240
@@ -67,6 +68,7 @@ AssettoCorsa:
     threshold: 0.5
     release_threshold: 0.1
     cooldown_s: 0.0
+    prevent_reverse_downshift: True
 
   Rewards:
     use_reference_line_in_reward: True

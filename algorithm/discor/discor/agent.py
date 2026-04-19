@@ -335,14 +335,28 @@ class Agent:
 
     def load_pre_train_data(self, trajs_path, env, log_steer_ratios=False):
         total_added_episodes = 0
+        total_added_transitions = 0
+        load_start_time = time.time()
 
         buffer_size_before = len(self._replay_buffer)
         env_data = DataLoader(env, trajs_path, log_steer_ratios=log_steer_ratios)
-        for ep in tqdm(range(env_data.trajectories_count)[:]):
+        for ep in tqdm(range(env_data.trajectories_count)[:], desc="Loading demo trajectories"):
             state = env_data.reset()
 
             total_added_episodes += 1
-            for i in range(len(env_data.trajectory) - 1):
+            trajectory_steps = max(len(env_data.trajectory) - 1, 0)
+            logger.info(
+                "Loading demonstration trajectory %s/%s with %s transitions",
+                ep + 1,
+                env_data.trajectories_count,
+                trajectory_steps,
+            )
+            step_progress = tqdm(
+                range(trajectory_steps),
+                desc=f"Trajectory {ep + 1}/{env_data.trajectories_count}",
+                leave=False,
+            )
+            for i in step_progress:
                 action = env_data.act()
                 next_state, reward, done, info = env_data.step(action)
 
@@ -358,17 +372,21 @@ class Agent:
                     episode_done = False # use the termination signal from the environment
 
                 self._replay_buffer.append(state, action, reward, next_state, terminated=terminated, episode_done=episode_done)
+                total_added_transitions += 1
                 state = next_state
                 if episode_done:
                     break
+            step_progress.close()
         added_transitions = len(self._replay_buffer) - buffer_size_before
         self._demo_transition_count += added_transitions
+        load_elapsed = time.time() - load_start_time
         logger.info(
-            "Loaded %s demonstration episodes from %s. Added %s transitions. Buffer size: %s",
+            "Loaded %s demonstration episodes from %s. Added %s transitions. Buffer size: %s. Took %.1fs",
             total_added_episodes,
             trajs_path,
             added_transitions,
             len(self._replay_buffer),
+            load_elapsed,
         )
         return added_transitions
 

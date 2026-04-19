@@ -73,8 +73,26 @@ def build_work_dir(config) -> str:
     return work_dir + os.sep
 
 
+def resolve_demonstration_config(config):
+    top_level_demo = getattr(config, "Demonstrations", None)
+    nested_demo = None
+    assetto_cfg = getattr(config, "AssettoCorsa", None)
+    if assetto_cfg is not None:
+        nested_demo = getattr(assetto_cfg, "Demonstrations", None)
+
+    if nested_demo is not None:
+        if top_level_demo is not None:
+            logger.warning(
+                "Both Demonstrations and AssettoCorsa.Demonstrations are set; "
+                "using AssettoCorsa.Demonstrations."
+            )
+        return nested_demo
+
+    return top_level_demo
+
+
 def maybe_load_demonstrations(agent: Agent, env, config) -> bool:
-    demo_config = getattr(config, "Demonstrations", None)
+    demo_config = resolve_demonstration_config(config)
     if demo_config is None or not getattr(demo_config, "enabled", False):
         return False
 
@@ -86,7 +104,12 @@ def maybe_load_demonstrations(agent: Agent, env, config) -> bool:
         data_paths.append(path)
 
     if not data_paths:
-        raise ValueError("Demonstrations.enabled is true, but no Demonstrations.data_path or data_paths were provided")
+        raise ValueError(
+            "Demonstrations.enabled is true, but no data_path/data_paths were provided "
+            "in Demonstrations or AssettoCorsa.Demonstrations"
+        )
+
+    logger.info("Demonstration paths requested: %s", data_paths)
 
     total_transitions = 0
     log_steer_ratios = getattr(demo_config, "log_steer_ratios", False)
@@ -165,6 +188,13 @@ def main() -> None:
 
     if not args.test:
         did_demo_pretrain = maybe_load_demonstrations(agent, env, config)
+        if did_demo_pretrain and bool(getattr(config.Agent, "use_offline_buffer", False)):
+            replay_buffer = getattr(agent, "_replay_buffer", None)
+            if replay_buffer is not None and hasattr(replay_buffer, "online"):
+                replay_buffer.online(True)
+                logger.info(
+                    "Enabled mixed offline/online replay sampling after demonstration pretraining"
+                )
         if not did_demo_pretrain:
             wait_for_start()
 
