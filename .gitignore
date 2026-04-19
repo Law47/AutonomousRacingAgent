@@ -1,6 +1,7 @@
 outputs/
-outputs/
+demonstrations/
 .venv/
+.vscode/
 __pycache__/
 *.pyc
 *.pkl
