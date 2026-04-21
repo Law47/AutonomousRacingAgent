@@ -91,7 +91,7 @@ class DataLoader():
         return np.zeros(2, dtype='float32')
 
     def validate_shift_action_alignment(self, trajectory):
-        threshold = float(getattr(self.env, "gear_shift_threshold", 0.5))
+        threshold = float(getattr(self.env, "shift_execution_threshold", 0.5))
         stats = {
             "gear_up_events": 0,
             "gear_down_events": 0,

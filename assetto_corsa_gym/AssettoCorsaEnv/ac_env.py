@@ -113,53 +113,36 @@ class TaskIdsIndexer:
         return task_one_hot
 
 
-class GearShiftGate:
-    def __init__(self, press_threshold=0.4, release_threshold=0.05, cooldown_steps=1):
-        if release_threshold >= press_threshold:
-            raise ValueError("release_threshold must be lower than press_threshold")
-        self.press_threshold = float(press_threshold)
-        self.release_threshold = float(release_threshold)
+class ShiftExecutionGate:
+    def __init__(self, threshold=0.5, cooldown_steps=0):
+        self.threshold = float(threshold)
         self.cooldown_steps = max(int(cooldown_steps), 0)
         self.reset()
 
     def reset(self):
-        self._up_armed = True
-        self._down_armed = True
         self._cooldown_remaining = 0
 
     def update(self, shift_up_signal, shift_down_signal):
-        if shift_up_signal <= self.release_threshold:
-            self._up_armed = True
-        if shift_down_signal <= self.release_threshold:
-            self._down_armed = True
-
-        shift_up_ready = self._up_armed and shift_up_signal >= self.press_threshold
-        shift_down_ready = self._down_armed and shift_down_signal >= self.press_threshold
+        shift_up_ready = shift_up_signal >= self.threshold
+        shift_down_ready = shift_down_signal >= self.threshold
 
         if self._cooldown_remaining > 0:
             self._cooldown_remaining -= 1
-            if shift_up_ready:
-                self._up_armed = False
-            if shift_down_ready:
-                self._down_armed = False
             return False, False
 
         if shift_up_ready and shift_down_ready:
-            self._up_armed = False
-            self._down_armed = False
             return False, False
 
         if shift_up_ready:
-            self._up_armed = False
             self._cooldown_remaining = self.cooldown_steps
             return True, False
 
         if shift_down_ready:
-            self._down_armed = False
             self._cooldown_remaining = self.cooldown_steps
             return False, True
 
         return False, False
+
 
 class AssettoCorsaEnv(Env, gym_utils.EzPickle):
     # List of tracks and cars when using task IDs
@@ -298,7 +281,7 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         self.max_steer_rate = self.config.max_steer_rate
         self.use_obs_extra = self.config.use_obs_extra
         reward_config = getattr(self.config, "Rewards", None)
-        gear_shift_config = getattr(self.config, "GearShift", None)
+        shift_execution_config = getattr(self.config, "ShiftExecution", None)
         auto_shift_config = getattr(self.config, "AutoShift", None)
         self.use_reference_line_in_reward = getattr(
             reward_config,
@@ -318,24 +301,19 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         self.enforce_mutually_exclusive_pedals = bool(
             getattr(self.config, "enforce_mutually_exclusive_pedals", True)
         )
-        self.gear_shift_threshold = getattr(
-            gear_shift_config,
+        self.shift_execution_threshold = getattr(
+            shift_execution_config,
             "threshold",
-            getattr(self.config, "gear_shift_threshold", 0.4),
+            getattr(self.config, "shift_execution_threshold", 0.5),
         )
-        self.gear_shift_release_threshold = getattr(
-            gear_shift_config,
-            "release_threshold",
-            getattr(self.config, "gear_shift_release_threshold", 0.05),
-        )
-        self.gear_shift_cooldown_s = getattr(
-            gear_shift_config,
+        self.shift_execution_cooldown_s = getattr(
+            shift_execution_config,
             "cooldown_s",
-            getattr(self.config, "gear_shift_cooldown_s", 0.30),
+            getattr(self.config, "shift_execution_cooldown_s", 0.0),
         )
         self.prevent_reverse_downshift = bool(
             getattr(
-                gear_shift_config,
+                shift_execution_config,
                 "prevent_reverse_downshift",
                 getattr(self.config, "prevent_reverse_downshift", True),
             )
@@ -433,10 +411,9 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             low=np.full((self.action_dim,), -1.0, dtype=np.float32),
             high=np.full((self.action_dim,), 1.0, dtype=np.float32),
         )
-        self.shift_gate = GearShiftGate(
-            press_threshold=self.gear_shift_threshold,
-            release_threshold=self.gear_shift_release_threshold,
-            cooldown_steps=round(self.gear_shift_cooldown_s * self.ctrl_rate),
+        self.shift_gate = ShiftExecutionGate(
+            threshold=self.shift_execution_threshold,
+            cooldown_steps=round(self.shift_execution_cooldown_s * self.ctrl_rate),
         )
         self.shift_up_count = 0
         self.shift_down_count = 0

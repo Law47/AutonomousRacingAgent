@@ -88,9 +88,8 @@ AssettoCorsa:
   color_mode: "gray"
   use_obs_extra: False
 
-  GearShift:
+  ShiftExecution:
     threshold: 0.5
-    release_threshold: 0.1
     cooldown_s: 0.0
     prevent_reverse_downshift: True
 

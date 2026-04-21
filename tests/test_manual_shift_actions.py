@@ -87,7 +87,7 @@ sys.modules["AssettoCorsaEnv.sensors_ray_casting"] = sensors_module
 sys.modules["AssettoCorsaEnv.gap"] = gap_module
 sys.modules["AssettoCorsaEnv.brake_map"] = brake_map_module
 
-from AssettoCorsaEnv.ac_env import AssettoCorsaEnv, GearShiftGate, STREAMING_DEMO_FORMAT
+from AssettoCorsaEnv.ac_env import AssettoCorsaEnv, ShiftExecutionGate, STREAMING_DEMO_FORMAT
 from AssettoCorsaEnv.autoshift import AutoShifter
 from AssettoCorsaEnv.data_loader import DataLoader
 from AssettoCorsaPlugin.plugins.sensors_par import car_control
@@ -126,7 +126,7 @@ def make_env_stub(cooldown_steps=0):
     env.controls_min_values = np.array([-1.0, -1.0, -1.0], dtype=np.float32)
     env.controls_max_values = np.array([1.0, 1.0, 1.0], dtype=np.float32)
     env.current_actions = np.array([0.0, -1.0, -1.0], dtype=np.float32)
-    env.shift_gate = GearShiftGate(cooldown_steps=cooldown_steps)
+    env.shift_gate = ShiftExecutionGate(cooldown_steps=cooldown_steps)
     env.shift_up_count = 0
     env.shift_down_count = 0
     env.enforce_mutually_exclusive_pedals = True
@@ -142,33 +142,30 @@ def make_env_stub(cooldown_steps=0):
     return env
 
 
-def test_shift_gate_below_threshold_emits_no_pulse():
-    gate = GearShiftGate(cooldown_steps=0)
+def test_shift_execution_below_threshold_emits_no_pulse():
+    gate = ShiftExecutionGate(cooldown_steps=0)
 
     assert gate.update(0.39, 0.0) == (False, False)
 
 
-def test_shift_gate_crossing_emits_one_pulse_until_rearmed():
-    gate = GearShiftGate(cooldown_steps=0)
+def test_shift_execution_repeats_bernoulli_events_without_release_gate():
+    gate = ShiftExecutionGate(cooldown_steps=0)
 
-    assert gate.update(0.41, 0.0) == (True, False)
-    assert gate.update(1.0, 0.0) == (False, False)
-    assert gate.update(0.04, 0.0) == (False, False)
-    assert gate.update(0.9, 0.0) == (True, False)
+    assert gate.update(0.51, 0.0) == (True, False)
+    assert gate.update(1.0, 0.0) == (True, False)
 
 
-def test_shift_gate_cooldown_blocks_repeated_shift():
-    gate = GearShiftGate(cooldown_steps=2)
+def test_shift_execution_cooldown_blocks_repeated_shift():
+    gate = ShiftExecutionGate(cooldown_steps=2)
 
     assert gate.update(0.9, 0.0) == (True, False)
-    assert gate.update(0.0, 0.0) == (False, False)
     assert gate.update(0.9, 0.0) == (False, False)
-    assert gate.update(0.0, 0.0) == (False, False)
+    assert gate.update(0.9, 0.0) == (False, False)
     assert gate.update(0.9, 0.0) == (True, False)
 
 
-def test_shift_gate_simultaneous_crossing_suppresses_both():
-    gate = GearShiftGate(cooldown_steps=0)
+def test_shift_execution_simultaneous_crossing_suppresses_both():
+    gate = ShiftExecutionGate(cooldown_steps=0)
 
     assert gate.update(0.9, 0.9) == (False, False)
 
@@ -275,9 +272,9 @@ def test_offline_loader_infers_shift_up_from_gear_delta():
     np.testing.assert_allclose(inferred, [1.0, 0.0])
 
 
-def test_demo_shift_alignment_matches_model_shift_gate_indices():
+def test_demo_shift_alignment_matches_shift_execution_indices():
     loader = DataLoader.__new__(DataLoader)
-    loader.env = type("EnvStub", (), {"action_dim": 3, "control_action_dim": 3, "shift_action_dim": 2, "gear_shift_threshold": 0.5})()
+    loader.env = type("EnvStub", (), {"action_dim": 3, "control_action_dim": 3, "shift_action_dim": 2, "shift_execution_threshold": 0.5})()
     trajectory = [
         {"actualGear": 2, "actions_0": 0.0, "actions_1": 0.0, "actions_2": 0.0, "actions_3": 0.0, "actions_4": 0.0},
         {"actualGear": 3, "actions_0": 0.0, "actions_1": 0.0, "actions_2": 0.0, "actions_3": 1.0, "actions_4": 0.0},
@@ -295,7 +292,7 @@ def test_demo_shift_alignment_matches_model_shift_gate_indices():
 
 def test_demo_shift_alignment_detects_missing_shift_signal():
     loader = DataLoader.__new__(DataLoader)
-    loader.env = type("EnvStub", (), {"action_dim": 3, "control_action_dim": 3, "shift_action_dim": 2, "gear_shift_threshold": 0.5})()
+    loader.env = type("EnvStub", (), {"action_dim": 3, "control_action_dim": 3, "shift_action_dim": 2, "shift_execution_threshold": 0.5})()
     trajectory = [
         {"actualGear": 2, "actions_0": 0.0, "actions_1": 0.0, "actions_2": 0.0, "actions_3": 0.0, "actions_4": 0.0},
         {"actualGear": 3, "actions_0": 0.0, "actions_1": 0.0, "actions_2": 0.0, "actions_3": 0.0, "actions_4": 0.0},
