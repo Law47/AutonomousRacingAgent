@@ -1,9 +1,10 @@
 import os
 import torch
 from torch.optim import Adam
+from torch.nn import functional as F
 
 from .base import Algorithm
-from discor.network import TwinnedStateActionFunction, GaussianPolicy
+from discor.network import TwinnedStateActionFunction, GaussianPolicy, BernoulliShiftPolicy
 from discor.utils import disable_gradients, soft_update, update_params, \
     assert_action
 
@@ -16,7 +17,11 @@ class SAC(Algorithm):
     def __init__(self, state_dim, action_dim, device, gamma=0.99, nstep=1,
                  policy_lr=0.0003, q_lr=0.0003, entropy_lr=0.0003,
                  policy_hidden_units=[256, 256], q_hidden_units=[256, 256],
-                 target_update_coef=0.005, log_interval=10, seed=0):
+                 target_update_coef=0.005, log_interval=10, seed=0,
+                 target_entropy=None, shift_enabled=True, shift_lr=0.0003,
+                 shift_hidden_units=[256, 256], shift_dim=2,
+                 shift_loss_weight=1.0, shift_pos_weight=None,
+                 shift_threshold=0.5):
         super().__init__(
             state_dim, action_dim, device, gamma, nstep, log_interval, seed)
 
@@ -48,7 +53,7 @@ class SAC(Algorithm):
         self._q_optim = Adam(self._online_q_net.parameters(), lr=q_lr)
 
         # Target entropy is -|A|.
-        self._target_entropy = -float(self._action_dim)
+        self._target_entropy = -float(self._action_dim) if target_entropy is None else float(target_entropy)
 
         # We optimize log(alpha), instead of alpha.
         self._log_alpha = torch.zeros(
@@ -59,23 +64,82 @@ class SAC(Algorithm):
         self._target_update_coef = target_update_coef
         self.update_entropy = True
 
+        self._shift_enabled = bool(shift_enabled)
+        self._shift_dim = int(shift_dim)
+        self._shift_threshold = float(shift_threshold)
+        self._shift_loss_weight = float(shift_loss_weight)
+        self._shift_learning_steps = 0
+        self._shift_pos_weight = self._build_shift_pos_weight(shift_pos_weight)
+        if self._shift_enabled:
+            self._shift_net = BernoulliShiftPolicy(
+                state_dim=self._state_dim,
+                hidden_units=shift_hidden_units,
+                shift_dim=self._shift_dim,
+            ).to(self._device)
+            self._shift_optim = Adam(self._shift_net.parameters(), lr=shift_lr)
+        else:
+            self._shift_net = None
+            self._shift_optim = None
+
+    def _build_shift_pos_weight(self, shift_pos_weight):
+        if shift_pos_weight is None:
+            return None
+        if isinstance(shift_pos_weight, (int, float)):
+            weights = [float(shift_pos_weight)] * self._shift_dim
+        else:
+            weights = [float(value) for value in shift_pos_weight]
+        if len(weights) != self._shift_dim:
+            raise ValueError(f"shift_pos_weight must have {self._shift_dim} entries")
+        return torch.tensor(weights, dtype=torch.float, device=self._device)
+
+    def unpack_batch(self, batch):
+        if len(batch) == 6:
+            return batch
+        states, actions, rewards, next_states, dones = batch
+        shift_labels = torch.zeros(
+            (states.shape[0], self._shift_dim),
+            dtype=states.dtype,
+            device=states.device,
+        )
+        return states, actions, shift_labels, rewards, next_states, dones
+
     def explore(self, state):
         state = torch.tensor(
             state[None, ...].copy(), dtype=torch.float, device=self._device)
         with torch.no_grad():
             action, entropies, _ = self._policy_net(state)
+            shift_action, shift_probs = self._sample_shift_from_tensor(state, deterministic=False)
         action = action.cpu().numpy()[0]
         assert_action(action)
-        return action, entropies
+        return action, {
+            "entropies": entropies,
+            "shift_action": shift_action,
+            "shift_probs": shift_probs,
+        }
 
     def exploit(self, state):
         state = torch.tensor(
             state[None, ...].copy(), dtype=torch.float, device=self._device)
         with torch.no_grad():
             _, entropies, action = self._policy_net(state)
+            shift_action, shift_probs = self._sample_shift_from_tensor(state, deterministic=True)
         action = action.cpu().numpy()[0]
         assert_action(action)
-        return action, entropies
+        return action, {
+            "entropies": entropies,
+            "shift_action": shift_action,
+            "shift_probs": shift_probs,
+        }
+
+    def _sample_shift_from_tensor(self, states, deterministic=False):
+        if not self._shift_enabled:
+            zeros = torch.zeros((states.shape[0], self._shift_dim), device=states.device)
+            return zeros.cpu().numpy()[0], zeros.cpu().numpy()[0]
+
+        sampled_actions, probs, deterministic_actions = self._shift_net.sample(
+            states, threshold=self._shift_threshold)
+        actions = deterministic_actions if deterministic else sampled_actions
+        return actions.cpu().numpy()[0], probs.cpu().numpy()[0]
 
     def update_target_networks(self):
         soft_update(
@@ -85,10 +149,15 @@ class SAC(Algorithm):
         self._learning_steps += 1
         stats = self.update_policy_and_entropy(batch, writer)
         self.update_q_functions(batch, writer)
+        shift_stats = self.update_shift_model_from_batch(batch, writer)
+        if shift_stats:
+            if stats is None:
+                stats = {}
+            stats.update(shift_stats)
         return stats
 
     def update_policy_and_entropy(self, batch, writer):
-        states, actions, rewards, next_states, dones = batch
+        states, actions, shift_labels, rewards, next_states, dones = self.unpack_batch(batch)
 
         # Update policy.
         policy_loss, entropies = self.calc_policy_loss(states)
@@ -144,7 +213,7 @@ class SAC(Algorithm):
         return entropy_loss
 
     def update_q_functions(self, batch, writer, imp_ws1=None, imp_ws2=None):
-        states, actions, rewards, next_states, dones = batch
+        states, actions, shift_labels, rewards, next_states, dones = self.unpack_batch(batch)
 
         # Calculate current and target Q values.
         curr_qs1, curr_qs2 = self.calc_current_qs(states, actions)
@@ -205,13 +274,67 @@ class SAC(Algorithm):
 
         return q1_loss + q2_loss, mean_q1, mean_q2
 
+    def update_shift_model_from_batch(self, batch, writer):
+        if not self._shift_enabled:
+            return None
+
+        states, actions, shift_labels, rewards, next_states, dones = self.unpack_batch(batch)
+        self._shift_learning_steps += 1
+        shift_loss, shift_acc, shift_up_rate, shift_down_rate = self.calc_shift_loss(states, shift_labels)
+        update_params(self._shift_optim, shift_loss)
+
+        if self._shift_learning_steps % self._log_interval == 0:
+            loss_value = shift_loss.detach().item()
+            writer.add_scalar('loss/shift', loss_value, self._shift_learning_steps)
+            writer.add_scalar('stats/shift_accuracy', shift_acc, self._shift_learning_steps)
+            writer.add_scalar('stats/shift_up_label_rate', shift_up_rate, self._shift_learning_steps)
+            writer.add_scalar('stats/shift_down_label_rate', shift_down_rate, self._shift_learning_steps)
+            return {
+                "shift_loss": loss_value,
+                "shift_accuracy": shift_acc,
+                "shift_up_label_rate": shift_up_rate,
+                "shift_down_label_rate": shift_down_rate,
+            }
+        return None
+
+    def calc_shift_loss(self, states, shift_labels):
+        labels = shift_labels.clamp(0.0, 1.0)
+        logits, probs = self._shift_net(states)
+        loss = F.binary_cross_entropy_with_logits(
+            logits,
+            labels,
+            pos_weight=self._shift_pos_weight,
+        ) * self._shift_loss_weight
+
+        with torch.no_grad():
+            predictions = (probs >= self._shift_threshold).float()
+            simultaneous = (predictions[:, :1] > 0.5) & (predictions[:, 1:2] > 0.5)
+            if simultaneous.any():
+                predictions = torch.where(
+                    simultaneous.repeat(1, predictions.shape[1]),
+                    torch.zeros_like(predictions),
+                    predictions,
+                )
+            shift_acc = (predictions == labels).float().mean().item()
+            shift_up_rate = labels[:, 0].mean().item()
+            shift_down_rate = labels[:, 1].mean().item()
+
+        return loss, shift_acc, shift_up_rate, shift_down_rate
+
     def save_models(self, save_dir):
         super().save_models(save_dir)
         self._policy_net.save(os.path.join(save_dir, 'policy_net.pth'))
         self._online_q_net.save(os.path.join(save_dir, 'online_q_net.pth'))
         self._target_q_net.save(os.path.join(save_dir, 'target_q_net.pth'))
+        if self._shift_enabled:
+            self._shift_net.save(os.path.join(save_dir, 'shift_net.pth'))
 
     def load_models(self, load_dir):
         self._policy_net.load(os.path.join(load_dir, 'policy_net.pth'))
         self._online_q_net.load(os.path.join(load_dir, 'online_q_net.pth'))
         self._target_q_net.load(os.path.join(load_dir, 'target_q_net.pth'))
+        shift_path = os.path.join(load_dir, 'shift_net.pth')
+        if self._shift_enabled and os.path.exists(shift_path):
+            self._shift_net.load(shift_path)
+        elif self._shift_enabled:
+            logger.warning("shift_net.pth not found in %s; shift model starts fresh", load_dir)

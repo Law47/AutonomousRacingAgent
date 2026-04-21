@@ -5,6 +5,7 @@ from torch.utils.tensorboard import SummaryWriter
 import pickle
 from pathlib import Path
 from tqdm import tqdm
+from collections.abc import Mapping
 
 from discor.replay_buffer import ReplayBuffer, EnsembleBuffer
 from discor.utils import RunningMeanStats
@@ -16,12 +17,22 @@ logger.setLevel(logging.INFO)
 
 import time
 
+
+def cfg_get(config, key, default):
+    if config is None:
+        return default
+    if isinstance(config, Mapping):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
 class Agent:
     def __init__(self, env, test_env, algo, log_dir, device, num_steps=3000000,
                  batch_size=256, memory_size=1_000_000,
                  update_interval=1, start_steps=10000, log_interval=10, checkpoint_freq=0,
                  eval_interval=5000, num_eval_episodes=5, seed=0, use_offline_buffer=False, offline_buffer_size=1_000_000,
-                 wandb_logger=None, save_final_buffer=False):
+                 start_steps_count="online_steps", offline_sampling_config=None,
+                 shift_curriculum_config=None, wandb_logger=None, save_final_buffer=False):
 
         # Environment.
         self._env = env
@@ -70,6 +81,38 @@ class Agent:
         self._eval_interval = eval_interval
         self._num_eval_episodes = num_eval_episodes
         self._start_time = time.time()
+        self._start_steps_count = str(start_steps_count)
+        self._use_offline_buffer = bool(use_offline_buffer)
+        self._offline_sampling_enabled = bool(
+            cfg_get(offline_sampling_config, "enabled", self._use_offline_buffer)
+        )
+        self._offline_sampling_initial_ratio = float(
+            cfg_get(offline_sampling_config, "initial_offline_ratio", 0.5)
+        )
+        self._offline_sampling_final_ratio = float(
+            cfg_get(offline_sampling_config, "final_offline_ratio", 0.0)
+        )
+        self._offline_sampling_transition_steps = max(
+            int(cfg_get(offline_sampling_config, "transition_steps", 3_000_000)), 1
+        )
+        self._shift_curriculum_enabled = bool(
+            cfg_get(shift_curriculum_config, "enabled", True)
+        )
+        self._shift_auto_only_steps = int(
+            cfg_get(shift_curriculum_config, "auto_only_steps", self._start_steps)
+        )
+        self._shift_auto_transition_steps = max(
+            int(cfg_get(shift_curriculum_config, "transition_steps", 500_000)), 1
+        )
+        self._shift_initial_auto_probability = float(
+            cfg_get(shift_curriculum_config, "initial_auto_probability", 0.75)
+        )
+        self._shift_final_auto_probability = float(
+            cfg_get(shift_curriculum_config, "final_auto_probability", 0.0)
+        )
+        self._shift_eval_use_manual = bool(
+            cfg_get(shift_curriculum_config, "eval_use_manual", True)
+        )
 
         self.best_lap_time = np.inf
         self.best_reward = -np.inf
@@ -131,7 +174,7 @@ class Agent:
                 if getattr(loaded_replay_buffer, "_action_shape", None) != self._env.action_space.shape:
                     raise ValueError(
                         "Replay buffer is incompatible with the current action shape. "
-                        "This project now uses 5 actions, so old 3-action replay buffers cannot be resumed; "
+                        "This project now stores 3 continuous actions plus separate shift labels; "
                         "start a fresh run or load weights without the old buffer."
                     )
                 self._replay_buffer = loaded_replay_buffer
@@ -156,9 +199,18 @@ class Agent:
         train_stats = None
         # Update online networks.
         if self._steps % self._update_interval == 0:
-            batch = self._replay_buffer.sample(self._batch_size, self._device)
+            batch = self.sample_replay_batch()
             train_stats = self.update_model_from_batch(batch)
         return train_stats
+
+    def sample_replay_batch(self):
+        if isinstance(self._replay_buffer, EnsembleBuffer):
+            return self._replay_buffer.sample(
+                self._batch_size,
+                self._device,
+                offline_ratio=self.offline_sample_ratio(),
+            )
+        return self._replay_buffer.sample(self._batch_size, self._device)
 
     def update_model_from_batch(self, batch):
         train_stats = self._algo.update_online_networks(batch, self._writer)
@@ -166,7 +218,69 @@ class Agent:
         return train_stats
 
     def has_min_experience(self):
-        return len(self._replay_buffer) >= self._start_steps
+        if self._start_steps_count == "replay_buffer":
+            return len(self._replay_buffer) >= self._start_steps
+        return self._steps >= self._start_steps
+
+    def can_update_shift_model(self):
+        return len(self._replay_buffer) >= self._batch_size
+
+    def update_shift_model(self):
+        if self._steps % self._update_interval != 0 or not self.can_update_shift_model():
+            return None
+        batch = self.sample_replay_batch()
+        return self._algo.update_shift_model_from_batch(batch, self._writer)
+
+    def offline_sample_ratio(self):
+        if not self._use_offline_buffer or not self._offline_sampling_enabled:
+            return 0.0
+        elapsed = max(self._steps - self._start_steps, 0)
+        progress = min(elapsed / self._offline_sampling_transition_steps, 1.0)
+        ratio = self._offline_sampling_initial_ratio + (
+            (self._offline_sampling_final_ratio - self._offline_sampling_initial_ratio) * progress
+        )
+        return float(np.clip(ratio, 0.0, 1.0))
+
+    def shift_auto_probability(self, eval_mode=False):
+        if not self._shift_curriculum_enabled:
+            return 0.0
+        if eval_mode and self._shift_eval_use_manual:
+            return 0.0
+        if self._steps < self._shift_auto_only_steps:
+            return 1.0
+        elapsed = max(self._steps - self._shift_auto_only_steps, 0)
+        progress = min(elapsed / self._shift_auto_transition_steps, 1.0)
+        probability = self._shift_initial_auto_probability + (
+            (self._shift_final_auto_probability - self._shift_initial_auto_probability) * progress
+        )
+        return float(np.clip(probability, 0.0, 1.0))
+
+    def select_action_and_shift(self, state, eval_mode=False, env=None):
+        active_env = env if env is not None else self._env
+        if (not eval_mode) and (not self.has_min_experience()):
+            action = active_env.action_space.sample()
+            policy_info = {
+                "entropies": None,
+                "shift_action": np.zeros(getattr(active_env, "shift_action_dim", 2), dtype=np.float32),
+                "shift_probs": np.zeros(getattr(active_env, "shift_action_dim", 2), dtype=np.float32),
+            }
+        else:
+            if eval_mode:
+                action, policy_info = self._algo.exploit(state)
+            else:
+                action, policy_info = self._algo.explore(state)
+
+        teacher_shift = active_env.get_auto_shift_action() if hasattr(active_env, "get_auto_shift_action") else np.zeros(2, dtype=np.float32)
+        manual_shift = np.asarray(policy_info.get("shift_action", np.zeros_like(teacher_shift)), dtype=np.float32)
+        auto_probability = self.shift_auto_probability(eval_mode=eval_mode)
+        if np.random.random() < auto_probability:
+            shift_action = teacher_shift
+            shift_source = "auto"
+        else:
+            shift_action = manual_shift
+            shift_source = "manual"
+
+        return action, shift_action, teacher_shift, shift_source, policy_info
 
     def train_episode(self):
         """
@@ -188,19 +302,25 @@ class Agent:
 
             while (not done):
                 start_profile = time.perf_counter()
-                if not self.has_min_experience():
-                    action = self._env.action_space.sample()
-                else:
-                    action, _ = self._algo.explore(state)
+                action, shift_action, shift_label, shift_source, policy_info = self.select_action_and_shift(state, env=self._env)
                 action_perf.append(time.perf_counter() - start_profile)
 
                 # apply actions right away without blocking
-                self._env.set_actions(action)
+                self._env.set_actions(
+                    action,
+                    shift_action=shift_action,
+                    shift_teacher=shift_label,
+                    shift_source=shift_source,
+                )
 
                 # update model
                 start_profile = time.perf_counter()
                 if self.has_min_experience():
                     train_stats = self.update_model()
+                else:
+                    shift_stats = self.update_shift_model()
+                    if shift_stats:
+                        train_stats = shift_stats
                 update_model_perf.append(time.perf_counter() - start_profile)
 
                 # get observations
@@ -222,7 +342,8 @@ class Agent:
 
                 self._replay_buffer.append(
                     state, action, reward, next_state, masked_done,
-                    episode_done=rb_done)
+                    episode_done=rb_done,
+                    shift_label=shift_label)
 
                 self._steps += 1
                 episode_steps += 1
@@ -299,16 +420,24 @@ class Agent:
                 done = False
 
                 while (not done):
-                    action, entropies = self._algo.exploit(state)
-                    next_state, reward, done, info = self._test_env.step(action)
-                    self._test_env.states[-1]["entropies"] = entropies.cpu().numpy().item()
+                    action, shift_action, shift_label, shift_source, policy_info = self.select_action_and_shift(state, eval_mode=True, env=self._test_env)
+                    self._test_env.set_actions(
+                        action,
+                        shift_action=shift_action,
+                        shift_teacher=shift_label,
+                        shift_source=shift_source,
+                    )
+                    next_state, reward, done, info = self._test_env.step(action=None)
+                    entropies = policy_info.get("entropies")
+                    if entropies is not None:
+                        self._test_env.states[-1]["entropies"] = entropies.cpu().numpy().item()
                     episode_return += reward
                     state = next_state
                 total_return += episode_return
         except TimeoutError:
             logger.exception("Agent TimeoutError")
         finally:
-            env_ep_stats = self._env.close()
+            env_ep_stats = self._test_env.close()
             pd.DataFrame([env_ep_stats]).to_csv(os.path.join(self._log_dir, 'eval_summary.csv'), index=None)
 
     def __del__(self):
@@ -330,6 +459,8 @@ class Agent:
             step=self._steps,
             episode=self._episodes,
             buffer_size=len(self._replay_buffer),
+            offline_sample_ratio=self.offline_sample_ratio(),
+            shift_auto_probability=self.shift_auto_probability(),
             total_time=time.time() - self._start_time,
         )
 
@@ -371,7 +502,16 @@ class Agent:
                 else:
                     episode_done = False # use the termination signal from the environment
 
-                self._replay_buffer.append(state, action, reward, next_state, terminated=terminated, episode_done=episode_done)
+                shift_label = info.get("shift_label", getattr(env_data, "shift_label", None))
+                self._replay_buffer.append(
+                    state,
+                    action,
+                    reward,
+                    next_state,
+                    terminated=terminated,
+                    episode_done=episode_done,
+                    shift_label=shift_label,
+                )
                 total_added_transitions += 1
                 state = next_state
                 if episode_done:

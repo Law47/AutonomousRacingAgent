@@ -174,26 +174,29 @@ def enrich_states_with_actions(
         state = raw_state.copy()
         current_abs_controls = absolute_controls[index]
         current_gear = int(state.get("actualGear", 0))
-        model_actions = np.zeros(env.action_dim, dtype=np.float32)
+        control_actions = np.zeros(env.control_action_dim, dtype=np.float32)
+        shift_actions = np.zeros(getattr(env, "shift_action_dim", 2), dtype=np.float32)
 
         if previous_abs_controls is not None:
-            model_actions[:env.control_action_dim] = env.inverse_preprocess_actions(
+            control_actions = env.inverse_preprocess_actions(
                 previous_abs_controls,
                 current_abs_controls,
             )
         if previous_gear is not None:
             gear_delta = current_gear - previous_gear
             if gear_delta > 0:
-                model_actions[3] = 1.0
+                shift_actions[0] = 1.0
             elif gear_delta < 0:
-                model_actions[4] = 1.0
+                shift_actions[1] = 1.0
 
         for control_index in range(env.control_action_dim):
             state[f"current_action_abs_{control_index}"] = float(current_abs_controls[control_index])
-        for action_index in range(env.action_dim):
-            state[f"actions_{action_index}"] = float(model_actions[action_index])
-        state["shift_up"] = bool(model_actions[3] > 0.5)
-        state["shift_down"] = bool(model_actions[4] > 0.5)
+            state[f"actions_{control_index}"] = float(control_actions[control_index])
+        for shift_index in range(getattr(env, "shift_action_dim", 2)):
+            state[f"actions_{env.control_action_dim + shift_index}"] = float(shift_actions[shift_index])
+        state["shift_up"] = bool(shift_actions[0] > 0.5)
+        state["shift_down"] = bool(shift_actions[1] > 0.5)
+        state["shift_source"] = "human"
 
         _, actions_diff = env.get_obs(state, history_tail + processed_states)
         state["reward"] = env.get_reward(state, actions_diff).item()

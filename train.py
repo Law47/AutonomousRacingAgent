@@ -91,10 +91,10 @@ def resolve_demonstration_config(config):
     return top_level_demo
 
 
-def maybe_load_demonstrations(agent: Agent, env, config) -> bool:
+def maybe_load_demonstrations(agent: Agent, env, config) -> dict:
     demo_config = resolve_demonstration_config(config)
     if demo_config is None or not getattr(demo_config, "enabled", False):
-        return False
+        return {"loaded": False, "pretrained": False, "transitions": 0}
 
     data_paths = []
     single_path = getattr(demo_config, "data_path", None)
@@ -123,7 +123,7 @@ def maybe_load_demonstrations(agent: Agent, env, config) -> bool:
     pretrain_epochs = int(getattr(demo_config, "pretrain_epochs", 0))
     if pretrain_epochs > 0:
         agent.pre_train_epochs(pretrain_epochs, num_samples=total_transitions)
-        return True
+        return {"loaded": True, "pretrained": True, "transitions": total_transitions}
 
     legacy_pretrain_steps = int(getattr(demo_config, "pretrain_steps", 0))
     if legacy_pretrain_steps > 0:
@@ -132,10 +132,29 @@ def maybe_load_demonstrations(agent: Agent, env, config) -> bool:
             "Use Demonstrations.pretrain_epochs so each epoch covers the demonstration dataset once."
         )
         agent.pre_train(legacy_pretrain_steps)
-        return True
+        return {"loaded": True, "pretrained": True, "transitions": total_transitions}
 
     logger.info("Demonstrations were loaded, but pretrain_epochs=0 so demo pretraining was skipped.")
-    return False
+    return {"loaded": True, "pretrained": False, "transitions": total_transitions}
+
+
+def build_sac_kwargs(config):
+    sac_kwargs = OmegaConf.to_container(config.SAC, resolve=True)
+    shift_config = getattr(config, "ShiftModel", None)
+    if shift_config is not None:
+        shift_config = OmegaConf.to_container(shift_config, resolve=True)
+        shift_key_map = {
+            "enabled": "shift_enabled",
+            "lr": "shift_lr",
+            "hidden_units": "shift_hidden_units",
+            "loss_weight": "shift_loss_weight",
+            "pos_weight": "shift_pos_weight",
+            "threshold": "shift_threshold",
+        }
+        for source_key, target_key in shift_key_map.items():
+            if source_key in shift_config:
+                sac_kwargs[target_key] = shift_config[source_key]
+    return sac_kwargs
 
 
 def main() -> None:
@@ -166,8 +185,9 @@ def main() -> None:
         action_dim=env.action_space.shape[0],
         device=device,
         seed=config.seed,
-        **OmegaConf.to_container(config.SAC),
+        **build_sac_kwargs(config),
     )
+    agent_kwargs = OmegaConf.to_container(config.Agent, resolve=True)
 
     agent = Agent(
         env=env,
@@ -176,8 +196,10 @@ def main() -> None:
         log_dir=config.work_dir,
         device=device,
         seed=config.seed,
+        offline_sampling_config=OmegaConf.to_container(getattr(config, "OfflineSampling", {}), resolve=True),
+        shift_curriculum_config=OmegaConf.to_container(getattr(config, "ShiftCurriculum", {}), resolve=True),
         wandb_logger=None,
-        **config.Agent,
+        **agent_kwargs,
     )
 
     if args.load_path:
@@ -187,15 +209,15 @@ def main() -> None:
         agent.load(load_path, load_buffer=(not args.test and not args.load_weights_only))
 
     if not args.test:
-        did_demo_pretrain = maybe_load_demonstrations(agent, env, config)
-        if did_demo_pretrain and bool(getattr(config.Agent, "use_offline_buffer", False)):
+        demo_result = maybe_load_demonstrations(agent, env, config)
+        if bool(getattr(config.Agent, "use_offline_buffer", False)):
             replay_buffer = getattr(agent, "_replay_buffer", None)
             if replay_buffer is not None and hasattr(replay_buffer, "online"):
                 replay_buffer.online(True)
                 logger.info(
-                    "Enabled mixed offline/online replay sampling after demonstration pretraining"
+                    "Enabled online replay writes with scheduled offline/online sampling"
                 )
-        if not did_demo_pretrain:
+        if not demo_result["pretrained"]:
             wait_for_start()
 
     if args.test:

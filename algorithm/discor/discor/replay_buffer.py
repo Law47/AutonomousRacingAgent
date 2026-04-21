@@ -15,9 +15,10 @@ class NStepBuffer:
         self._nstep = nstep
         self.reset()
 
-    def append(self, state, action, reward):
+    def append(self, state, action, reward, shift_label):
         self._states.append(state)
         self._actions.append(action)
+        self._shift_labels.append(shift_label)
         self._rewards.append(reward)
 
     def get(self):
@@ -25,8 +26,9 @@ class NStepBuffer:
 
         state = self._states.popleft()
         action = self._actions.popleft()
+        shift_label = self._shift_labels.popleft()
         reward = self._nstep_reward()
-        return state, action, reward
+        return state, action, shift_label, reward
 
     def _nstep_reward(self):
         reward = np.sum([
@@ -37,6 +39,7 @@ class NStepBuffer:
     def reset(self):
         self._states = deque(maxlen=self._nstep)
         self._actions = deque(maxlen=self._nstep)
+        self._shift_labels = deque(maxlen=self._nstep)
         self._rewards = deque(maxlen=self._nstep)
 
     def is_empty(self):
@@ -50,16 +53,18 @@ class NStepBuffer:
 
 
 class ReplayBuffer:
-    def __init__(self, memory_size, state_shape, action_shape, gamma=0.99, nstep=1):
+    def __init__(self, memory_size, state_shape, action_shape, gamma=0.99, nstep=1, shift_shape=(2,)):
         assert isinstance(memory_size, int) and memory_size > 0
         assert isinstance(state_shape, tuple)
         assert isinstance(action_shape, tuple)
+        assert isinstance(shift_shape, tuple)
         assert isinstance(gamma, float) and 0 < gamma < 1.0
         assert isinstance(nstep, int) and nstep > 0
 
         self._memory_size = memory_size
         self._state_shape = state_shape
         self._action_shape = action_shape
+        self._shift_shape = shift_shape
         self._gamma = gamma
         self._nstep = nstep
         self._reset()
@@ -74,6 +79,8 @@ class ReplayBuffer:
             (self._memory_size, ) + self._state_shape, dtype=np.float32)
         self._actions = np.empty(
             (self._memory_size, ) + self._action_shape, dtype=np.float32)
+        self._shift_labels = np.empty(
+            (self._memory_size, ) + self._shift_shape, dtype=np.float32)
 
         self._rewards = np.empty((self._memory_size, 1), dtype=np.float32)
         self._dones = np.empty((self._memory_size, 1), dtype=np.float32)
@@ -82,28 +89,34 @@ class ReplayBuffer:
             self._nstep_buffer = NStepBuffer(self._gamma, self._nstep)
         logger.info(f"Replay buffer initialized for {self._memory_size} samples")
 
-    def append(self, state, action, reward, next_state, terminated, episode_done=None):
+    def append(self, state, action, reward, next_state, terminated, episode_done=None, shift_label=None):
         """
         done (masked_done): False if the agent reach time horizons. Else = done
         """
+        if shift_label is None:
+            shift_label = np.zeros(self._shift_shape, dtype=np.float32)
+        else:
+            shift_label = np.asarray(shift_label, dtype=np.float32).reshape(self._shift_shape)
+
         if self._nstep != 1:
-            self._nstep_buffer.append(state, action, reward)
+            self._nstep_buffer.append(state, action, reward, shift_label)
 
             if self._nstep_buffer.is_full():
-                state, action, reward = self._nstep_buffer.get()
-                self._append(state, action, reward, next_state, terminated)
+                state, action, shift_label, reward = self._nstep_buffer.get()
+                self._append(state, action, shift_label, reward, next_state, terminated)
 
             if terminated or episode_done:
                 while not self._nstep_buffer.is_empty():
-                    state, action, reward = self._nstep_buffer.get()
-                    self._append(state, action, reward, next_state, terminated)
+                    state, action, shift_label, reward = self._nstep_buffer.get()
+                    self._append(state, action, shift_label, reward, next_state, terminated)
 
         else:
-            self._append(state, action, reward, next_state, terminated)
+            self._append(state, action, shift_label, reward, next_state, terminated)
 
-    def _append(self, state, action, reward, next_state, done):
+    def _append(self, state, action, shift_label, reward, next_state, done):
         self._states[self._p, ...] = state
         self._actions[self._p, ...] = action
+        self._shift_labels[self._p, ...] = shift_label
         self._rewards[self._p, ...] = reward
         self._next_states[self._p, ...] = next_state
         self._dones[self._p, ...] = done
@@ -140,6 +153,8 @@ class ReplayBuffer:
             self._states[idxes], dtype=torch.float, device=device)
         actions = torch.tensor(
             self._actions[idxes], dtype=torch.float, device=device)
+        shift_labels = torch.tensor(
+            self._shift_labels[idxes], dtype=torch.float, device=device)
         rewards = torch.tensor(
             self._rewards[idxes], dtype=torch.float, device=device)
         dones = torch.tensor(
@@ -147,7 +162,7 @@ class ReplayBuffer:
         next_states = torch.tensor(
             self._next_states[idxes], dtype=torch.float, device=device)
 
-        return states, actions, rewards, next_states, dones
+        return states, actions, shift_labels, rewards, next_states, dones
 
     def __len__(self):
         return self._n
@@ -157,12 +172,12 @@ class EnsembleBuffer(ReplayBuffer):
     """
     Ensemble of an offline dataloader and an online replay buffer.
     """
-    def __init__(self, memory_size, state_shape, action_shape, offline_buffer_size, gamma=0.99, nstep=1):
+    def __init__(self, memory_size, state_shape, action_shape, offline_buffer_size, gamma=0.99, nstep=1, shift_shape=(2,)):
         # Initialize the offline buffer with the specified offline_buffer_size
-        self._offline = ReplayBuffer(offline_buffer_size, state_shape, action_shape, gamma, nstep)
+        self._offline = ReplayBuffer(offline_buffer_size, state_shape, action_shape, gamma, nstep, shift_shape)
 
         # Initialize the online buffer using the parent class constructor
-        super().__init__(memory_size, state_shape, action_shape, gamma, nstep)
+        super().__init__(memory_size, state_shape, action_shape, gamma, nstep, shift_shape)
         self._online = False
 
     def online(self, enable):
@@ -171,30 +186,48 @@ class EnsembleBuffer(ReplayBuffer):
         if enable:
             logger.info("Switching to Online buffer.")
 
-    def append(self, state, action, reward, next_state, terminated, episode_done=None):
+    def append(self, state, action, reward, next_state, terminated, episode_done=None, shift_label=None):
         if self._online:
-            super().append(state, action, reward, next_state, terminated, episode_done)
+            super().append(state, action, reward, next_state, terminated, episode_done, shift_label)
         else:
-            self._offline.append(state, action, reward, next_state, terminated, episode_done)
+            self._offline.append(state, action, reward, next_state, terminated, episode_done, shift_label)
 
     def __len__(self):
         offline_len = len(self._offline)
         online_len = super().__len__()
         return offline_len + online_len
 
-    def sample(self, batch_size, device=torch.device('cpu')):
+    @property
+    def online_size(self):
+        return super().__len__()
+
+    @property
+    def offline_size(self):
+        return len(self._offline)
+
+    def sample(self, batch_size, device=torch.device('cpu'), offline_ratio=0.5):
         """Sample a batch of data from the two buffers."""
-        obs0, action0, reward0, next_states0, dones0 = self._offline.sample(batch_size // 2, device)
-        obs1, action1, reward1, next_states1, dones1 = (super() if self._online else self._offline).sample(batch_size // 2, device)
+        offline_ratio = float(np.clip(offline_ratio, 0.0, 1.0))
 
-        # Concatenate samples from both buffers
-        states = torch.cat([obs0, obs1], dim=0)
-        actions = torch.cat([action0, action1], dim=0)
-        rewards = torch.cat([reward0, reward1], dim=0)
-        next_states = torch.cat([next_states0, next_states1], dim=0)
-        dones = torch.cat([dones0, dones1], dim=0)
+        if not self._online or self.online_size == 0:
+            return self._offline.sample(batch_size, device)
+        if self.offline_size == 0 or offline_ratio <= 0.0:
+            return super().sample(batch_size, device)
 
-        return states, actions, rewards, next_states, dones
+        offline_count = int(round(batch_size * offline_ratio))
+        offline_count = max(0, min(batch_size, offline_count))
+        online_count = batch_size - offline_count
+
+        if online_count == 0:
+            return self._offline.sample(batch_size, device)
+        if offline_count == 0:
+            return super().sample(batch_size, device)
+
+        offline_batch = self._offline.sample(offline_count, device)
+        online_batch = super().sample(online_count, device)
+
+        return tuple(torch.cat([offline_tensor, online_tensor], dim=0)
+                     for offline_tensor, online_tensor in zip(offline_batch, online_batch))
 
     def iter_batches(self, batch_size, device=torch.device('cpu'), num_samples=None, shuffle=True):
         if len(self._offline) > 0:

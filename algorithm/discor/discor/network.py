@@ -42,9 +42,9 @@ class BaseNetwork(nn.Module):
         except RuntimeError as exc:
             raise ValueError(
                 "Model checkpoint is incompatible with the current network shape. "
-                "This project now uses 5 actions "
-                "[steer, throttle, brake, shift_up_signal, shift_down_signal], "
-                "so old 3-action checkpoints must not be resumed; start a fresh run instead."
+                "This project now uses 3 continuous control actions and a separate "
+                "2-label Bernoulli shift model, so old checkpoints from the 5-action "
+                "policy shape must not be resumed; start a fresh run instead."
             ) from exc
 
 
@@ -112,3 +112,36 @@ class GaussianPolicy(BaseNetwork):
         entropies = -log_probs.sum(dim=1, keepdim=True)
 
         return actions, entropies, torch.tanh(means)
+
+
+class BernoulliShiftPolicy(BaseNetwork):
+    def __init__(self, state_dim, hidden_units=[256, 256], shift_dim=2):
+        super().__init__()
+
+        self.net = create_linear_network(
+            input_dim=state_dim,
+            output_dim=shift_dim,
+            hidden_units=hidden_units)
+
+    def forward(self, states):
+        assert states.dim() == 2
+
+        logits = self.net(states)
+        probs = torch.sigmoid(logits)
+        return logits, probs
+
+    def sample(self, states, threshold=0.5):
+        logits, probs = self.forward(states)
+        samples = torch.bernoulli(probs)
+        simultaneous = (samples[:, :1] > 0.5) & (samples[:, 1:2] > 0.5)
+        if simultaneous.any():
+            samples = torch.where(simultaneous.repeat(1, samples.shape[1]), torch.zeros_like(samples), samples)
+        deterministic = (probs >= threshold).float()
+        simultaneous_det = (deterministic[:, :1] > 0.5) & (deterministic[:, 1:2] > 0.5)
+        if simultaneous_det.any():
+            deterministic = torch.where(
+                simultaneous_det.repeat(1, deterministic.shape[1]),
+                torch.zeros_like(deterministic),
+                deterministic,
+            )
+        return samples, probs, deterministic

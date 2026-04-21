@@ -4,16 +4,31 @@ seed: 0
 Agent:
   num_steps: 8_000_000
   batch_size: 128
-  memory_size: 8_000_000
-  offline_buffer_size: 12_000_000
-  use_offline_buffer: False
+  memory_size: 10_000_000
+  offline_buffer_size: 10_000_000
+  use_offline_buffer: True
   update_interval: 1
   start_steps: 2000
+  start_steps_count: "online_steps"
   log_interval: 10
   eval_interval: 0
   num_eval_episodes: 1
   checkpoint_freq: 200_000
   save_final_buffer: True
+
+OfflineSampling:
+  enabled: True
+  initial_offline_ratio: 0.5
+  final_offline_ratio: 0.0
+  transition_steps: 3_000_000
+
+ShiftCurriculum:
+  enabled: True
+  auto_only_steps: 2000
+  initial_auto_probability: 0.75
+  final_auto_probability: 0.0
+  transition_steps: 500_000
+  eval_use_manual: True
 
 SAC:
   gamma: 0.992
@@ -21,14 +36,23 @@ SAC:
   policy_lr: 0.0003
   q_lr: 0.0003
   entropy_lr: 0.0003
+  target_entropy: -3.0
   policy_hidden_units: [256, 256, 256]
   q_hidden_units: [256, 256, 256]
   target_update_coef: 0.005
   log_interval: 10
 
-Demonstrations:
+ShiftModel:
   enabled: True
-  data_path: "C:\\Users\\Leo\\Documents\\Github\\AutonomousRacingAgent\\demonstrations\\session_01"
+  lr: 0.0003
+  hidden_units: [256, 256, 256]
+  loss_weight: 1.0
+  pos_weight: [10.0, 10.0]
+  threshold: 0.5
+
+Demonstrations:
+  enabled: False
+  data_path: null
   data_paths: []
   pretrain_epochs: 5
   log_steer_ratios: False
@@ -70,12 +94,25 @@ AssettoCorsa:
     cooldown_s: 0.0
     prevent_reverse_downshift: True
 
+  AutoShift:
+    enabled: True
+    mode: "normal"
+    gear_index_offset: 0
+    max_rpm: 0.0
+    idle_rpm_fallback: 1000.0
+    max_shift_rpm_ratio: 0.95
+    rpm_range_divisor: 3.0
+    min_shift_interval_s: 0.10
+    upshift_cooldown_s: 1.0
+    downshift_cooldown_s: 2.0
+    braking_downshift_cooldown_s: 1.0
+    up_after_downshift_cooldown_s: 1.0
+    min_downshift_to_first_speed_kmh: 15.0
+    downshift_to_first_aggression: 0.95
+    overdrive_downshift_gear: 4
+    slip_threshold: 1.0
+
   Rewards:
     use_reference_line_in_reward: True
     penalize_actions_diff: False
     penalize_actions_diff_coef: 0.1
-    neutral_reverse_gear_step_penalty: 0.001
-    enable_out_of_track_penalty: True
-    out_of_track_penalty_start: 0.075
-    out_of_track_penalty_end: 0.5
-    out_of_track_penalty_ramp_steps: 3_000_000

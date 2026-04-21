@@ -56,11 +56,17 @@ class DisCor(SAC):
 
     def update_online_networks(self, batch, writer):
         self._learning_steps += 1
-        self.update_policy_and_entropy(batch, writer)
+        stats = self.update_policy_and_entropy(batch, writer)
         self.update_q_functions_and_error_models(batch, writer)
+        shift_stats = self.update_shift_model_from_batch(batch, writer)
+        if shift_stats:
+            if stats is None:
+                stats = {}
+            stats.update(shift_stats)
+        return stats
 
     def update_q_functions_and_error_models(self, batch, writer):
-        states, actions, rewards, next_states, dones = batch
+        states, actions, shift_labels, rewards, next_states, dones = self.unpack_batch(batch)
 
         # Calculate importance weights.
         imp_ws1, imp_ws2 = self.calc_importance_weights(next_states, dones)

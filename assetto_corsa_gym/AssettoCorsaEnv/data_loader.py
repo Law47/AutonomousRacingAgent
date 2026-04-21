@@ -51,19 +51,30 @@ class DataLoader():
     def get_actions_from_state(self, state):
         return self.get_absolute_actions_from_state(state)
 
-    def get_recorded_model_actions(self, state):
-        action_dim = getattr(self.env, "action_dim", 5)
-        action_keys = [f"actions_{i}" for i in range(action_dim)]
+    def get_recorded_control_actions(self, state):
+        control_dim = getattr(self.env, "control_action_dim", 3)
+        action_keys = [f"actions_{i}" for i in range(control_dim)]
         if all(key in state for key in action_keys):
             return np.array([state[key] for key in action_keys], dtype='float32')
 
-        legacy_action_keys = [f"actions_{i}" for i in range(min(3, action_dim))]
-        if all(key in state for key in legacy_action_keys):
-            actions = np.zeros(action_dim, dtype='float32')
-            actions[:len(legacy_action_keys)] = np.array([state[key] for key in legacy_action_keys], dtype='float32')
-            return actions
-
         return None
+
+    def get_recorded_shift_actions(self, state):
+        control_dim = getattr(self.env, "control_action_dim", 3)
+        shift_dim = getattr(self.env, "shift_action_dim", 2)
+        action_keys = [f"actions_{control_dim + i}" for i in range(shift_dim)]
+        if all(key in state for key in action_keys):
+            return np.array([state[key] for key in action_keys], dtype='float32')
+        return None
+
+    def get_recorded_model_actions(self, state):
+        controls = self.get_recorded_control_actions(state)
+        shift_actions = self.get_recorded_shift_actions(state)
+        if controls is None:
+            return None
+        if shift_actions is None:
+            shift_actions = np.zeros(getattr(self.env, "shift_action_dim", 2), dtype='float32')
+        return np.concatenate([controls, shift_actions]).astype('float32')
 
     def infer_shift_actions(self, current_state, previous_state):
         if previous_state is None:
@@ -93,16 +104,16 @@ class DataLoader():
         for index in range(1, len(trajectory)):
             previous_state = trajectory[index - 1]
             current_state = trajectory[index]
-            recorded_actions = self.get_recorded_model_actions(current_state)
-            if recorded_actions is None or recorded_actions.shape[0] < 5:
+            recorded_actions = self.get_recorded_shift_actions(current_state)
+            if recorded_actions is None or recorded_actions.shape[0] < 2:
                 continue
 
             stats["has_recorded_model_actions"] = True
             current_gear = int(current_state.get("actualGear", 0))
             previous_gear = int(previous_state.get("actualGear", current_gear))
             gear_delta = current_gear - previous_gear
-            shift_up_active = bool(recorded_actions[3] > threshold)
-            shift_down_active = bool(recorded_actions[4] > threshold)
+            shift_up_active = bool(recorded_actions[0] > threshold)
+            shift_down_active = bool(recorded_actions[1] > threshold)
 
             stats["shift_up_signals"] += int(shift_up_active)
             stats["shift_down_signals"] += int(shift_down_active)
@@ -119,7 +130,7 @@ class DataLoader():
                 stats["mismatches"] += 1
 
         if not stats["has_recorded_model_actions"]:
-            logger.info("No recorded 5-action shift signals found; shift actions will be inferred from gear deltas.")
+            logger.info("No recorded shift signals found; shift actions will be inferred from gear deltas.")
             return stats
 
         log_message = (
@@ -155,14 +166,18 @@ class DataLoader():
 
     def compose_model_actions(self, state, previous_state, current_abs_actions):
         controls_actions = self.env.inverse_preprocess_actions(self.prev_abs_actions, current_abs_actions)
+        return self.pad_model_actions(controls_actions)
 
-        recorded_model_actions = self.get_recorded_model_actions(state)
-        if recorded_model_actions is not None and recorded_model_actions.shape[0] >= 5:
-            shift_actions = recorded_model_actions[3:5]
+    def compose_transition_labels(self, state, previous_state, current_abs_actions):
+        controls_actions = self.compose_model_actions(state, previous_state, current_abs_actions)
+
+        recorded_shift_actions = self.get_recorded_shift_actions(state)
+        if recorded_shift_actions is not None:
+            shift_actions = recorded_shift_actions
         else:
             shift_actions = self.infer_shift_actions(state, previous_state)
 
-        return self.pad_model_actions(np.concatenate([controls_actions, shift_actions]))
+        return controls_actions, shift_actions.astype('float32')
 
     def compute_steer_ratio_statistics(self, trajectory):
         # trajectory is a list of dictionaries
@@ -203,12 +218,13 @@ class DataLoader():
         if self.current_step == 0:
             self.prev_abs_actions = current_abs_actions
 
-        actions = self.compose_model_actions(state, previous_state, current_abs_actions)
+        actions, shift_label = self.compose_transition_labels(state, previous_state, current_abs_actions)
         self.prev_abs_actions = current_abs_actions
 
         # abs values or relative
-        self.current_actions = self.pad_model_actions(current_abs_actions)
-        self.action = self.pad_model_actions(actions)
+        self.current_actions = current_abs_actions.astype('float32')
+        self.action = actions.astype('float32')
+        self.shift_label = shift_label.astype('float32')
 
         self.state = state
         # re build the observations and the reward using the current environment settings
@@ -232,6 +248,7 @@ class DataLoader():
 
         self.info = {"terminated": float(terminated),
                      "obs_extra": self.env.get_extra_observations(state),
+                     "shift_label": self.shift_label,
                      "TimeLimit.truncated": float(truncated)
                      }
         self.done = float(done)

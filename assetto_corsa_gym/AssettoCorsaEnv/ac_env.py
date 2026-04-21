@@ -16,6 +16,7 @@ from pathlib import Path
 from AssettoCorsaEnv.ac_client import Client
 from AssettoCorsaEnv.track import Track
 from AssettoCorsaEnv.reference_lap import ReferenceLap
+from AssettoCorsaEnv.autoshift import AutoShifter
 import AssettoCorsaEnv.sensors_ray_casting as sensors_ray_casting
 from AssettoCorsaEnv.sensors_ray_casting import MAX_RAY_LEN
 from AssettoCorsaEnv.gap import get_gap
@@ -44,9 +45,10 @@ TERMINAL_JUDGE_TIMEOUT = 10.       # If after this number of seconds still no pr
 
 TOP_SPEED_MS = 80.
 CONTROL_ACTION_DIM = 3
-MODEL_ACTION_DIM = 5
-SHIFT_UP_ACTION_INDEX = 3
-SHIFT_DOWN_ACTION_INDEX = 4
+SHIFT_ACTION_DIM = 2
+MODEL_ACTION_DIM = CONTROL_ACTION_DIM
+SHIFT_UP_ACTION_INDEX = 0
+SHIFT_DOWN_ACTION_INDEX = 1
 STREAMING_DEMO_FORMAT = "streaming_demo_v1"
 
 def get_date_timestemp():
@@ -297,6 +299,7 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         self.use_obs_extra = self.config.use_obs_extra
         reward_config = getattr(self.config, "Rewards", None)
         gear_shift_config = getattr(self.config, "GearShift", None)
+        auto_shift_config = getattr(self.config, "AutoShift", None)
         self.use_reference_line_in_reward = getattr(
             reward_config,
             "use_reference_line_in_reward",
@@ -314,41 +317,6 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         )
         self.enforce_mutually_exclusive_pedals = bool(
             getattr(self.config, "enforce_mutually_exclusive_pedals", True)
-        )
-        self.neutral_reverse_gear_step_penalty = getattr(
-            reward_config,
-            "neutral_reverse_gear_step_penalty",
-            getattr(
-                reward_config,
-                "neutral_reverse_gear_penalty",
-                getattr(self.config, "neutral_reverse_gear_penalty", 0.001),
-            ),
-        )
-        self.enable_out_of_track_penalty = getattr(
-            reward_config,
-            "enable_out_of_track_penalty",
-            getattr(self.config, "enable_out_of_track_penalty", False),
-        )
-        legacy_out_of_track_penalty = getattr(self.config, "out_of_track_penalty", 0.0)
-        self.out_of_track_penalty_start = getattr(
-            reward_config,
-            "out_of_track_penalty_start",
-            legacy_out_of_track_penalty,
-        )
-        self.out_of_track_penalty_end = getattr(
-            reward_config,
-            "out_of_track_penalty_end",
-            self.out_of_track_penalty_start,
-        )
-        self.out_of_track_penalty_ramp_steps = max(
-            int(
-                getattr(
-                    reward_config,
-                    "out_of_track_penalty_ramp_steps",
-                    0,
-                )
-            ),
-            0,
         )
         self.gear_shift_threshold = getattr(
             gear_shift_config,
@@ -372,6 +340,7 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
                 getattr(self.config, "prevent_reverse_downshift", True),
             )
         )
+        self.auto_shifter = AutoShifter(auto_shift_config, ctrl_rate=self.ctrl_rate)
 
         # from the config
         self.use_ac_out_of_track = self.config.use_ac_out_of_track
@@ -458,7 +427,8 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
 
         # actions space is always -1 to 1 for most algorithms
         self.control_action_dim = CONTROL_ACTION_DIM
-        self.action_dim = MODEL_ACTION_DIM
+        self.shift_action_dim = SHIFT_ACTION_DIM
+        self.action_dim = self.control_action_dim
         self.action_space = Box(
             low=np.full((self.action_dim,), -1.0, dtype=np.float32),
             high=np.full((self.action_dim,), 1.0, dtype=np.float32),
@@ -470,6 +440,11 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         )
         self.shift_up_count = 0
         self.shift_down_count = 0
+        self.raw_actions = np.zeros(self.control_action_dim, dtype=np.float32)
+        self.raw_shift_actions = np.zeros(self.shift_action_dim, dtype=np.float32)
+        self.shift_teacher_actions = np.zeros(self.shift_action_dim, dtype=np.float32)
+        self.shift_source = "manual"
+        self.last_auto_shift_info = {}
 
         state_dim = len( self.obs_enabled_channels )
         if self.enable_sensors:
@@ -505,7 +480,6 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             logger.info(f"recover_car_on_done: {self.recover_car_on_done}")
             logger.info(f"enable_out_of_track_termination: {self.enable_out_of_track_termination}")
             logger.info(f"enable_low_speed_termination: {self.enable_low_speed_termination}")
-            logger.info(f"enable_out_of_track_penalty: {self.enable_out_of_track_penalty}")
             logger.info(f"enable_task_id_in_obs: {self.config.enable_task_id_in_obs}")
             logger.info(f"track: {self.config.track}")
             logger.info(f"car: {self.config.car}")
@@ -550,21 +524,41 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         if self.torch_device:
             self.racing_line_torch = torch.tensor(self.racing_line, device=self.torch_device, dtype=torch.float)
 
-    def _as_model_action(self, actions):
+    def _as_control_action(self, actions):
         actions = np.asarray(actions, dtype=np.float32).reshape(-1)
-        if actions.shape[0] != self.action_dim:
+        if actions.shape[0] < self.control_action_dim:
             raise ValueError(
-                f"Expected {self.action_dim} model actions "
-                f"[steer, throttle, brake, shift_up_signal, shift_down_signal], got {actions.shape[0]}"
+                f"Expected at least {self.control_action_dim} control actions "
+                f"[steer, throttle, brake], got {actions.shape[0]}"
             )
-        return np.clip(actions, -1.0, 1.0)
+        return np.clip(actions[:self.control_action_dim], -1.0, 1.0)
 
-    def decode_shift_actions(self, actions):
+    def _as_shift_action(self, shift_action):
+        if shift_action is None:
+            return np.zeros(self.shift_action_dim, dtype=np.float32)
+        shift_action = np.asarray(shift_action, dtype=np.float32).reshape(-1)
+        if shift_action.shape[0] != self.shift_action_dim:
+            raise ValueError(
+                f"Expected {self.shift_action_dim} shift actions "
+                f"[shift_up, shift_down], got {shift_action.shape[0]}"
+            )
+        return np.clip(shift_action, 0.0, 1.0)
+
+    def decode_shift_actions(self, shift_action):
+        shift_action = self._as_shift_action(shift_action)
         shift_up, shift_down = self.shift_gate.update(
-            float(actions[SHIFT_UP_ACTION_INDEX]),
-            float(actions[SHIFT_DOWN_ACTION_INDEX]),
+            float(shift_action[SHIFT_UP_ACTION_INDEX]),
+            float(shift_action[SHIFT_DOWN_ACTION_INDEX]),
         )
         return self._filter_shift_actions(shift_up, shift_down)
+
+    def get_auto_shift_action(self, state=None):
+        state = state if state is not None else getattr(self.client, "state", None)
+        if state is None:
+            state = getattr(self, "state", {})
+        shift_action, shift_info = self.auto_shifter.update(state, self.dt)
+        self.last_auto_shift_info = shift_info
+        return shift_action
 
     def _get_current_gear(self):
         if hasattr(self.client, "state"):
@@ -620,12 +614,18 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
 
         return actions
 
-    def set_actions(self, actions):
+    def set_actions(self, actions, shift_action=None, shift_teacher=None, shift_source="manual"):
         """
         Apply the actions to the sim right away. The step function can be called later
         """
-        model_actions = self._as_model_action(actions)
-        shift_up, shift_down = self.decode_shift_actions(model_actions)
+        raw_actions = np.asarray(actions, dtype=np.float32).reshape(-1)
+        control_actions = self._as_control_action(raw_actions)
+        if shift_action is None and raw_actions.shape[0] >= self.control_action_dim + self.shift_action_dim:
+            shift_action = raw_actions[self.control_action_dim:self.control_action_dim + self.shift_action_dim]
+        raw_shift_actions = self._as_shift_action(shift_action)
+        shift_teacher_actions = self._as_shift_action(shift_teacher if shift_teacher is not None else raw_shift_actions)
+
+        shift_up, shift_down = self.decode_shift_actions(raw_shift_actions)
         if shift_up:
             self.shift_up_count += 1
         if shift_down:
@@ -636,15 +636,18 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
                 int(shift_up),
                 int(shift_down),
                 self._get_current_gear(),
-                float(model_actions[SHIFT_UP_ACTION_INDEX]),
-                float(model_actions[SHIFT_DOWN_ACTION_INDEX]),
+                float(raw_shift_actions[SHIFT_UP_ACTION_INDEX]),
+                float(raw_shift_actions[SHIFT_DOWN_ACTION_INDEX]),
             )
 
         # get state from the sim
-        self.raw_actions = model_actions.copy()
+        self.raw_actions = control_actions.copy()
+        self.raw_shift_actions = raw_shift_actions.copy()
+        self.shift_teacher_actions = shift_teacher_actions.copy()
+        self.shift_source = str(shift_source)
 
         # actions are deltas, update current controls
-        self.current_actions = self.preprocess_actions(model_actions, self.current_actions)
+        self.current_actions = self.preprocess_actions(control_actions, self.current_actions)
         self.actions = self.current_actions
 
         self.client.controls.set_controls(
@@ -679,10 +682,15 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             self.state[f'current_action_abs_{i:01d}'] = self.current_actions[i]
 
         # save input actions
-        for i in range(self.action_dim):
+        for i in range(self.control_action_dim):
             self.state[f'actions_{i:01d}'] = self.raw_actions[i]
+        for i in range(self.shift_action_dim):
+            self.state[f'actions_{self.control_action_dim + i:01d}'] = self.raw_shift_actions[i]
+            self.state[f'shift_teacher_{i:01d}'] = self.shift_teacher_actions[i]
         self.state['shift_up'] = bool(self.client.controls["shift_up"])
         self.state['shift_down'] = bool(self.client.controls["shift_down"])
+        self.state['shift_source'] = self.shift_source
+        self.state.update(self.last_auto_shift_info)
 
         # create obs
         obs, actions_diff = self.get_obs(state, self.states)
@@ -697,8 +705,8 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             logger.debug(f't: {self.ep_steps} speed: {state["speed"]:.2f}, oot: {state["out_of_track"]} '
                          f's: {self.actions[0]:.2f} a: {self.actions[1]:.2f} b: {self.actions[2]:.2f} '
                          f'gear: {current_gear:d} '
-                         f'sig_up: {self.raw_actions[SHIFT_UP_ACTION_INDEX]:.2f} '
-                         f'sig_down: {self.raw_actions[SHIFT_DOWN_ACTION_INDEX]:.2f} '
+                         f'sig_up: {self.raw_shift_actions[SHIFT_UP_ACTION_INDEX]:.2f} '
+                         f'sig_down: {self.raw_shift_actions[SHIFT_DOWN_ACTION_INDEX]:.2f} '
                          f'su: {int(self.state["shift_up"])} sd: {int(self.state["shift_down"])} '
                          f'reward: {state["reward"]:.3f} '
                          f'done: {state["done"]:.0f} LapDist: {state["LapDist"]:.0f} gap: {state["gap"]:.1f} '
@@ -833,7 +841,6 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
 
     def get_reward(self, state, actions_diff):
         speed = 3.6 * np.array(state['speed'])
-        dist_to_border = state["dist_to_border"]
 
         r = speed
         if self.use_reference_line_in_reward:
@@ -843,40 +850,8 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         if self.penalize_actions_diff:
             action_difference_penalty = np.linalg.norm(actions_diff, ord=2)
             r -= action_difference_penalty * self.penalize_actions_diff_coef
-        r += self.get_gear_shift_reward(state)
-        r += self.get_out_of_track_penalty(state)
         r = r.reshape(-1)  # [N, 1] -> [N]
         return r
-
-    def get_gear_shift_reward(self, state):
-        gear = int(state.get("actualGear", 0))
-
-        reward = 0.0
-        if gear <= 0:
-            reward -= self.neutral_reverse_gear_step_penalty
-
-        state["gear_shift_reward"] = reward
-        state["neutral_reverse_gear_penalty"] = reward
-        return reward
-
-    def get_current_out_of_track_penalty(self):
-        if self.out_of_track_penalty_ramp_steps <= 0:
-            return float(self.out_of_track_penalty_end)
-
-        progress = min(max(self.total_steps, 0) / self.out_of_track_penalty_ramp_steps, 1.0)
-        penalty = self.out_of_track_penalty_start + (
-            (self.out_of_track_penalty_end - self.out_of_track_penalty_start) * progress
-        )
-        return float(penalty)
-
-    def get_out_of_track_penalty(self, state):
-        penalty = 0.0
-        is_out_of_track = bool(state.get("out_of_track", state.get("out_of_track_calc", 0.0)))
-        if self.enable_out_of_track_penalty and is_out_of_track:
-            penalty -= self.get_current_out_of_track_penalty()
-
-        state["out_of_track_penalty"] = penalty
-        return penalty
 
     def recover_car(self):
         logger.info("Recover car")
@@ -920,13 +895,20 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             assert self.static_info["CarName"] == self.car_name, f"Track name mismatch. Running: {self.static_info['CarName']} Configured: {self.car_name}"
 
         self.client.reset(self.send_reset_at_start)
+        self.auto_shifter.configure_static_info(self.static_info)
 
         self.termination_counter = int(TERMINAL_JUDGE_TIMEOUT * self.ctrl_rate)
         self.episode_saved = False
         self.is_out_of_track = False
         self.current_actions = np.array( [0.0, -1.0, -1.0] )
-        self.start_actions = np.array( [0.0, -1.0, -1.0, 0.0, 0.0] )
+        self.start_actions = np.array( [0.0, -1.0, -1.0] )
+        self.raw_actions = self.start_actions.astype(np.float32).copy()
+        self.raw_shift_actions = np.zeros(self.shift_action_dim, dtype=np.float32)
+        self.shift_teacher_actions = np.zeros(self.shift_action_dim, dtype=np.float32)
+        self.shift_source = "reset"
+        self.last_auto_shift_info = {}
         self.shift_gate.reset()
+        self.auto_shifter.reset()
 
         self.ep_steps = 0  # reset steps after flushing the actions
 
@@ -1100,8 +1082,8 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
                   "shift_down_count": int(ep.shift_down.sum()) if "shift_down" in ep else 0,
                   "shift_up_signal_max": ep.actions_3.max() if "actions_3" in ep else 0.0,
                   "shift_down_signal_max": ep.actions_4.max() if "actions_4" in ep else 0.0,
-                  "gear_shift_reward_sum": ep.gear_shift_reward.sum() if "gear_shift_reward" in ep else 0.0,
-                  "out_of_track_penalty_sum": ep.out_of_track_penalty.sum() if "out_of_track_penalty" in ep else 0.0,
+                  "auto_shift_steps": int((ep.shift_source == "auto").sum()) if "shift_source" in ep else 0,
+                  "manual_shift_steps": int((ep.shift_source == "manual").sum()) if "shift_source" in ep else 0,
                   #"completedLaps": ep.completedLaps.values[-1],
                   "BestLap": ep['BestLap'].values[-1] / 1000.,
                   "terminated": ep.terminated.values[-1]
@@ -1121,8 +1103,8 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
                     f"shift_up_count: {r['shift_up_count']} shift_down_count: {r['shift_down_count']} "
                     f"shift_up_signal_max: {r['shift_up_signal_max']:.3f} "
                     f"shift_down_signal_max: {r['shift_down_signal_max']:.3f} "
-                    f"gear_shift_reward_sum: {r['gear_shift_reward_sum']:.3f} "
-                    f"out_of_track_penalty_sum: {r['out_of_track_penalty_sum']:.3f}"
+                    f"auto_shift_steps: {r['auto_shift_steps']} "
+                    f"manual_shift_steps: {r['manual_shift_steps']}"
                 )
                 if len(ep) > 10:
                     dt = np.diff( ep.currentTime.values )[1:]
