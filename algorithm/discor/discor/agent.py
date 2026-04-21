@@ -17,6 +17,8 @@ logger.setLevel(logging.INFO)
 
 import time
 
+TRAINING_STATE_FILENAME = 'training_state.pkl'
+
 
 def cfg_get(config, key, default):
     if config is None:
@@ -129,6 +131,78 @@ class Agent:
         logger.info(f'nstep: {self._algo.nstep}')
         logger.info(f'memory_size: {memory_size}')
 
+    def _training_state(self):
+        return {
+            'version': 1,
+            'steps': int(self._steps),
+            'episodes': int(self._episodes),
+            'demo_transition_count': int(self._demo_transition_count),
+            'best_lap_time': float(self.best_lap_time),
+            'best_reward': float(self.best_reward),
+            'best_eval_score': float(self._best_eval_score),
+        }
+
+    def _save_training_state(self, path):
+        os.makedirs(path, exist_ok=True)
+        state_path = os.path.join(path, TRAINING_STATE_FILENAME)
+        tmp_path = state_path + ".tmp"
+        try:
+            with open(tmp_path, 'wb') as f:
+                pickle.dump(self._training_state(), f, protocol=pickle.HIGHEST_PROTOCOL)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, state_path)
+            logger.info("saved training state to %s", state_path)
+        except Exception:
+            logger.exception("Failed to save training state to %s", state_path)
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                logger.exception("Failed to remove temp training state at %s", tmp_path)
+
+    def _load_training_state(self, path):
+        state_path = os.path.join(path, TRAINING_STATE_FILENAME)
+        if not os.path.exists(state_path):
+            return False
+
+        try:
+            with open(state_path, 'rb') as f:
+                state = pickle.load(f)
+        except (pickle.UnpicklingError, EOFError) as exc:
+            logger.warning(
+                "Unable to load training state from %s (%s). "
+                "Falling back to replay-buffer-derived counters.",
+                state_path,
+                exc,
+            )
+            return False
+
+        if not isinstance(state, Mapping):
+            logger.warning(
+                "Training state at %s was %s, expected mapping. "
+                "Falling back to replay-buffer-derived counters.",
+                state_path,
+                type(state).__name__,
+            )
+            return False
+
+        self._steps = int(state.get('steps', self._steps))
+        self._episodes = int(state.get('episodes', self._episodes))
+        self._demo_transition_count = int(
+            state.get('demo_transition_count', self._demo_transition_count)
+        )
+        self.best_lap_time = float(state.get('best_lap_time', self.best_lap_time))
+        self.best_reward = float(state.get('best_reward', self.best_reward))
+        self._best_eval_score = float(state.get('best_eval_score', self._best_eval_score))
+        logger.info(
+            "loaded training state from %s. steps=%s episodes=%s",
+            state_path,
+            self._steps,
+            self._episodes,
+        )
+        return True
+
     def save(self, path, save_buffer=True):
         self._algo.save_models(path)
         if save_buffer:
@@ -148,6 +222,7 @@ class Agent:
                         os.remove(tmp_path)
                 except Exception:
                     logger.exception("Failed to remove temp replay buffer at %s", tmp_path)
+        self._save_training_state(path)
         logger.info("saved models to {}".format(path))
 
     def load(self, path, load_buffer=True):
@@ -158,6 +233,7 @@ class Agent:
             raise
         logger.info(f"loaded model from {path}")
         if load_buffer:
+            loaded_buffer = False
             replay_buffer_path = os.path.join(path, 'replay_buffer.pkl')
             if os.path.exists(replay_buffer_path):
                 try:
@@ -178,10 +254,17 @@ class Agent:
                         "start a fresh run or load weights without the old buffer."
                     )
                 self._replay_buffer = loaded_replay_buffer
-                self._steps = self._replay_buffer._n
+                loaded_buffer = True
                 logger.info(f"loaded buffer from {path}. Number of steps: {len(self._replay_buffer)}")
             else:
                 logger.warning("replay_buffer.pkl not found in %s; continuing with model weights only", path)
+            loaded_training_state = self._load_training_state(path)
+            if not loaded_training_state and loaded_buffer:
+                self._steps = self._replay_buffer._n
+                logger.info(
+                    "No training state found; restored steps from replay buffer occupancy: %s",
+                    self._steps,
+                )
 
     def run(self):
         try:

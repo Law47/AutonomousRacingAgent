@@ -4,6 +4,7 @@ import pickle
 from pathlib import Path
 
 import numpy as np
+import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 ASSETTO_GYM = ROOT / "assetto_corsa_gym"
@@ -91,6 +92,7 @@ from AssettoCorsaEnv.ac_env import AssettoCorsaEnv, ShiftExecutionGate, STREAMIN
 from AssettoCorsaEnv.autoshift import AutoShifter
 from AssettoCorsaEnv.data_loader import DataLoader
 from AssettoCorsaPlugin.plugins.sensors_par import car_control
+from discor.agent import Agent, TRAINING_STATE_FILENAME
 from discor.replay_buffer import ReplayBuffer
 
 
@@ -107,6 +109,35 @@ class FakeClient:
 
     def respond_to_server(self):
         self.responded = True
+
+
+class DummySpace:
+    def __init__(self, shape):
+        self.shape = shape
+
+    def sample(self):
+        return np.zeros(self.shape, dtype=np.float32)
+
+
+class DummyAgentEnv:
+    observation_space = DummySpace((2,))
+    action_space = DummySpace((3,))
+
+    def seed(self, seed):
+        self.seed_value = seed
+
+
+class DummyAlgo:
+    gamma = 0.99
+    nstep = 1
+
+    def save_models(self, path):
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "model.marker").write_text("ok", encoding="utf-8")
+
+    def load_models(self, path):
+        assert (Path(path) / "model.marker").exists()
 
 
 def make_env_stub(cooldown_steps=0):
@@ -140,6 +171,21 @@ def make_env_stub(cooldown_steps=0):
     env.shift_teacher_actions = np.zeros(env.shift_action_dim, dtype=np.float32)
     env.shift_source = "manual"
     return env
+
+
+def append_agent_transition(buffer, index):
+    state = np.array([index, index + 0.1], dtype=np.float32)
+    action = np.array([index, -index, index + 0.5], dtype=np.float32)
+    shift_label = np.array([index % 2, (index + 1) % 2], dtype=np.float32)
+    next_state = state + 10.0
+    buffer.append(
+        state,
+        action,
+        float(index),
+        next_state,
+        bool(index % 2),
+        shift_label=shift_label,
+    )
 
 
 def test_shift_execution_below_threshold_emits_no_pulse():
@@ -321,6 +367,115 @@ def test_replay_buffer_iter_batches_visits_demo_dataset_once():
     assert batch_sizes == [2, 2, 1]
     np.testing.assert_allclose(visited_states, [0, 1, 2, 3, 4])
     np.testing.assert_allclose(visited_shift_up, [0, 1, 0, 1, 0])
+
+
+def test_agent_training_state_preserves_steps_beyond_buffer_occupancy(tmp_path):
+    src = Agent(
+        DummyAgentEnv(),
+        DummyAgentEnv(),
+        DummyAlgo(),
+        str(tmp_path / "src"),
+        torch.device("cpu"),
+        use_offline_buffer=True,
+        memory_size=8,
+        offline_buffer_size=8,
+        batch_size=2,
+        eval_interval=0,
+    )
+    dst = Agent(
+        DummyAgentEnv(),
+        DummyAgentEnv(),
+        DummyAlgo(),
+        str(tmp_path / "dst"),
+        torch.device("cpu"),
+        use_offline_buffer=True,
+        memory_size=8,
+        offline_buffer_size=8,
+        batch_size=2,
+        eval_interval=0,
+    )
+    try:
+        for index in range(3):
+            append_agent_transition(src._replay_buffer, index)
+        src._replay_buffer.online(True)
+        for index in range(3, 5):
+            append_agent_transition(src._replay_buffer, index)
+
+        src._steps = 12345
+        src._episodes = 67
+        src._demo_transition_count = 89
+        src.best_lap_time = 72.5
+        src.best_reward = 100.25
+        src._best_eval_score = 12.5
+
+        checkpoint_path = tmp_path / "checkpoint"
+        src.save(str(checkpoint_path), save_buffer=True)
+        dst.load(str(checkpoint_path), load_buffer=True)
+
+        assert dst._steps == 12345
+        assert dst._episodes == 67
+        assert dst._demo_transition_count == 89
+        assert dst.best_lap_time == 72.5
+        assert dst.best_reward == 100.25
+        assert dst._best_eval_score == 12.5
+        assert dst._replay_buffer.offline_size == 3
+        assert dst._replay_buffer.online_size == 2
+        np.testing.assert_allclose(
+            dst._replay_buffer._shift_labels[:2],
+            src._replay_buffer._shift_labels[:2],
+        )
+        np.testing.assert_allclose(
+            dst._replay_buffer._offline._shift_labels[:3],
+            src._replay_buffer._offline._shift_labels[:3],
+        )
+    finally:
+        src._writer.close()
+        dst._writer.close()
+
+
+def test_agent_training_state_saved_when_checkpoint_skips_replay_buffer(tmp_path):
+    src = Agent(
+        DummyAgentEnv(),
+        DummyAgentEnv(),
+        DummyAlgo(),
+        str(tmp_path / "src"),
+        torch.device("cpu"),
+        use_offline_buffer=True,
+        memory_size=8,
+        offline_buffer_size=8,
+        batch_size=2,
+        eval_interval=0,
+    )
+    dst = Agent(
+        DummyAgentEnv(),
+        DummyAgentEnv(),
+        DummyAlgo(),
+        str(tmp_path / "dst"),
+        torch.device("cpu"),
+        use_offline_buffer=True,
+        memory_size=8,
+        offline_buffer_size=8,
+        batch_size=2,
+        eval_interval=0,
+    )
+    try:
+        src._steps = 2468
+        src._episodes = 24
+
+        checkpoint_path = tmp_path / "checkpoint_without_buffer"
+        src.save(str(checkpoint_path), save_buffer=False)
+
+        assert (checkpoint_path / TRAINING_STATE_FILENAME).exists()
+        assert not (checkpoint_path / "replay_buffer.pkl").exists()
+
+        dst.load(str(checkpoint_path), load_buffer=True)
+
+        assert dst._steps == 2468
+        assert dst._episodes == 24
+        assert len(dst._replay_buffer) == 0
+    finally:
+        src._writer.close()
+        dst._writer.close()
 
 
 def test_load_history_reads_streaming_demo_file_and_ignores_partial_tail(tmp_path):

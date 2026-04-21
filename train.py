@@ -209,7 +209,15 @@ def main() -> None:
         agent.load(load_path, load_buffer=(not args.test and not args.load_weights_only))
 
     if not args.test:
-        demo_result = maybe_load_demonstrations(agent, env, config)
+        if args.load_path:
+            logger.info(
+                "Skipping demonstration loading/pretraining because --load_path was provided; "
+                "resuming from checkpoint instead."
+            )
+            demo_result = {"loaded": False, "pretrained": False, "transitions": 0}
+        else:
+            demo_result = maybe_load_demonstrations(agent, env, config)
+
         if bool(getattr(config.Agent, "use_offline_buffer", False)):
             replay_buffer = getattr(agent, "_replay_buffer", None)
             if replay_buffer is not None and hasattr(replay_buffer, "online"):
