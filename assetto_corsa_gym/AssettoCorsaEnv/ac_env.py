@@ -706,9 +706,11 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         state['rl_point'] = rl_point.item()
         state['gap'] = gap[0]
 
-        if self.enable_out_of_track_calculation:
+        state['out_of_track_ac'] = 1.0 if state['numberOfTyresOut'] > 2. else 0.0
+        if self.enable_out_of_track_calculation and getattr(self.track, "track_occupancy_grid", None) is not None:
             state['out_of_track_calc'] = 0.0 if self.track.track_occupancy_grid.is_inside_grid(point).item() > 0. else 1.0
-            state['out_of_track_ac'] = 1.0 if state['numberOfTyresOut'] > 2. else 0.0
+        else:
+            state['out_of_track_calc'] = state['out_of_track_ac']
 
         if self.use_ac_out_of_track:
             # get oot from AC. If more than two wheels are out of track, then the car is out of track
@@ -1136,7 +1138,18 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         self.track_file = os.path.join(self.tracks_path, self.track_config["track_file"])
         self.ref_lap_file = os.path.join(self.tracks_path, self.track_config["ref_lap_file"])
         self.track_grid_file = os.path.join(self.tracks_path, self.track_config["track_grid_file"])
-        self.track_grid_file = self.resolve_track_asset(self.track_grid_file)
+        try:
+            self.track_grid_file = self.resolve_track_asset(self.track_grid_file)
+        except FileNotFoundError:
+            if not self.use_ac_out_of_track:
+                raise
+            logger.warning(
+                "Track grid asset missing for %s. Continuing without calculated "
+                "out-of-track because use_ac_out_of_track=True.",
+                track_name,
+            )
+            self.track_grid_file = None
+            self.enable_out_of_track_calculation = False
 
     def resolve_track_asset(self, asset_path):
         if os.path.exists(asset_path):
