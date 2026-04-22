@@ -162,6 +162,7 @@ def make_env_stub(cooldown_steps=0):
     env.shift_down_count = 0
     env.enforce_mutually_exclusive_pedals = True
     env.prevent_reverse_downshift = True
+    env.auto_shifter = type("AutoShiftStub", (), {"gear_index_offset": 0})()
     env.use_reference_line_in_reward = False
     env.penalize_actions_diff = False
     env.total_steps = 0
@@ -256,6 +257,20 @@ def test_env_set_actions_forwards_decoded_shift_pulse():
 def test_env_set_actions_blocks_downshift_into_reverse():
     env = make_env_stub()
     env.client.state["actualGear"] = 1
+
+    env.set_actions(
+        np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        shift_action=np.array([0.0, 1.0], dtype=np.float32),
+    )
+
+    assert env.client.controls["shift_up"] is False
+    assert env.client.controls["shift_down"] is False
+
+
+def test_env_set_actions_blocks_downshift_into_neutral_with_gear_offset():
+    env = make_env_stub()
+    env.auto_shifter.gear_index_offset = 1
+    env.client.state["actualGear"] = 2
 
     env.set_actions(
         np.array([0.0, 0.0, 0.0], dtype=np.float32),
@@ -518,6 +533,105 @@ def test_autoshifter_upshifts_from_high_rpm_with_throttle():
 
     np.testing.assert_allclose(action, [1.0, 0.0])
     assert info["auto_aggressiveness"] > 0.0
+
+
+def test_autoshifter_recovers_neutral_to_first_at_idle():
+    shifter = AutoShifter({"max_rpm": 8000.0, "idle_rpm": 1000.0}, ctrl_rate=25)
+
+    action, info = shifter.update(
+        {"actualGear": 0, "accStatus": 0.0, "brakeStatus": 0.0, "RPM": 1000.0, "speed": 0.0},
+        dt=0.04,
+    )
+
+    np.testing.assert_allclose(action, [1.0, 0.0])
+    assert info["auto_gear"] == 0
+
+
+def test_autoshifter_holds_first_at_idle():
+    shifter = AutoShifter({"max_rpm": 8000.0, "idle_rpm": 1000.0}, ctrl_rate=25)
+
+    action, _ = shifter.update(
+        {"actualGear": 1, "accStatus": 0.0, "brakeStatus": 0.0, "RPM": 1000.0, "speed": 0.0},
+        dt=0.04,
+    )
+
+    np.testing.assert_allclose(action, [0.0, 0.0])
+
+
+def test_autoshifter_uses_gear_offset_for_neutral_and_first():
+    neutral_shifter = AutoShifter(
+        {"max_rpm": 8000.0, "idle_rpm": 1000.0, "gear_index_offset": 1},
+        ctrl_rate=25,
+    )
+
+    action, info = neutral_shifter.update(
+        {"actualGear": 1, "accStatus": 0.0, "brakeStatus": 0.0, "RPM": 1000.0, "speed": 0.0},
+        dt=0.04,
+    )
+    np.testing.assert_allclose(action, [1.0, 0.0])
+    assert info["auto_gear"] == 0
+
+    first_shifter = AutoShifter(
+        {"max_rpm": 8000.0, "idle_rpm": 1000.0, "gear_index_offset": 1},
+        ctrl_rate=25,
+    )
+
+    action, info = first_shifter.update(
+        {"actualGear": 2, "accStatus": 0.0, "brakeStatus": 0.0, "RPM": 1000.0, "speed": 0.0},
+        dt=0.04,
+    )
+    np.testing.assert_allclose(action, [0.0, 0.0])
+    assert info["auto_gear"] == 1
+
+
+def test_autoshifter_config_can_wait_for_high_upshift_rpm():
+    shifter = AutoShifter(
+        {
+            "max_rpm": 8000.0,
+            "idle_rpm": 1000.0,
+            "mode": "sport",
+            "max_shift_rpm_ratio": 0.99,
+            "rpm_range_divisor": 1.5,
+        },
+        ctrl_rate=25,
+    )
+
+    action, _ = shifter.update(
+        {"actualGear": 3, "accStatus": 1.0, "brakeStatus": 0.0, "RPM": 7800.0, "speed": 40.0},
+        dt=0.04,
+    )
+    np.testing.assert_allclose(action, [0.0, 0.0])
+
+    action, _ = shifter.update(
+        {"actualGear": 3, "accStatus": 1.0, "brakeStatus": 0.0, "RPM": 7950.0, "speed": 40.0},
+        dt=0.04,
+    )
+    np.testing.assert_allclose(action, [1.0, 0.0])
+
+
+def test_autoshifter_config_waits_for_low_downshift_rpm():
+    shifter = AutoShifter(
+        {
+            "max_rpm": 8000.0,
+            "idle_rpm": 1000.0,
+            "mode": "sport",
+            "max_shift_rpm_ratio": 0.99,
+            "rpm_range_divisor": 1.5,
+        },
+        ctrl_rate=25,
+    )
+
+    action, _ = shifter.update(
+        {"actualGear": 4, "accStatus": 0.0, "brakeStatus": 0.0, "RPM": 2500.0, "speed": 20.0},
+        dt=0.04,
+    )
+    np.testing.assert_allclose(action, [0.0, 0.0])
+
+    action, _ = shifter.update(
+        {"actualGear": 4, "accStatus": 0.0, "brakeStatus": 0.0, "RPM": 1200.0, "speed": 20.0},
+        dt=0.04,
+    )
+    np.testing.assert_allclose(action, [0.0, 1.0])
 
 
 def test_vigem_backend_maps_shift_up_to_a_and_shift_down_to_x(monkeypatch):

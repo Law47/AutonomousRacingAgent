@@ -547,7 +547,8 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             return shift_up, shift_down
 
         current_gear = self._get_current_gear()
-        if current_gear <= 1:
+        gear_index_offset = getattr(getattr(self, "auto_shifter", None), "gear_index_offset", 0)
+        if current_gear - gear_index_offset <= 1:
             return shift_up, False
 
         return shift_up, shift_down

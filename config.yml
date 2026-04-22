@@ -95,12 +95,12 @@ AssettoCorsa:
 
   AutoShift:
     enabled: True
-    mode: "normal"
-    gear_index_offset: 0
+    mode: "sport"
+    gear_index_offset: 1
     max_rpm: 0.0
     idle_rpm_fallback: 1000.0
-    max_shift_rpm_ratio: 0.95
-    rpm_range_divisor: 3.0
+    max_shift_rpm_ratio: 0.99
+    rpm_range_divisor: 1.5
     min_shift_interval_s: 0.10
     upshift_cooldown_s: 1.0
     downshift_cooldown_s: 2.0

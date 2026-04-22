@@ -162,9 +162,11 @@ class AutoShifter:
             else self.downshift_cooldown_s
         )
 
+        if telemetry["gear"] < 1:
+            return True, False
+
         if (
             self.elapsed_time < self.last_shift_time + self.min_shift_interval_s
-            or telemetry["gear"] < 1
             or self.elapsed_time < self.last_shift_up_time + self.upshift_cooldown_s
             or self.elapsed_time < self.last_shift_down_time + downshift_cooldown
         ):
