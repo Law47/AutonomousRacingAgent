@@ -16,7 +16,6 @@ from pathlib import Path
 from AssettoCorsaEnv.ac_client import Client
 from AssettoCorsaEnv.track import Track
 from AssettoCorsaEnv.reference_lap import ReferenceLap
-from AssettoCorsaEnv.autoshift import AutoShifter
 import AssettoCorsaEnv.sensors_ray_casting as sensors_ray_casting
 from AssettoCorsaEnv.sensors_ray_casting import MAX_RAY_LEN
 from AssettoCorsaEnv.gap import get_gap
@@ -282,7 +281,6 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         self.use_obs_extra = self.config.use_obs_extra
         reward_config = getattr(self.config, "Rewards", None)
         shift_execution_config = getattr(self.config, "ShiftExecution", None)
-        auto_shift_config = getattr(self.config, "AutoShift", None)
         self.use_reference_line_in_reward = getattr(
             reward_config,
             "use_reference_line_in_reward",
@@ -318,8 +316,6 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
                 getattr(self.config, "prevent_reverse_downshift", True),
             )
         )
-        self.auto_shifter = AutoShifter(auto_shift_config, ctrl_rate=self.ctrl_rate)
-
         # from the config
         self.use_ac_out_of_track = self.config.use_ac_out_of_track
 
@@ -421,7 +417,6 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         self.raw_shift_actions = np.zeros(self.shift_action_dim, dtype=np.float32)
         self.shift_teacher_actions = np.zeros(self.shift_action_dim, dtype=np.float32)
         self.shift_source = "manual"
-        self.last_auto_shift_info = {}
 
         state_dim = len( self.obs_enabled_channels )
         if self.enable_sensors:
@@ -521,34 +516,29 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             )
         return np.clip(shift_action, 0.0, 1.0)
 
-    def decode_shift_actions(self, shift_action):
+    def decode_shift_actions(self, shift_action, shift_source="manual"):
         shift_action = self._as_shift_action(shift_action)
         shift_up, shift_down = self.shift_gate.update(
             float(shift_action[SHIFT_UP_ACTION_INDEX]),
             float(shift_action[SHIFT_DOWN_ACTION_INDEX]),
         )
-        return self._filter_shift_actions(shift_up, shift_down)
-
-    def get_auto_shift_action(self, state=None):
-        state = state if state is not None else getattr(self.client, "state", None)
-        if state is None:
-            state = getattr(self, "state", {})
-        shift_action, shift_info = self.auto_shifter.update(state, self.dt)
-        self.last_auto_shift_info = shift_info
-        return shift_action
+        return self._filter_shift_actions(shift_up, shift_down, shift_source=shift_source)
 
     def _get_current_gear(self):
         if hasattr(self.client, "state"):
             return int(self.client.state.get("actualGear", 0))
         return 0
 
-    def _filter_shift_actions(self, shift_up, shift_down):
+    def _filter_shift_actions(self, shift_up, shift_down, shift_source="manual"):
+        current_gear = self._get_current_gear()
+        model_controls_shift = str(shift_source) == "manual"
+        if model_controls_shift and current_gear <= 1:
+            return True, False
+
         if not shift_down or not self.prevent_reverse_downshift:
             return shift_up, shift_down
 
-        current_gear = self._get_current_gear()
-        gear_index_offset = getattr(getattr(self, "auto_shifter", None), "gear_index_offset", 0)
-        if current_gear - gear_index_offset <= 1:
+        if model_controls_shift and current_gear <= 2:
             return shift_up, False
 
         return shift_up, shift_down
@@ -603,7 +593,7 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         raw_shift_actions = self._as_shift_action(shift_action)
         shift_teacher_actions = self._as_shift_action(shift_teacher if shift_teacher is not None else raw_shift_actions)
 
-        shift_up, shift_down = self.decode_shift_actions(raw_shift_actions)
+        shift_up, shift_down = self.decode_shift_actions(raw_shift_actions, shift_source=shift_source)
         if shift_up:
             self.shift_up_count += 1
         if shift_down:
@@ -668,7 +658,6 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         self.state['shift_up'] = bool(self.client.controls["shift_up"])
         self.state['shift_down'] = bool(self.client.controls["shift_down"])
         self.state['shift_source'] = self.shift_source
-        self.state.update(self.last_auto_shift_info)
 
         # create obs
         obs, actions_diff = self.get_obs(state, self.states)
@@ -873,7 +862,6 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             assert self.static_info["CarName"] == self.car_name, f"Track name mismatch. Running: {self.static_info['CarName']} Configured: {self.car_name}"
 
         self.client.reset(self.send_reset_at_start)
-        self.auto_shifter.configure_static_info(self.static_info)
 
         self.termination_counter = int(TERMINAL_JUDGE_TIMEOUT * self.ctrl_rate)
         self.episode_saved = False
@@ -884,9 +872,7 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         self.raw_shift_actions = np.zeros(self.shift_action_dim, dtype=np.float32)
         self.shift_teacher_actions = np.zeros(self.shift_action_dim, dtype=np.float32)
         self.shift_source = "reset"
-        self.last_auto_shift_info = {}
         self.shift_gate.reset()
-        self.auto_shifter.reset()
 
         self.ep_steps = 0  # reset steps after flushing the actions
 
@@ -1060,7 +1046,7 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
                   "shift_down_count": int(ep.shift_down.sum()) if "shift_down" in ep else 0,
                   "shift_up_signal_max": ep.actions_3.max() if "actions_3" in ep else 0.0,
                   "shift_down_signal_max": ep.actions_4.max() if "actions_4" in ep else 0.0,
-                  "auto_shift_steps": int((ep.shift_source == "auto").sum()) if "shift_source" in ep else 0,
+                  "auto_shift_steps": int((ep.shift_source == "assetto_auto").sum()) if "shift_source" in ep else 0,
                   "manual_shift_steps": int((ep.shift_source == "manual").sum()) if "shift_source" in ep else 0,
                   #"completedLaps": ep.completedLaps.values[-1],
                   "BestLap": ep['BestLap'].values[-1] / 1000.,

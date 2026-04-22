@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from torch.distributions import Normal
+from torch.distributions import Categorical, Normal
 
 
 def initialize_weights_xavier(m, gain=1.0):
@@ -43,7 +43,7 @@ class BaseNetwork(nn.Module):
             raise ValueError(
                 "Model checkpoint is incompatible with the current network shape. "
                 "This project now uses 3 continuous control actions and a separate "
-                "2-label Bernoulli shift model, so old checkpoints from the 5-action "
+                "discrete shift policy, so old checkpoints from the 5-action "
                 "policy shape must not be resumed; start a fresh run instead."
             ) from exc
 
@@ -114,34 +114,82 @@ class GaussianPolicy(BaseNetwork):
         return actions, entropies, torch.tanh(means)
 
 
-class BernoulliShiftPolicy(BaseNetwork):
-    def __init__(self, state_dim, hidden_units=[256, 256], shift_dim=2):
+class DiscreteStateActionFunction(BaseNetwork):
+    def __init__(self, state_dim, action_count, hidden_units=[256, 256]):
         super().__init__()
 
         self.net = create_linear_network(
             input_dim=state_dim,
-            output_dim=shift_dim,
+            output_dim=action_count,
+            hidden_units=hidden_units)
+
+    def forward(self, states):
+        assert states.dim() == 2
+        return self.net(states)
+
+
+class TwinnedDiscreteStateActionFunction(BaseNetwork):
+    def __init__(self, state_dim, action_count, hidden_units=[256, 256]):
+        super().__init__()
+
+        self.net1 = DiscreteStateActionFunction(state_dim, action_count, hidden_units)
+        self.net2 = DiscreteStateActionFunction(state_dim, action_count, hidden_units)
+
+    def forward(self, states):
+        assert states.dim() == 2
+
+        value1 = self.net1(states)
+        value2 = self.net2(states)
+        return value1, value2
+
+
+class DiscreteShiftPolicy(BaseNetwork):
+    def __init__(self, state_dim, hidden_units=[256, 256], shift_dim=2):
+        super().__init__()
+
+        self.shift_dim = int(shift_dim)
+        self.action_count = self.shift_dim + 1
+        self.net = create_linear_network(
+            input_dim=state_dim,
+            output_dim=self.action_count,
             hidden_units=hidden_units)
 
     def forward(self, states):
         assert states.dim() == 2
 
         logits = self.net(states)
-        probs = torch.sigmoid(logits)
+        probs = torch.softmax(logits, dim=-1)
         return logits, probs
 
-    def sample(self, states, threshold=0.5):
+    def action_vectors(self, action_indices):
+        actions = torch.zeros(
+            (action_indices.shape[0], self.shift_dim),
+            dtype=torch.float,
+            device=action_indices.device,
+        )
+        if self.shift_dim >= 1:
+            actions[:, 0] = (action_indices == 1).float()
+        if self.shift_dim >= 2:
+            actions[:, 1] = (action_indices == 2).float()
+        return actions
+
+    def deterministic_indices(self, probs, threshold=0.5):
+        if threshold is None:
+            return torch.argmax(probs, dim=-1)
+
+        shift_probs = probs[:, 1:]
+        best_shift_probs, best_shift_offsets = torch.max(shift_probs, dim=-1)
+        best_shift_indices = best_shift_offsets + 1
+        return torch.where(
+            best_shift_probs >= threshold,
+            best_shift_indices,
+            torch.zeros_like(best_shift_indices),
+        )
+
+    def sample(self, states, deterministic=False, threshold=0.5):
         logits, probs = self.forward(states)
-        samples = torch.bernoulli(probs)
-        simultaneous = (samples[:, :1] > 0.5) & (samples[:, 1:2] > 0.5)
-        if simultaneous.any():
-            samples = torch.where(simultaneous.repeat(1, samples.shape[1]), torch.zeros_like(samples), samples)
-        deterministic = (probs >= threshold).float()
-        simultaneous_det = (deterministic[:, :1] > 0.5) & (deterministic[:, 1:2] > 0.5)
-        if simultaneous_det.any():
-            deterministic = torch.where(
-                simultaneous_det.repeat(1, deterministic.shape[1]),
-                torch.zeros_like(deterministic),
-                deterministic,
-            )
-        return samples, probs, deterministic
+        distribution = Categorical(probs=probs)
+        sampled_indices = distribution.sample()
+        deterministic_indices = self.deterministic_indices(probs, threshold=threshold)
+        action_indices = deterministic_indices if deterministic else sampled_indices
+        return action_indices, self.action_vectors(action_indices), probs, deterministic_indices

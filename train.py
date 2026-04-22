@@ -26,10 +26,13 @@ import Common.misc as misc
 logger = logging.getLogger(__name__)
 
 
-def wait_for_start() -> None:
+def wait_for_start(expect_assetto_auto: bool = True) -> None:
     print("\n" + "=" * 50)
     print("Environment ready!")
-    print("Launch Assetto Corsa, then press SPACE to start training...")
+    if expect_assetto_auto:
+        print("Launch Assetto Corsa, enable its built-in auto shifter for the curriculum auto phase, then press SPACE to start training...")
+    else:
+        print("Launch Assetto Corsa, then press SPACE to start training...")
     print("=" * 50 + "\n")
 
     if os.name == "nt":
@@ -146,10 +149,13 @@ def build_sac_kwargs(config):
         shift_key_map = {
             "enabled": "shift_enabled",
             "lr": "shift_lr",
+            "entropy_lr": "shift_entropy_lr",
             "hidden_units": "shift_hidden_units",
             "loss_weight": "shift_loss_weight",
             "pos_weight": "shift_pos_weight",
             "threshold": "shift_threshold",
+            "target_entropy": "shift_target_entropy",
+            "reward_scale": "shift_reward_scale",
         }
         for source_key, target_key in shift_key_map.items():
             if source_key in shift_config:
@@ -218,15 +224,7 @@ def main() -> None:
         else:
             demo_result = maybe_load_demonstrations(agent, env, config)
 
-        if bool(getattr(config.Agent, "use_offline_buffer", False)):
-            replay_buffer = getattr(agent, "_replay_buffer", None)
-            if replay_buffer is not None and hasattr(replay_buffer, "online"):
-                replay_buffer.online(True)
-                logger.info(
-                    "Enabled online replay writes with scheduled offline/online sampling"
-                )
-        if not demo_result["pretrained"]:
-            wait_for_start()
+        wait_for_start(expect_assetto_auto=agent.shift_ac_auto_phase_active())
 
     if args.test:
         env.set_eval_mode()

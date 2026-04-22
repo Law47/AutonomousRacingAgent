@@ -89,10 +89,11 @@ sys.modules["AssettoCorsaEnv.gap"] = gap_module
 sys.modules["AssettoCorsaEnv.brake_map"] = brake_map_module
 
 from AssettoCorsaEnv.ac_env import AssettoCorsaEnv, ShiftExecutionGate, STREAMING_DEMO_FORMAT
-from AssettoCorsaEnv.autoshift import AutoShifter
 from AssettoCorsaEnv.data_loader import DataLoader
 from AssettoCorsaPlugin.plugins.sensors_par import car_control
 from discor.agent import Agent, TRAINING_STATE_FILENAME
+from discor.algorithm.sac import SAC
+from discor.network import DiscreteShiftPolicy
 from discor.replay_buffer import ReplayBuffer
 
 
@@ -122,9 +123,13 @@ class DummySpace:
 class DummyAgentEnv:
     observation_space = DummySpace((2,))
     action_space = DummySpace((3,))
+    shift_action_dim = 2
 
     def seed(self, seed):
         self.seed_value = seed
+
+    def close(self):
+        return {}
 
 
 class DummyAlgo:
@@ -138,6 +143,14 @@ class DummyAlgo:
 
     def load_models(self, path):
         assert (Path(path) / "model.marker").exists()
+
+
+class DummyWriter:
+    def __init__(self):
+        self.scalars = []
+
+    def add_scalar(self, tag, value, step):
+        self.scalars.append((tag, value, step))
 
 
 def make_env_stub(cooldown_steps=0):
@@ -162,7 +175,6 @@ def make_env_stub(cooldown_steps=0):
     env.shift_down_count = 0
     env.enforce_mutually_exclusive_pedals = True
     env.prevent_reverse_downshift = True
-    env.auto_shifter = type("AutoShiftStub", (), {"gear_index_offset": 0})()
     env.use_reference_line_in_reward = False
     env.penalize_actions_diff = False
     env.total_steps = 0
@@ -254,9 +266,22 @@ def test_env_set_actions_forwards_decoded_shift_pulse():
     np.testing.assert_allclose(env.raw_shift_actions, [1.0, 0.0])
 
 
-def test_env_set_actions_blocks_downshift_into_reverse():
+def test_env_set_actions_forces_manual_shift_up_from_first_gear():
     env = make_env_stub()
     env.client.state["actualGear"] = 1
+
+    env.set_actions(
+        np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        shift_action=np.array([0.0, 0.0], dtype=np.float32),
+    )
+
+    assert env.client.controls["shift_up"] is True
+    assert env.client.controls["shift_down"] is False
+
+
+def test_env_set_actions_blocks_manual_downshift_into_first_gear():
+    env = make_env_stub()
+    env.client.state["actualGear"] = 2
 
     env.set_actions(
         np.array([0.0, 0.0, 0.0], dtype=np.float32),
@@ -267,14 +292,14 @@ def test_env_set_actions_blocks_downshift_into_reverse():
     assert env.client.controls["shift_down"] is False
 
 
-def test_env_set_actions_blocks_downshift_into_neutral_with_gear_offset():
+def test_env_set_actions_does_not_force_shift_during_assetto_auto_phase():
     env = make_env_stub()
-    env.auto_shifter.gear_index_offset = 1
-    env.client.state["actualGear"] = 2
+    env.client.state["actualGear"] = 1
 
     env.set_actions(
         np.array([0.0, 0.0, 0.0], dtype=np.float32),
-        shift_action=np.array([0.0, 1.0], dtype=np.float32),
+        shift_action=np.array([0.0, 0.0], dtype=np.float32),
+        shift_source="assetto_auto",
     )
 
     assert env.client.controls["shift_up"] is False
@@ -299,6 +324,23 @@ def test_offline_loader_prefers_recorded_five_action_demo_tensor():
     )
 
     np.testing.assert_allclose(recorded, [0.1, -0.2, 0.3, 1.0, 0.0])
+
+
+def test_offline_loader_prefers_assetto_auto_shift_teacher_labels():
+    loader = DataLoader.__new__(DataLoader)
+    loader.env = type("EnvStub", (), {"control_action_dim": 3, "shift_action_dim": 2})()
+
+    recorded = loader.get_recorded_shift_actions(
+        {
+            "actions_3": 0.0,
+            "actions_4": 0.0,
+            "shift_teacher_0": 0.0,
+            "shift_teacher_1": 1.0,
+            "shift_source": "assetto_auto",
+        }
+    )
+
+    np.testing.assert_allclose(recorded, [0.0, 1.0])
 
 
 def test_offline_loader_rebuilds_controls_but_preserves_recorded_shift_signals():
@@ -331,6 +373,22 @@ def test_offline_loader_infers_shift_up_from_gear_delta():
     inferred = loader.infer_shift_actions({"actualGear": 4}, {"actualGear": 3})
 
     np.testing.assert_allclose(inferred, [1.0, 0.0])
+
+
+def test_offline_loader_waits_for_full_assetto_auto_shift_transition():
+    loader = DataLoader.__new__(DataLoader)
+
+    first_hop = loader.infer_shift_actions({"actualGear": 1}, {"actualGear": 3})
+    completed_shift = loader.infer_shift_actions({"actualGear": 4}, {"actualGear": 1})
+
+    np.testing.assert_allclose(first_hop, [0.0, 0.0])
+    np.testing.assert_allclose(completed_shift, [1.0, 0.0])
+
+    first_hop = loader.infer_shift_actions({"actualGear": 1}, {"actualGear": 3})
+    completed_shift = loader.infer_shift_actions({"actualGear": 2}, {"actualGear": 1})
+
+    np.testing.assert_allclose(first_hop, [0.0, 0.0])
+    np.testing.assert_allclose(completed_shift, [0.0, 1.0])
 
 
 def test_demo_shift_alignment_matches_shift_execution_indices():
@@ -382,6 +440,187 @@ def test_replay_buffer_iter_batches_visits_demo_dataset_once():
     assert batch_sizes == [2, 2, 1]
     np.testing.assert_allclose(visited_states, [0, 1, 2, 3, 4])
     np.testing.assert_allclose(visited_shift_up, [0, 1, 0, 1, 0])
+
+
+def test_discrete_shift_policy_maps_indices_to_exclusive_shift_vectors():
+    policy = DiscreteShiftPolicy(state_dim=2, hidden_units=[], shift_dim=2)
+
+    vectors = policy.action_vectors(torch.tensor([0, 1, 2], dtype=torch.long))
+
+    np.testing.assert_allclose(
+        vectors.detach().cpu().numpy(),
+        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+    )
+
+
+def test_sac_shift_action_indices_treat_simultaneous_shift_as_noop():
+    algo = SAC(
+        state_dim=2,
+        action_dim=3,
+        device=torch.device("cpu"),
+        policy_hidden_units=[8],
+        q_hidden_units=[8],
+        shift_hidden_units=[8],
+        log_interval=1,
+    )
+
+    indices = algo.shift_action_indices(
+        torch.tensor(
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+            dtype=torch.float,
+        )
+    )
+
+    np.testing.assert_allclose(indices.cpu().numpy(), [0, 1, 2, 0])
+
+
+def test_sac_shift_update_logs_rl_losses_instead_of_supervised_accuracy():
+    algo = SAC(
+        state_dim=2,
+        action_dim=3,
+        device=torch.device("cpu"),
+        policy_hidden_units=[8],
+        q_hidden_units=[8],
+        shift_hidden_units=[8],
+        log_interval=1,
+        shift_target_entropy=0.2,
+    )
+    writer = DummyWriter()
+    states = torch.tensor(
+        [[0.0, 0.0], [0.5, 0.1], [1.0, -0.5], [-0.25, 0.75]],
+        dtype=torch.float,
+    )
+    actions = torch.zeros((4, 3), dtype=torch.float)
+    shift_actions = torch.tensor(
+        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 0.0]],
+        dtype=torch.float,
+    )
+    rewards = torch.tensor([[0.0], [1.0], [-0.5], [0.25]], dtype=torch.float)
+    next_states = states + 0.1
+    dones = torch.zeros((4, 1), dtype=torch.float)
+
+    stats = algo.update_shift_model_from_batch(
+        (states, actions, shift_actions, rewards, next_states, dones),
+        writer,
+    )
+
+    assert "shift_q_loss" in stats
+    assert "shift_policy_loss" in stats
+    assert "shift_accuracy" not in stats
+    assert any(tag == "loss/shift_Q" for tag, _, _ in writer.scalars)
+
+
+def test_sac_shift_behavior_clone_logs_bc_loss():
+    algo = SAC(
+        state_dim=2,
+        action_dim=3,
+        device=torch.device("cpu"),
+        policy_hidden_units=[8],
+        q_hidden_units=[8],
+        shift_hidden_units=[8],
+        log_interval=1,
+    )
+    writer = DummyWriter()
+    states = torch.tensor(
+        [[0.0, 0.0], [0.5, 0.1], [1.0, -0.5], [-0.25, 0.75]],
+        dtype=torch.float,
+    )
+    actions = torch.zeros((4, 3), dtype=torch.float)
+    shift_actions = torch.tensor(
+        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 0.0]],
+        dtype=torch.float,
+    )
+    rewards = torch.zeros((4, 1), dtype=torch.float)
+    next_states = states + 0.1
+    dones = torch.zeros((4, 1), dtype=torch.float)
+
+    stats = algo.update_shift_behavior_clone_from_batch(
+        (states, actions, shift_actions, rewards, next_states, dones),
+        writer,
+    )
+
+    assert "shift_bc_loss" in stats
+    assert "shift_q_loss" not in stats
+    assert any(tag == "loss/shift_bc" for tag, _, _ in writer.scalars)
+
+
+def test_agent_infers_assetto_auto_shift_from_gear_delta(tmp_path):
+    agent = Agent(
+        DummyAgentEnv(),
+        DummyAgentEnv(),
+        DummyAlgo(),
+        str(tmp_path / "agent"),
+        torch.device("cpu"),
+        batch_size=2,
+        eval_interval=0,
+    )
+    try:
+        np.testing.assert_allclose(
+            agent.infer_shift_action_from_gear_delta({"actualGear": 2}, {"actualGear": 3}),
+            [1.0, 0.0],
+        )
+        np.testing.assert_allclose(
+            agent.infer_shift_action_from_gear_delta({"actualGear": 4}, {"actualGear": 3}),
+            [0.0, 1.0],
+        )
+        np.testing.assert_allclose(
+            agent.infer_shift_action_from_gear_delta({"actualGear": 3}, {"actualGear": 3}),
+            [0.0, 0.0],
+        )
+        np.testing.assert_allclose(
+            agent.infer_shift_action_from_gear_delta({"actualGear": 3}, {"actualGear": 1}),
+            [0.0, 0.0],
+        )
+        np.testing.assert_allclose(
+            agent.infer_shift_action_from_gear_delta({"actualGear": 1}, {"actualGear": 4}),
+            [1.0, 0.0],
+        )
+        np.testing.assert_allclose(
+            agent.infer_shift_action_from_gear_delta({"actualGear": 3}, {"actualGear": 1}),
+            [0.0, 0.0],
+        )
+        np.testing.assert_allclose(
+            agent.infer_shift_action_from_gear_delta({"actualGear": 1}, {"actualGear": 2}),
+            [0.0, 1.0],
+        )
+    finally:
+        agent._writer.close()
+
+
+def test_shift_curriculum_handoff_switches_replay_to_online(tmp_path):
+    agent = Agent(
+        DummyAgentEnv(),
+        DummyAgentEnv(),
+        DummyAlgo(),
+        str(tmp_path / "agent"),
+        torch.device("cpu"),
+        use_offline_buffer=True,
+        memory_size=8,
+        offline_buffer_size=8,
+        batch_size=2,
+        eval_interval=0,
+        shift_curriculum_config={
+            "enabled": True,
+            "auto_only_steps": 5,
+            "eval_use_manual": True,
+            "handoff_prompt": "handoff now",
+        },
+    )
+    prompts = []
+    agent._wait_for_space = lambda message: prompts.append(message)
+    try:
+        assert agent.shift_ac_auto_phase_active() is True
+        assert agent._replay_buffer._online is False
+
+        agent._steps = 5
+        agent.maybe_pause_for_shift_handoff()
+
+        assert prompts == ["handoff now"]
+        assert agent._shift_handoff_completed is True
+        assert agent.shift_rl_training_enabled() is True
+        assert agent._replay_buffer._online is True
+    finally:
+        agent._writer.close()
 
 
 def test_agent_training_state_preserves_steps_beyond_buffer_occupancy(tmp_path):
@@ -521,117 +760,6 @@ def test_reward_ignores_neutral_reverse_and_out_of_track_penalties():
     assert np.isclose(reward, 0.36)
     assert "gear_shift_reward" not in state
     assert "out_of_track_penalty" not in state
-
-
-def test_autoshifter_upshifts_from_high_rpm_with_throttle():
-    shifter = AutoShifter({"max_rpm": 8000.0, "idle_rpm": 1000.0}, ctrl_rate=25)
-
-    action, info = shifter.update(
-        {"actualGear": 3, "accStatus": 1.0, "brakeStatus": 0.0, "RPM": 7900.0, "speed": 40.0},
-        dt=0.04,
-    )
-
-    np.testing.assert_allclose(action, [1.0, 0.0])
-    assert info["auto_aggressiveness"] > 0.0
-
-
-def test_autoshifter_recovers_neutral_to_first_at_idle():
-    shifter = AutoShifter({"max_rpm": 8000.0, "idle_rpm": 1000.0}, ctrl_rate=25)
-
-    action, info = shifter.update(
-        {"actualGear": 0, "accStatus": 0.0, "brakeStatus": 0.0, "RPM": 1000.0, "speed": 0.0},
-        dt=0.04,
-    )
-
-    np.testing.assert_allclose(action, [1.0, 0.0])
-    assert info["auto_gear"] == 0
-
-
-def test_autoshifter_holds_first_at_idle():
-    shifter = AutoShifter({"max_rpm": 8000.0, "idle_rpm": 1000.0}, ctrl_rate=25)
-
-    action, _ = shifter.update(
-        {"actualGear": 1, "accStatus": 0.0, "brakeStatus": 0.0, "RPM": 1000.0, "speed": 0.0},
-        dt=0.04,
-    )
-
-    np.testing.assert_allclose(action, [0.0, 0.0])
-
-
-def test_autoshifter_uses_gear_offset_for_neutral_and_first():
-    neutral_shifter = AutoShifter(
-        {"max_rpm": 8000.0, "idle_rpm": 1000.0, "gear_index_offset": 1},
-        ctrl_rate=25,
-    )
-
-    action, info = neutral_shifter.update(
-        {"actualGear": 1, "accStatus": 0.0, "brakeStatus": 0.0, "RPM": 1000.0, "speed": 0.0},
-        dt=0.04,
-    )
-    np.testing.assert_allclose(action, [1.0, 0.0])
-    assert info["auto_gear"] == 0
-
-    first_shifter = AutoShifter(
-        {"max_rpm": 8000.0, "idle_rpm": 1000.0, "gear_index_offset": 1},
-        ctrl_rate=25,
-    )
-
-    action, info = first_shifter.update(
-        {"actualGear": 2, "accStatus": 0.0, "brakeStatus": 0.0, "RPM": 1000.0, "speed": 0.0},
-        dt=0.04,
-    )
-    np.testing.assert_allclose(action, [0.0, 0.0])
-    assert info["auto_gear"] == 1
-
-
-def test_autoshifter_config_can_wait_for_high_upshift_rpm():
-    shifter = AutoShifter(
-        {
-            "max_rpm": 8000.0,
-            "idle_rpm": 1000.0,
-            "mode": "sport",
-            "max_shift_rpm_ratio": 0.99,
-            "rpm_range_divisor": 1.5,
-        },
-        ctrl_rate=25,
-    )
-
-    action, _ = shifter.update(
-        {"actualGear": 3, "accStatus": 1.0, "brakeStatus": 0.0, "RPM": 7800.0, "speed": 40.0},
-        dt=0.04,
-    )
-    np.testing.assert_allclose(action, [0.0, 0.0])
-
-    action, _ = shifter.update(
-        {"actualGear": 3, "accStatus": 1.0, "brakeStatus": 0.0, "RPM": 7950.0, "speed": 40.0},
-        dt=0.04,
-    )
-    np.testing.assert_allclose(action, [1.0, 0.0])
-
-
-def test_autoshifter_config_waits_for_low_downshift_rpm():
-    shifter = AutoShifter(
-        {
-            "max_rpm": 8000.0,
-            "idle_rpm": 1000.0,
-            "mode": "sport",
-            "max_shift_rpm_ratio": 0.99,
-            "rpm_range_divisor": 1.5,
-        },
-        ctrl_rate=25,
-    )
-
-    action, _ = shifter.update(
-        {"actualGear": 4, "accStatus": 0.0, "brakeStatus": 0.0, "RPM": 2500.0, "speed": 20.0},
-        dt=0.04,
-    )
-    np.testing.assert_allclose(action, [0.0, 0.0])
-
-    action, _ = shifter.update(
-        {"actualGear": 4, "accStatus": 0.0, "brakeStatus": 0.0, "RPM": 1200.0, "speed": 20.0},
-        dt=0.04,
-    )
-    np.testing.assert_allclose(action, [0.0, 1.0])
 
 
 def test_vigem_backend_maps_shift_up_to_a_and_shift_down_to_x(monkeypatch):

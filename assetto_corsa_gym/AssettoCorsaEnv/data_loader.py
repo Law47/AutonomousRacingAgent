@@ -36,6 +36,7 @@ class DataLoader():
         self.current_step = 0
         self.prev_abs_actions = None
         self.log_steer_ratios = log_steer_ratios
+        self._assetto_auto_shift_source_gear = None
 
         # load the brake and steer maps from the env config!!! -> check if using another car
         brake_map_file = Path(env.ac_configs_path) / "cars" / env.config.car / 'brake_map.csv'
@@ -63,9 +64,23 @@ class DataLoader():
         control_dim = getattr(self.env, "control_action_dim", 3)
         shift_dim = getattr(self.env, "shift_action_dim", 2)
         action_keys = [f"actions_{control_dim + i}" for i in range(shift_dim)]
+        teacher_keys = [f"shift_teacher_{i}" for i in range(shift_dim)]
+        recorded_actions = None
+        teacher_actions = None
+
         if all(key in state for key in action_keys):
-            return np.array([state[key] for key in action_keys], dtype='float32')
-        return None
+            recorded_actions = np.array([state[key] for key in action_keys], dtype='float32')
+        if all(key in state for key in teacher_keys):
+            teacher_actions = np.array([state[key] for key in teacher_keys], dtype='float32')
+
+        if teacher_actions is not None and (
+            state.get("shift_source") == "assetto_auto"
+            or recorded_actions is None
+            or (np.any(teacher_actions > 0.5) and not np.any(recorded_actions > 0.5))
+        ):
+            return teacher_actions
+
+        return recorded_actions
 
     def get_recorded_model_actions(self, state):
         controls = self.get_recorded_control_actions(state)
@@ -78,15 +93,33 @@ class DataLoader():
 
     def infer_shift_actions(self, current_state, previous_state):
         if previous_state is None:
+            self._assetto_auto_shift_source_gear = None
             return np.zeros(2, dtype='float32')
 
         current_gear = int(current_state.get("actualGear", 0))
         previous_gear = int(previous_state.get("actualGear", current_gear))
-        gear_delta = current_gear - previous_gear
+        first_gear = 1
 
-        if gear_delta > 0:
+        if previous_gear > first_gear and current_gear <= first_gear:
+            self._assetto_auto_shift_source_gear = previous_gear
+            return np.zeros(2, dtype='float32')
+
+        source_gear = getattr(self, "_assetto_auto_shift_source_gear", None)
+        if source_gear is not None:
+            if current_gear <= first_gear:
+                return np.zeros(2, dtype='float32')
+            self._assetto_auto_shift_source_gear = None
+            if current_gear > source_gear:
+                return np.array([1.0, 0.0], dtype='float32')
+            if current_gear < source_gear:
+                return np.array([0.0, 1.0], dtype='float32')
+            return np.zeros(2, dtype='float32')
+
+        if previous_gear <= first_gear or current_gear <= first_gear:
+            return np.zeros(2, dtype='float32')
+        if current_gear > previous_gear:
             return np.array([1.0, 0.0], dtype='float32')
-        if gear_delta < 0:
+        if current_gear < previous_gear:
             return np.array([0.0, 1.0], dtype='float32')
         return np.zeros(2, dtype='float32')
 
@@ -202,6 +235,7 @@ class DataLoader():
             self.trajectory, self.static_info = self.env.load_history(load_path)
             self.trajectory_number += 1
             self.current_step = 0
+            self._assetto_auto_shift_source_gear = None
             self.validate_shift_action_alignment(self.trajectory)
             if self.log_steer_ratios:
                 self.compute_steer_ratio_statistics(self.trajectory)

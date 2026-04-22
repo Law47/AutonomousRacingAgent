@@ -37,7 +37,7 @@ class Algorithm(ABC):
         pass
 
     @abstractmethod
-    def update_online_networks(self, batch, writer):
+    def update_online_networks(self, batch, writer, train_shift_rl=True):
         pass
 
     @abstractmethod

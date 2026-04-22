@@ -15,6 +15,7 @@ Agent:
   num_eval_episodes: 1
   checkpoint_freq: 200_000
   save_final_buffer: True
+  save_checkpoint_buffer: False
 
 OfflineSampling:
   enabled: True
@@ -24,11 +25,9 @@ OfflineSampling:
 
 ShiftCurriculum:
   enabled: True
-  auto_only_steps: 2000
-  initial_auto_probability: 0.75
-  final_auto_probability: 0.0
-  transition_steps: 500_000
+  auto_only_steps: 1_000_000
   eval_use_manual: True
+  handoff_prompt: "Turn off Assetto Corsa automatic shifting, then press SPACE to continue training."
 
 SAC:
   gamma: 0.992
@@ -45,14 +44,15 @@ SAC:
 ShiftModel:
   enabled: True
   lr: 0.0003
+  entropy_lr: 0.0003
   hidden_units: [256, 256, 256]
-  loss_weight: 1.0
-  pos_weight: [10.0, 10.0]
   threshold: 0.5
+  target_entropy: 0.2
+  reward_scale: 1.0
 
 Demonstrations:
   enabled: False
-  data_path: null
+  data_path: C:\Users\Leo\Documents\Github\AutonomousRacingAgent\demonstrations\session_02
   data_paths: []
   pretrain_epochs: 5
   log_steer_ratios: False
@@ -92,24 +92,6 @@ AssettoCorsa:
     threshold: 0.5
     cooldown_s: 0.0
     prevent_reverse_downshift: True
-
-  AutoShift:
-    enabled: True
-    mode: "sport"
-    gear_index_offset: 1
-    max_rpm: 0.0
-    idle_rpm_fallback: 1000.0
-    max_shift_rpm_ratio: 0.99
-    rpm_range_divisor: 1.5
-    min_shift_interval_s: 0.10
-    upshift_cooldown_s: 1.0
-    downshift_cooldown_s: 2.0
-    braking_downshift_cooldown_s: 1.0
-    up_after_downshift_cooldown_s: 1.0
-    min_downshift_to_first_speed_kmh: 15.0
-    downshift_to_first_aggression: 0.95
-    overdrive_downshift_gear: 4
-    slip_threshold: 1.0
 
   Rewards:
     use_reference_line_in_reward: True
