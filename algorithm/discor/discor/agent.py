@@ -214,8 +214,64 @@ class Agent:
         )
         return True
 
+    def _load_summary_training_state(self, path):
+        load_path = Path(path)
+        candidates = [
+            load_path / 'summary.csv',
+            load_path.parent / 'summary.csv',
+            load_path.parent.parent / 'summary.csv',
+        ]
+        summary_path = next((candidate for candidate in candidates if candidate.exists()), None)
+        if summary_path is None:
+            return False
+
+        try:
+            summary = pd.read_csv(summary_path)
+        except Exception:
+            logger.exception("Unable to load summary fallback from %s", summary_path)
+            return False
+
+        if summary.empty:
+            logger.warning("Summary fallback at %s was empty", summary_path)
+            return False
+
+        last_row = summary.iloc[-1]
+        if 'step' in summary.columns and pd.notna(last_row.get('step')):
+            self._steps = int(last_row['step'])
+        elif 'total_steps' in summary.columns and pd.notna(last_row.get('total_steps')):
+            self._steps = int(last_row['total_steps'])
+        else:
+            logger.warning("Summary fallback at %s has no step/total_steps column", summary_path)
+            return False
+
+        if 'episode' in summary.columns and pd.notna(last_row.get('episode')):
+            self._episodes = int(last_row['episode'])
+        elif 'ep_count' in summary.columns and pd.notna(last_row.get('ep_count')):
+            self._episodes = int(last_row['ep_count'])
+
+        if 'ep_reward' in summary.columns:
+            rewards = pd.to_numeric(summary['ep_reward'], errors='coerce')
+            if rewards.notna().any():
+                self.best_reward = float(rewards.max())
+
+        if 'BestLap' in summary.columns:
+            best_laps = pd.to_numeric(summary['BestLap'], errors='coerce')
+            best_laps = best_laps[best_laps > 0]
+            if not best_laps.empty:
+                self.best_lap_time = float(best_laps.min())
+
+        self._configure_replay_source_for_shift_phase()
+        logger.info(
+            "loaded training counters from summary fallback %s. steps=%s episodes=%s",
+            summary_path,
+            self._steps,
+            self._episodes,
+        )
+        return True
+
     def save(self, path, save_buffer=True):
         self._algo.save_models(path)
+        self._save_training_state(path)
         if save_buffer:
             replay_buffer_path = os.path.join(path, 'replay_buffer.pkl')
             tmp_path = replay_buffer_path + ".tmp"
@@ -233,7 +289,6 @@ class Agent:
                         os.remove(tmp_path)
                 except Exception:
                     logger.exception("Failed to remove temp replay buffer at %s", tmp_path)
-        self._save_training_state(path)
         logger.info("saved models to {}".format(path))
 
     def load(self, path, load_buffer=True):
@@ -243,9 +298,14 @@ class Agent:
             logger.exception("Unable to load model from %s", path)
             raise
         logger.info(f"loaded model from {path}")
+        loaded_training_state = self._load_training_state(path)
+        if not loaded_training_state:
+            loaded_training_state = self._load_summary_training_state(path)
+
         if load_buffer:
             loaded_buffer = False
             replay_buffer_path = os.path.join(path, 'replay_buffer.pkl')
+            replay_buffer_tmp_path = replay_buffer_path + ".tmp"
             if os.path.exists(replay_buffer_path):
                 try:
                     with open(replay_buffer_path, 'rb') as f:
@@ -257,7 +317,9 @@ class Agent:
                         replay_buffer_path,
                         exc,
                     )
-                    return
+                    if loaded_training_state:
+                        return
+                    raise
                 if getattr(loaded_replay_buffer, "_action_shape", None) != self._env.action_space.shape:
                     raise ValueError(
                         "Replay buffer is incompatible with the current action shape. "
@@ -269,7 +331,11 @@ class Agent:
                 logger.info(f"loaded buffer from {path}. Number of steps: {len(self._replay_buffer)}")
             else:
                 logger.warning("replay_buffer.pkl not found in %s; continuing with model weights only", path)
-            loaded_training_state = self._load_training_state(path)
+                if os.path.exists(replay_buffer_tmp_path):
+                    logger.warning(
+                        "Found %s, which usually means a previous replay-buffer save was interrupted.",
+                        replay_buffer_tmp_path,
+                    )
             if not loaded_training_state and loaded_buffer:
                 self._steps = self._replay_buffer._n
                 logger.info(
