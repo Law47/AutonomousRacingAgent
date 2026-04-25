@@ -4,7 +4,6 @@ pyarrow
 scipy==1.10.1
 gym==0.25.2
 omegaconf==2.3.0
-torch
 tensorboard
 tqdm
 numba
