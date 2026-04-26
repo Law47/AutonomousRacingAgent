@@ -263,7 +263,7 @@ class DataLoader():
         self.state = state
         # re build the observations and the reward using the current environment settings
         self.obs, self.actions_diff = self.env.get_obs(state, history)
-        self.reward = self.env.get_reward(state, self.actions_diff).item()
+        self.reward = self.env.get_reward(state, self.actions_diff, history=history).item()
 
         done = False
         terminated = False

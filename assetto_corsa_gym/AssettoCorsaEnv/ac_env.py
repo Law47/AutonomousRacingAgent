@@ -57,6 +57,13 @@ def load_yaml(file_path):
     with open(file_path, 'r') as file:
         return yaml.safe_load(file)
 
+def cfg_get(config, key, default):
+    if config is None:
+        return default
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
 def to_pickle(obj, file, verbose=False):
     if verbose: print('saving to..', file)
     with open(file, 'wb') as f: pickle.dump(obj, f)
@@ -280,22 +287,46 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         self.max_steer_rate = self.config.max_steer_rate
         self.use_obs_extra = self.config.use_obs_extra
         reward_config = getattr(self.config, "Rewards", None)
+        curriculum_config = getattr(self.config, "Curriculum", None)
         shift_execution_config = getattr(self.config, "ShiftExecution", None)
-        self.use_reference_line_in_reward = getattr(
+        self.reward_mode = str(cfg_get(reward_config, "mode", "progress"))
+        self.use_reference_line_in_reward = cfg_get(
             reward_config,
             "use_reference_line_in_reward",
             getattr(self.config, "use_reference_line_in_reward", True),
         )
-        self.penalize_actions_diff = getattr(
+        self.penalize_actions_diff = cfg_get(
             reward_config,
             "penalize_actions_diff",
             getattr(self.config, "penalize_actions_diff", False),
         )
-        self.penalize_actions_diff_coef = getattr(
+        self.penalize_actions_diff_coef = cfg_get(
             reward_config,
             "penalize_actions_diff_coef",
             getattr(self.config, "penalize_actions_diff_coef", 0.1),
         )
+        self.progress_reward_scale = float(cfg_get(reward_config, "progress_reward_scale", 0.1))
+        self.forward_speed_reward_scale = float(cfg_get(reward_config, "forward_speed_reward_scale", 0.03))
+        self.reference_line_penalty_coef = float(cfg_get(reward_config, "reference_line_penalty_coef", 0.05))
+        self.reference_line_margin_m = max(float(cfg_get(reward_config, "reference_line_margin_m", 6.0)), 1e-6)
+        self.border_margin_m = max(float(cfg_get(reward_config, "border_margin_m", 1.5)), 1e-6)
+        self.border_penalty_coef = float(cfg_get(reward_config, "border_penalty_coef", 0.04))
+        self.lateral_velocity_penalty_coef = float(cfg_get(reward_config, "lateral_velocity_penalty_coef", 0.01))
+        self.backwards_penalty_coef = float(cfg_get(reward_config, "backwards_penalty_coef", 0.4))
+        self.off_track_penalty = float(cfg_get(reward_config, "off_track_penalty", 30.0))
+        self.terminated_penalty = float(cfg_get(reward_config, "terminated_penalty", 5.0))
+        self.low_speed_penalty = float(cfg_get(reward_config, "low_speed_penalty", 0.02))
+        self.low_speed_threshold_ms = float(cfg_get(reward_config, "low_speed_threshold_ms", 2.0))
+        self.low_speed_grace_steps = int(cfg_get(reward_config, "low_speed_grace_steps", 2 * self.ctrl_rate))
+        self.lap_completion_bonus = float(cfg_get(reward_config, "lap_completion_bonus", 50.0))
+        self.max_progress_per_step_m = float(cfg_get(reward_config, "max_progress_per_step_m", 8.0))
+        self.curriculum_enabled = bool(cfg_get(curriculum_config, "enabled", False))
+        self.curriculum_duration_steps = max(int(cfg_get(curriculum_config, "duration_steps", 1)), 1)
+        self.curriculum_start_line_penalty_scale = float(cfg_get(curriculum_config, "start_line_penalty_scale", 1.0))
+        self.curriculum_start_border_penalty_scale = float(cfg_get(curriculum_config, "start_border_penalty_scale", 1.0))
+        self.curriculum_start_action_penalty_scale = float(cfg_get(curriculum_config, "start_action_penalty_scale", 1.0))
+        self.curriculum_start_off_track_penalty_scale = float(cfg_get(curriculum_config, "start_off_track_penalty_scale", 1.0))
+        self.training_step = 0
         self.enforce_mutually_exclusive_pedals = bool(
             getattr(self.config, "enforce_mutually_exclusive_pedals", True)
         )
@@ -532,8 +563,8 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
     def _filter_shift_actions(self, shift_up, shift_down, shift_source="manual"):
         current_gear = self._get_current_gear()
         model_controls_shift = str(shift_source) == "manual"
-        if model_controls_shift and current_gear <= 1:
-            return True, False
+        if model_controls_shift and current_gear <= 0:
+            return bool(shift_up), False
 
         if not shift_down or not self.prevent_reverse_downshift:
             return shift_up, shift_down
@@ -665,7 +696,7 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         #
         #   Reward
         #
-        self.state["reward"] = self.get_reward(self.state, actions_diff).item()
+        self.state["reward"] = self.get_reward(self.state, actions_diff, history=self.states).item()
 
         if (self.ep_steps % 50) == 0:
             current_gear = int(state.get("actualGear", 0))
@@ -808,7 +839,43 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
     def get_extra_obs_index(self, channel_name):
         return self.obs_extra_enabled_channels.index(channel_name)
 
-    def get_reward(self, state, actions_diff):
+    def set_training_step(self, step):
+        self.training_step = max(int(step), 0)
+
+    def _curriculum_fraction(self):
+        if not self.curriculum_enabled:
+            return 1.0
+        return float(np.clip(self.training_step / self.curriculum_duration_steps, 0.0, 1.0))
+
+    def _curriculum_scale(self, start_scale):
+        if not self.curriculum_enabled:
+            return 1.0
+        progress = self._curriculum_fraction()
+        return float(start_scale + (1.0 - start_scale) * progress)
+
+    def _lap_distance(self, state):
+        if "LapDist" in state:
+            return float(state["LapDist"])
+        return float(self.track_length * state.get("NormalizedSplinePosition", 0.0))
+
+    def _lap_progress_delta(self, state, history):
+        if not history:
+            return 0.0, False
+
+        current_dist = self._lap_distance(state)
+        previous_dist = self._lap_distance(history[-1])
+        raw_delta = current_dist - previous_dist
+        wrapped_forward = False
+
+        if raw_delta < -0.5 * self.track_length:
+            raw_delta += self.track_length
+            wrapped_forward = True
+        elif raw_delta > 0.5 * self.track_length:
+            raw_delta -= self.track_length
+
+        return raw_delta, wrapped_forward
+
+    def get_legacy_reward(self, state, actions_diff):
         speed = 3.6 * np.array(state['speed'])
 
         r = speed
@@ -821,6 +888,103 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             r -= action_difference_penalty * self.penalize_actions_diff_coef
         r = r.reshape(-1)  # [N, 1] -> [N]
         return r
+
+    def get_reward(self, state, actions_diff, history=None):
+        if self.reward_mode == "legacy":
+            return self.get_legacy_reward(state, actions_diff)
+
+        history = self.states if history is None else history
+        speed_ms = float(state.get("speed", 0.0))
+        forward_speed_ms = float(state.get("local_velocity_x", speed_ms))
+        lateral_speed_ms = abs(float(state.get("local_velocity_y", 0.0)))
+        gap_m = abs(float(state.get("gap", 0.0)))
+        out_of_track = bool(state.get("out_of_track", False))
+        terminated = bool(state.get("terminated", False))
+
+        progress_delta, wrapped_forward = self._lap_progress_delta(state, history)
+        clipped_progress = float(
+            np.clip(progress_delta, -self.max_progress_per_step_m, self.max_progress_per_step_m)
+        )
+
+        progress_reward = self.progress_reward_scale * clipped_progress
+        speed_reward = self.forward_speed_reward_scale * max(forward_speed_ms, 0.0) / TOP_SPEED_MS
+
+        line_penalty = 0.0
+        if self.use_reference_line_in_reward:
+            line_error = gap_m / self.reference_line_margin_m
+            line_penalty = (
+                self.reference_line_penalty_coef
+                * self._curriculum_scale(self.curriculum_start_line_penalty_scale)
+                * min(line_error * line_error, 4.0)
+            )
+
+        border_penalty = 0.0
+        dist_to_border = state.get("dist_to_border", None)
+        if dist_to_border is not None and np.isfinite(float(dist_to_border)):
+            border_risk = max((self.border_margin_m - float(dist_to_border)) / self.border_margin_m, 0.0)
+            border_penalty = (
+                self.border_penalty_coef
+                * self._curriculum_scale(self.curriculum_start_border_penalty_scale)
+                * border_risk * border_risk
+            )
+
+        backwards_penalty = self.backwards_penalty_coef * max(-clipped_progress, 0.0)
+        lateral_penalty = self.lateral_velocity_penalty_coef * lateral_speed_ms / TOP_SPEED_MS
+
+        low_speed_penalty = 0.0
+        if self.ep_steps > self.low_speed_grace_steps and speed_ms < self.low_speed_threshold_ms:
+            low_speed_penalty = self.low_speed_penalty
+
+        action_penalty = 0.0
+        if self.penalize_actions_diff:
+            action_penalty = (
+                np.linalg.norm(actions_diff, ord=2)
+                * self.penalize_actions_diff_coef
+                * self._curriculum_scale(self.curriculum_start_action_penalty_scale)
+            )
+
+        off_track_penalty = 0.0
+        if out_of_track:
+            off_track_penalty = (
+                self.off_track_penalty
+                * self._curriculum_scale(self.curriculum_start_off_track_penalty_scale)
+            )
+
+        terminal_penalty = self.terminated_penalty if terminated and not out_of_track else 0.0
+        lap_bonus = self.lap_completion_bonus if wrapped_forward else 0.0
+        if history:
+            previous_lap = int(history[-1].get("LapCount", state.get("LapCount", 0)))
+            current_lap = int(state.get("LapCount", previous_lap))
+            if current_lap > previous_lap:
+                lap_bonus = max(lap_bonus, self.lap_completion_bonus)
+
+        reward = (
+            progress_reward
+            + speed_reward
+            + lap_bonus
+            - line_penalty
+            - border_penalty
+            - backwards_penalty
+            - lateral_penalty
+            - low_speed_penalty
+            - action_penalty
+            - off_track_penalty
+            - terminal_penalty
+        )
+
+        state["progress_delta"] = progress_delta
+        state["reward_progress"] = progress_reward
+        state["reward_speed"] = speed_reward
+        state["reward_lap_bonus"] = lap_bonus
+        state["reward_line_penalty"] = line_penalty
+        state["reward_border_penalty"] = border_penalty
+        state["reward_backwards_penalty"] = backwards_penalty
+        state["reward_lateral_penalty"] = lateral_penalty
+        state["reward_low_speed_penalty"] = low_speed_penalty
+        state["reward_action_penalty"] = action_penalty
+        state["reward_off_track_penalty"] = off_track_penalty
+        state["reward_terminal_penalty"] = terminal_penalty
+        return np.array([reward], dtype=np.float32)
 
     def recover_car(self):
         logger.info("Recover car")

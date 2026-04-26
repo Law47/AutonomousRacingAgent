@@ -36,7 +36,12 @@ class BaseNetwork(nn.Module):
         torch.save(self.state_dict(), path)
 
     def load(self, path):
-        state_dict = torch.load(path)
+        first_param = next(self.parameters(), None)
+        map_location = first_param.device if first_param is not None else "cpu"
+        try:
+            state_dict = torch.load(path, map_location=map_location, weights_only=True)
+        except TypeError:
+            state_dict = torch.load(path, map_location=map_location)
         try:
             self.load_state_dict(state_dict)
         except RuntimeError as exc:

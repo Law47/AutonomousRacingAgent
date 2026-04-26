@@ -89,6 +89,48 @@ class ReplayBuffer:
             self._nstep_buffer = NStepBuffer(self._gamma, self._nstep)
         logger.info(f"Replay buffer initialized for {self._memory_size} samples")
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        serialized_n = int(self._n)
+        for key in ("_states", "_next_states", "_actions", "_shift_labels", "_rewards", "_dones"):
+            state[key] = state[key][:serialized_n].copy()
+        state["_serialized_n"] = serialized_n
+        return state
+
+    def __setstate__(self, state):
+        serialized_n = int(state.pop("_serialized_n", state.get("_n", 0)))
+        saved_arrays = {
+            key: state.pop(key)
+            for key in ("_states", "_next_states", "_actions", "_shift_labels", "_rewards", "_dones")
+        }
+        self.__dict__.update(state)
+
+        self._states = np.empty(
+            (self._memory_size, ) + self._state_shape, dtype=np.float32)
+        self._next_states = np.empty(
+            (self._memory_size, ) + self._state_shape, dtype=np.float32)
+        self._actions = np.empty(
+            (self._memory_size, ) + self._action_shape, dtype=np.float32)
+        self._shift_labels = np.empty(
+            (self._memory_size, ) + self._shift_shape, dtype=np.float32)
+        self._rewards = np.empty((self._memory_size, 1), dtype=np.float32)
+        self._dones = np.empty((self._memory_size, 1), dtype=np.float32)
+
+        copy_n = min(serialized_n, self._memory_size)
+        if copy_n:
+            self._states[:copy_n] = saved_arrays["_states"][:copy_n]
+            self._next_states[:copy_n] = saved_arrays["_next_states"][:copy_n]
+            self._actions[:copy_n] = saved_arrays["_actions"][:copy_n]
+            self._shift_labels[:copy_n] = saved_arrays["_shift_labels"][:copy_n]
+            self._rewards[:copy_n] = saved_arrays["_rewards"][:copy_n]
+            self._dones[:copy_n] = saved_arrays["_dones"][:copy_n]
+
+        self._n = copy_n
+        if self._n >= self._memory_size:
+            self._p = int(state.get("_p", 0)) % self._memory_size
+        else:
+            self._p = self._n
+
     def append(self, state, action, reward, next_state, terminated, episode_done=None, shift_label=None):
         """
         done (masked_done): False if the agent reach time horizons. Else = done

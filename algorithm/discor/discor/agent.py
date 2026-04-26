@@ -119,6 +119,7 @@ class Agent:
         )
         self._shift_handoff_completed = (not self._shift_curriculum_enabled) or self._shift_auto_only_steps <= 0
         self._paused = False
+        self._loaded_model = False
         self._assetto_auto_shift_source_gear = None
         self._configure_replay_source_for_shift_phase()
 
@@ -147,6 +148,9 @@ class Agent:
             'best_reward': float(self.best_reward),
             'best_eval_score': float(self._best_eval_score),
             'shift_handoff_completed': bool(self._shift_handoff_completed),
+            'replay_buffer_size': int(len(self._replay_buffer)),
+            'online_buffer_size': int(getattr(self._replay_buffer, "online_size", len(self._replay_buffer))),
+            'offline_buffer_size': int(getattr(self._replay_buffer, "offline_size", 0)),
         }
 
     def _save_training_state(self, path):
@@ -270,6 +274,10 @@ class Agent:
         return True
 
     def save(self, path, save_buffer=True):
+        try:
+            self._writer.flush()
+        except Exception:
+            logger.exception("Failed to flush TensorBoard writer before saving")
         self._algo.save_models(path)
         self._save_training_state(path)
         if save_buffer:
@@ -298,6 +306,7 @@ class Agent:
             logger.exception("Unable to load model from %s", path)
             raise
         logger.info(f"loaded model from {path}")
+        self._loaded_model = True
         loaded_training_state = self._load_training_state(path)
         if not loaded_training_state:
             loaded_training_state = self._load_summary_training_state(path)
@@ -320,13 +329,25 @@ class Agent:
                     if loaded_training_state:
                         return
                     raise
+                if getattr(loaded_replay_buffer, "_state_shape", None) != self._env.observation_space.shape:
+                    raise ValueError(
+                        "Replay buffer is incompatible with the current observation shape. "
+                        "Use --load_weights_only for inference or to restart data collection."
+                    )
                 if getattr(loaded_replay_buffer, "_action_shape", None) != self._env.action_space.shape:
                     raise ValueError(
                         "Replay buffer is incompatible with the current action shape. "
                         "This project now stores 3 continuous actions plus separate shift labels; "
                         "start a fresh run or load weights without the old buffer."
                     )
+                expected_shift_shape = (getattr(self._env, "shift_action_dim", 2),)
+                if getattr(loaded_replay_buffer, "_shift_shape", expected_shift_shape) != expected_shift_shape:
+                    raise ValueError(
+                        "Replay buffer is incompatible with the current shift-label shape. "
+                        "Use --load_weights_only for inference or to restart data collection."
+                    )
                 self._replay_buffer = loaded_replay_buffer
+                self._configure_replay_source_for_shift_phase()
                 loaded_buffer = True
                 logger.info(f"loaded buffer from {path}. Number of steps: {len(self._replay_buffer)}")
             else:
@@ -337,10 +358,15 @@ class Agent:
                         replay_buffer_tmp_path,
                     )
             if not loaded_training_state and loaded_buffer:
-                self._steps = self._replay_buffer._n
+                self._steps = len(self._replay_buffer)
                 logger.info(
                     "No training state found; restored steps from replay buffer occupancy: %s",
                     self._steps,
+                )
+            if not loaded_buffer:
+                logger.warning(
+                    "No replay buffer was restored. Training can resume collecting new samples, "
+                    "but updates will wait until at least one batch is available."
                 )
 
     def run(self):
@@ -358,7 +384,7 @@ class Agent:
     def update_model(self):
         train_stats = None
         # Update online networks.
-        if self._steps % self._update_interval == 0:
+        if self._steps % self._update_interval == 0 and self.can_update_model():
             batch = self.sample_replay_batch()
             train_stats = self.update_model_from_batch(
                 batch,
@@ -385,9 +411,14 @@ class Agent:
         return train_stats
 
     def has_min_experience(self):
+        if self._loaded_model:
+            return True
         if self._start_steps_count == "replay_buffer":
             return len(self._replay_buffer) >= self._start_steps
         return self._steps >= self._start_steps
+
+    def can_update_model(self):
+        return self.has_min_experience() and len(self._replay_buffer) >= self._batch_size
 
     def can_update_shift_model(self):
         return len(self._replay_buffer) >= self._batch_size
@@ -579,6 +610,8 @@ class Agent:
         try:
             done = False
             step_perf, action_perf, update_model_perf = [], [], []
+            if hasattr(self._env, "set_training_step"):
+                self._env.set_training_step(self._steps)
             state = self._env.reset()
             self._assetto_auto_shift_source_gear = None
             step_start_time = time.perf_counter()
@@ -586,6 +619,8 @@ class Agent:
             while (not done):
                 self._handle_keyboard_pause()
                 self.maybe_pause_for_shift_handoff()
+                if hasattr(self._env, "set_training_step"):
+                    self._env.set_training_step(self._steps)
 
                 start_profile = time.perf_counter()
                 previous_env_state = getattr(self._env, "state", {}).copy()
@@ -602,7 +637,7 @@ class Agent:
 
                 # update model
                 start_profile = time.perf_counter()
-                if self.has_min_experience():
+                if self.can_update_model():
                     train_stats = self.update_model()
                     if self.shift_ac_auto_phase_active():
                         shift_stats = self.update_shift_behavior_clone()
@@ -695,31 +730,36 @@ class Agent:
         ep_stats['ep_steps'] = episode_steps
         ep_stats.update(env_ep_stats if isinstance(env_ep_stats, dict) else {})
 
-        if env_ep_stats["BestLap"] < self.best_lap_time:
-            logger.info(f"new best lap time {env_ep_stats['BestLap']}")
-            self.best_lap_time = env_ep_stats["BestLap"]
+        best_lap = float(env_ep_stats.get("BestLap", np.inf)) if isinstance(env_ep_stats, dict) else np.inf
+        if best_lap > 0.0 and best_lap < self.best_lap_time:
+            logger.info(f"new best lap time {best_lap}")
+            self.best_lap_time = best_lap
             self.save(os.path.join(self._model_dir, 'best_lap_time'), save_buffer=False)
 
-        if env_ep_stats["ep_reward"] > self.best_reward:
-            logger.info(f"new best reward {env_ep_stats['ep_reward']}")
-            self.best_reward = env_ep_stats["ep_reward"]
+        env_reward = float(env_ep_stats.get("ep_reward", episode_return)) if isinstance(env_ep_stats, dict) else episode_return
+        if env_reward > self.best_reward:
+            logger.info(f"new best reward {env_reward}")
+            self.best_reward = env_reward
             self.save(os.path.join(self._model_dir, 'best_reward'), save_buffer=False)
 
         eval_metrics = self.common_metrics()
         eval_metrics.update(ep_stats)
         if train_stats:
             eval_metrics.update(train_stats)
-        eval_metrics["update_model_perf_mean"] = np.array(update_model_perf).mean()
-        eval_metrics["update_model_perf_max"] = np.array(update_model_perf).max()
-        eval_metrics["update_model_perf_std"] = np.array(update_model_perf).std()
-        eval_metrics["step_perf_mean"] = np.array(step_perf).mean()
-        eval_metrics["step_perf_max"] = np.array(step_perf).max()
-        eval_metrics["step_perf_std"] = np.array(step_perf).std()
-        eval_metrics["step_perf_q99"] = np.quantile(np.array(step_perf), 0.99)
-        eval_metrics["step_perf_> thres"] = np.sum(np.array(step_perf) > 0.041)
-        eval_metrics["action_perf_mean"] = np.array(action_perf).mean()
-        eval_metrics["action_perf_max"] = np.array(action_perf).max()
-        eval_metrics["action_perf_std"] = np.array(action_perf).std()
+        update_model_perf = np.asarray(update_model_perf, dtype=np.float32)
+        step_perf = np.asarray(step_perf, dtype=np.float32)
+        action_perf = np.asarray(action_perf, dtype=np.float32)
+        eval_metrics["update_model_perf_mean"] = update_model_perf.mean().item() if update_model_perf.size else 0.0
+        eval_metrics["update_model_perf_max"] = update_model_perf.max().item() if update_model_perf.size else 0.0
+        eval_metrics["update_model_perf_std"] = update_model_perf.std().item() if update_model_perf.size else 0.0
+        eval_metrics["step_perf_mean"] = step_perf.mean().item() if step_perf.size else 0.0
+        eval_metrics["step_perf_max"] = step_perf.max().item() if step_perf.size else 0.0
+        eval_metrics["step_perf_std"] = step_perf.std().item() if step_perf.size else 0.0
+        eval_metrics["step_perf_q99"] = np.quantile(step_perf, 0.99).item() if step_perf.size else 0.0
+        eval_metrics["step_perf_> thres"] = np.sum(step_perf > 0.041).item() if step_perf.size else 0
+        eval_metrics["action_perf_mean"] = action_perf.mean().item() if action_perf.size else 0.0
+        eval_metrics["action_perf_max"] = action_perf.max().item() if action_perf.size else 0.0
+        eval_metrics["action_perf_std"] = action_perf.std().item() if action_perf.size else 0.0
         logger.info(f"Avr step time: {eval_metrics['step_perf_mean']:.3f}s, actions: {eval_metrics['action_perf_mean']:.4f}s, update: {eval_metrics['update_model_perf_mean']:.3f}s")
         logger.info(f"Max step time: {eval_metrics['step_perf_max']:.3f}s, actions: {eval_metrics['action_perf_max']:.4f}s, update: {eval_metrics['update_model_perf_max']:.3f}s")
         logger.info(f"std step time: {eval_metrics['step_perf_std']:.3f}s, actions: {eval_metrics['action_perf_std']:.4f}s, update: {eval_metrics['update_model_perf_std']:.3f}s")
@@ -735,11 +775,15 @@ class Agent:
         try:
             total_return = 0.0
             for _ in range(self._num_eval_episodes):
+                if hasattr(self._test_env, "set_training_step"):
+                    self._test_env.set_training_step(self._steps)
                 state = self._test_env.reset()
                 episode_return = 0.0
                 done = False
 
                 while (not done):
+                    if hasattr(self._test_env, "set_training_step"):
+                        self._test_env.set_training_step(self._steps)
                     action, shift_action, teacher_shift, shift_source, policy_info = self.select_action_and_shift(state, eval_mode=True, env=self._test_env)
                     self._test_env.set_actions(
                         action,

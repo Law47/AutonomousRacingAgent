@@ -17,6 +17,8 @@ from discor.utils import disable_gradients, soft_update, update_params, \
 import logging
 logger = logging.getLogger(__name__)
 
+SAC_TRAINING_STATE_FILENAME = 'sac_training_state.pth'
+
 class SAC(Algorithm):
 
     def __init__(self, state_dim, action_dim, device, gamma=0.99, nstep=1,
@@ -500,6 +502,105 @@ class SAC(Algorithm):
         assert not entropy.requires_grad
         return torch.mean(self._shift_log_alpha * (entropy - self._shift_target_entropy))
 
+    def training_state_dict(self):
+        state = {
+            "version": 1,
+            "learning_steps": int(self._learning_steps),
+            "log_alpha": self._log_alpha.detach().cpu(),
+            "alpha_optim": self._alpha_optim.state_dict(),
+            "policy_optim": self._policy_optim.state_dict(),
+            "q_optim": self._q_optim.state_dict(),
+            "update_entropy": bool(self.update_entropy),
+        }
+        if self._shift_enabled:
+            state.update({
+                "shift_learning_steps": int(self._shift_learning_steps),
+                "shift_log_alpha": self._shift_log_alpha.detach().cpu(),
+                "shift_alpha_optim": self._shift_alpha_optim.state_dict(),
+                "shift_policy_optim": self._shift_policy_optim.state_dict(),
+                "shift_q_optim": self._shift_q_optim.state_dict(),
+            })
+        return state
+
+    def load_training_state_dict(self, state):
+        if not isinstance(state, dict):
+            logger.warning("SAC training state was %s, expected dict; optimizer state starts fresh", type(state).__name__)
+            return False
+
+        self._learning_steps = int(state.get("learning_steps", self._learning_steps))
+        self.update_entropy = bool(state.get("update_entropy", self.update_entropy))
+
+        log_alpha = state.get("log_alpha", None)
+        if log_alpha is not None:
+            with torch.no_grad():
+                self._log_alpha.copy_(
+                    torch.as_tensor(log_alpha, device=self._device).reshape_as(self._log_alpha)
+                )
+            self._alpha = self._log_alpha.detach().exp()
+
+        for name, optimizer in (
+            ("policy_optim", self._policy_optim),
+            ("q_optim", self._q_optim),
+            ("alpha_optim", self._alpha_optim),
+        ):
+            optim_state = state.get(name, None)
+            if optim_state is not None:
+                try:
+                    optimizer.load_state_dict(optim_state)
+                except ValueError:
+                    logger.warning("Ignoring incompatible SAC optimizer state: %s", name)
+
+        if self._shift_enabled:
+            self._shift_learning_steps = int(
+                state.get("shift_learning_steps", self._shift_learning_steps)
+            )
+            shift_log_alpha = state.get("shift_log_alpha", None)
+            if shift_log_alpha is not None:
+                with torch.no_grad():
+                    self._shift_log_alpha.copy_(
+                        torch.as_tensor(shift_log_alpha, device=self._device).reshape_as(self._shift_log_alpha)
+                    )
+                self._shift_alpha = self._shift_log_alpha.detach().exp()
+
+            for name, optimizer in (
+                ("shift_policy_optim", self._shift_policy_optim),
+                ("shift_q_optim", self._shift_q_optim),
+                ("shift_alpha_optim", self._shift_alpha_optim),
+            ):
+                optim_state = state.get(name, None)
+                if optim_state is not None:
+                    try:
+                        optimizer.load_state_dict(optim_state)
+                    except ValueError:
+                        logger.warning("Ignoring incompatible SAC optimizer state: %s", name)
+
+        logger.info(
+            "loaded SAC training state. learning_steps=%s shift_learning_steps=%s",
+            self._learning_steps,
+            self._shift_learning_steps if self._shift_enabled else 0,
+        )
+        return True
+
+    def save_training_state(self, save_dir):
+        torch.save(
+            self.training_state_dict(),
+            os.path.join(save_dir, SAC_TRAINING_STATE_FILENAME),
+        )
+
+    def load_training_state(self, load_dir):
+        state_path = os.path.join(load_dir, SAC_TRAINING_STATE_FILENAME)
+        if not os.path.exists(state_path):
+            logger.warning(
+                "SAC training state not found at %s; optimizer and entropy states start fresh",
+                state_path,
+            )
+            return False
+        try:
+            state = torch.load(state_path, map_location=self._device, weights_only=True)
+        except TypeError:
+            state = torch.load(state_path, map_location=self._device)
+        return self.load_training_state_dict(state)
+
     def save_models(self, save_dir):
         super().save_models(save_dir)
         self._policy_net.save(os.path.join(save_dir, 'policy_net.pth'))
@@ -509,6 +610,7 @@ class SAC(Algorithm):
             self._shift_policy_net.save(os.path.join(save_dir, 'shift_net.pth'))
             self._shift_online_q_net.save(os.path.join(save_dir, 'shift_online_q_net.pth'))
             self._shift_target_q_net.save(os.path.join(save_dir, 'shift_target_q_net.pth'))
+        self.save_training_state(save_dir)
 
     def load_models(self, load_dir):
         self._policy_net.load(os.path.join(load_dir, 'policy_net.pth'))
@@ -536,6 +638,7 @@ class SAC(Algorithm):
                 )
             if loaded_shift_q and not loaded_shift_target_q:
                 self._shift_target_q_net.load_state_dict(self._shift_online_q_net.state_dict())
+        self.load_training_state(load_dir)
 
     def _load_optional_shift_model(self, model, path, description):
         if not os.path.exists(path):
