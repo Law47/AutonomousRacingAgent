@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Autonomous Racing Agent | Experiment Log</title>
+  <meta name="description" content="A running log of experiments, models, and tools used in the Autonomous Racing Agent project.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="hero">
+    <div class="hero__content">
+      <p class="eyebrow">Autonomous Racing Agent</p>
+      <h1>Project Experiment Log</h1>
+      <p class="hero__text">
+        A public notebook of what we built, what we tested, and what we learned while training
+        an autonomous driver for Assetto Corsa.
+      </p>
+      <a class="hero__button" href="https://github.com" target="_blank" rel="noopener noreferrer">View Repository</a>
+    </div>
+    <div class="hero__shape" aria-hidden="true"></div>
+  </header>
+
+  <main class="layout">
+    <section class="panel">
+      <h2>What This Project Tries To Do</h2>
+      <ul class="checklist">
+        <li>Train an autonomous racing agent from simulator data.</li>
+        <li>Run low-latency control loops for steering, throttle, and brake.</li>
+        <li>Combine imitation learning and reinforcement learning workflows.</li>
+        <li>Continuously evaluate racing behavior and line quality.</li>
+      </ul>
+    </section>
+
+    <section class="panel">
+      <h2>Current Structure</h2>
+      <div class="tag-group">
+        <span class="tag">Environment + Control</span>
+        <span class="tag">Replay + Buffers</span>
+        <span class="tag">DisCor / SAC Models</span>
+        <span class="tag">Racing Line Generation</span>
+        <span class="tag">Reset + Simulator Hooks</span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="heading-row">
+        <h2>Things We Tried</h2>
+        <span class="hint">Update this as you run new experiments</span>
+      </div>
+      <div class="cards">
+        <article class="card card--good">
+          <h3>Imitation Learning Baseline</h3>
+          <p>Initial training and inference path for real-time control integration.</p>
+          <p class="meta">Status: Works and forms the base loop</p>
+        </article>
+
+        <article class="card card--maybe">
+          <h3>DisCor + SAC Pipeline</h3>
+          <p>Explored value correction and off-policy reinforcement learning behavior.</p>
+          <p class="meta">Status: In progress and being tuned</p>
+        </article>
+
+        <article class="card card--maybe">
+          <h3>Racing Line Generation</h3>
+          <p>Generated and tested line artifacts for track-guided driving.</p>
+          <p class="meta">Status: Active experimentation</p>
+        </article>
+
+        <article class="card card--note">
+          <h3>Legacy Experiments</h3>
+          <p>Older scripts and prototypes kept under deprecated modules for reference.</p>
+          <p class="meta">Status: Archived for lessons learned</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Next Updates To Add</h2>
+      <ol class="todo">
+        <li>Lap time comparisons with date and model checkpoint.</li>
+        <li>Track-specific results and failure cases.</li>
+        <li>Training config snapshots for reproducibility.</li>
+        <li>Short videos or GIFs of representative runs.</li>
+      </ol>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <p>Built for GitHub Pages. Edit <code>docs/index.html</code> to keep this log current.</p>
+  </footer>
+</body>
+</html>
