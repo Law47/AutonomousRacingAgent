@@ -187,6 +187,11 @@ def maybe_load_demonstrations(agent: Agent, env, config) -> dict:
     }
 
 
+def should_load_demonstrations(load_path=None, test_mode=False) -> bool:
+    """Demonstrations are only loaded for fresh training runs."""
+    return not load_path and not test_mode
+
+
 def build_sac_kwargs(config):
     sac_kwargs = OmegaConf.to_container(config.SAC, resolve=True)
     shift_config = getattr(config, "ShiftModel", None)
@@ -281,7 +286,7 @@ def main() -> None:
         agent.load(load_path, load_buffer=(not args.test and not args.load_weights_only))
 
     if not args.test:
-        if args.load_path:
+        if not should_load_demonstrations(args.load_path, args.test):
             logger.info(
                 "Skipping demonstration loading/pretraining because --load_path was provided; "
                 "resuming from checkpoint instead."

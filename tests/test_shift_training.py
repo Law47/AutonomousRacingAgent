@@ -17,11 +17,18 @@ if ASSETTO_ROOT not in sys.path:
 if DISCOR_ROOT not in sys.path:
     sys.path.insert(0, DISCOR_ROOT)
 
-from discor.agent import demo_lap_sample_counts, should_keep_demo_transition
+from discor.agent import (
+    checkpoint_step_from_path,
+    demo_lap_sample_counts,
+    merge_env_episode_stats,
+    should_keep_demo_transition,
+    summary_fallback_candidates,
+    sync_env_training_counters,
+)
 from discor.algorithm.sac import SAC
 from discor.network import DiscreteShiftPolicy
 from discor.replay_buffer import ReplayBuffer
-from train import maybe_load_demonstrations
+from train import maybe_load_demonstrations, should_load_demonstrations
 
 
 def set_shift_bias(policy, bias):
@@ -247,6 +254,80 @@ class ShiftTrainingTests(unittest.TestCase):
         self.assertEqual(result["transitions"], 24)
         self.assertEqual(agent.pretrain_calls, [(3, 24)])
         self.assertEqual(agent.shift_pretrain_calls, [(1, 24)])
+
+    def test_resume_training_skips_demonstration_loading(self):
+        self.assertFalse(should_load_demonstrations(load_path="checkpoint", test_mode=False))
+
+    def test_fresh_training_allows_demonstration_loading(self):
+        self.assertTrue(should_load_demonstrations(load_path=None, test_mode=False))
+
+    def test_eval_mode_skips_demonstration_loading(self):
+        self.assertFalse(should_load_demonstrations(load_path=None, test_mode=True))
+
+    def test_summary_fallback_candidates_include_run_root_for_checkpoint(self):
+        checkpoint_path = os.path.join(
+            ROOT,
+            "Outputs",
+            "run",
+            "model",
+            "checkpoints",
+            "step_00001000",
+        )
+
+        candidates = [str(path) for path in summary_fallback_candidates(checkpoint_path)]
+
+        self.assertIn(
+            os.path.join(ROOT, "Outputs", "run", "summary.csv"),
+            candidates,
+        )
+
+    def test_checkpoint_step_can_be_restored_from_path_name(self):
+        checkpoint_path = os.path.join(
+            ROOT,
+            "Outputs",
+            "run",
+            "model",
+            "checkpoints",
+            "step_04800000",
+        )
+
+        self.assertEqual(checkpoint_step_from_path(checkpoint_path), 4_800_000)
+
+    def test_env_total_steps_does_not_overwrite_agent_total_steps(self):
+        merged = merge_env_episode_stats(
+            {
+                "total_steps": 500000,
+                "episode": 12,
+                "ep_reward": 1.0,
+            },
+            {
+                "total_steps": 403,
+                "ep_reward": 2.0,
+                "speed_mean": 50.0,
+            },
+        )
+
+        self.assertEqual(merged["total_steps"], 500000)
+        self.assertEqual(merged["env_total_steps"], 403)
+        self.assertEqual(merged["ep_reward"], 2.0)
+        self.assertEqual(merged["speed_mean"], 50.0)
+
+    def test_sync_env_training_counters_preserves_resume_step(self):
+        class FakeEnv:
+            def __init__(self):
+                self.total_steps = 0
+                self.n_episodes = 0
+                self.training_steps = []
+
+            def set_training_step(self, step):
+                self.training_steps.append(step)
+
+        env = FakeEnv()
+        sync_env_training_counters((env,), steps=12345, episodes=67)
+
+        self.assertEqual(env.total_steps, 12345)
+        self.assertEqual(env.n_episodes, 67)
+        self.assertEqual(env.training_steps, [12345])
 
     def test_demo_transition_filter_rejects_long_lap_and_progress_jump(self):
         trajectory = (

@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 import pickle
+import re
 from pathlib import Path
 from tqdm import tqdm
 from collections.abc import Mapping
@@ -20,6 +21,55 @@ import time
 TRAINING_STATE_FILENAME = 'training_state.pkl'
 CTRL_P = b'\x10'
 SPACE = b' '
+
+
+def summary_fallback_candidates(path):
+    load_path = Path(path)
+    if load_path.is_file():
+        load_path = load_path.parent
+
+    candidates = []
+    for candidate_dir in (load_path, *load_path.parents):
+        candidate = candidate_dir / 'summary.csv'
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def checkpoint_step_from_path(path):
+    for part in reversed(Path(path).parts):
+        match = re.fullmatch(r"step[_-](\d+)", part)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def merge_env_episode_stats(agent_stats, env_stats):
+    merged = dict(agent_stats)
+    if not isinstance(env_stats, Mapping):
+        return merged
+
+    for key, value in env_stats.items():
+        if key == 'total_steps':
+            merged['env_total_steps'] = value
+        else:
+            merged[key] = value
+    return merged
+
+
+def sync_env_training_counters(envs, steps, episodes=None):
+    seen = set()
+    for env in envs:
+        if env is None or id(env) in seen:
+            continue
+        seen.add(id(env))
+
+        if hasattr(env, "total_steps"):
+            env.total_steps = max(int(getattr(env, "total_steps", 0)), int(steps))
+        if episodes is not None and hasattr(env, "n_episodes"):
+            env.n_episodes = max(int(getattr(env, "n_episodes", 0)), int(episodes))
+        if hasattr(env, "set_training_step"):
+            env.set_training_step(int(steps))
 
 
 def cfg_get(config, key, default):
@@ -305,6 +355,7 @@ class Agent:
             state.get('shift_handoff_completed', self._shift_handoff_completed)
         )
         self._configure_replay_source_for_shift_phase()
+        self._sync_env_training_counters()
         logger.info(
             "loaded training state from %s. steps=%s episodes=%s",
             state_path,
@@ -314,12 +365,7 @@ class Agent:
         return True
 
     def _load_summary_training_state(self, path):
-        load_path = Path(path)
-        candidates = [
-            load_path / 'summary.csv',
-            load_path.parent / 'summary.csv',
-            load_path.parent.parent / 'summary.csv',
-        ]
+        candidates = summary_fallback_candidates(path)
         summary_path = next((candidate for candidate in candidates if candidate.exists()), None)
         if summary_path is None:
             return False
@@ -360,11 +406,26 @@ class Agent:
                 self.best_lap_time = float(best_laps.min())
 
         self._configure_replay_source_for_shift_phase()
+        self._sync_env_training_counters()
         logger.info(
             "loaded training counters from summary fallback %s. steps=%s episodes=%s",
             summary_path,
             self._steps,
             self._episodes,
+        )
+        return True
+
+    def _load_checkpoint_path_training_state(self, path):
+        checkpoint_step = checkpoint_step_from_path(path)
+        if checkpoint_step is None:
+            return False
+
+        self._steps = int(checkpoint_step)
+        self._sync_env_training_counters()
+        logger.info(
+            "restored training step %s from checkpoint path %s",
+            self._steps,
+            path,
         )
         return True
 
@@ -405,6 +466,8 @@ class Agent:
         loaded_training_state = self._load_training_state(path)
         if not loaded_training_state:
             loaded_training_state = self._load_summary_training_state(path)
+        if not loaded_training_state:
+            loaded_training_state = self._load_checkpoint_path_training_state(path)
 
         if load_buffer:
             loaded_buffer = False
@@ -454,6 +517,7 @@ class Agent:
                     )
             if not loaded_training_state and loaded_buffer:
                 self._steps = len(self._replay_buffer)
+                self._sync_env_training_counters()
                 logger.info(
                     "No training state found; restored steps from replay buffer occupancy: %s",
                     self._steps,
@@ -463,6 +527,13 @@ class Agent:
                     "No replay buffer was restored. Training can resume collecting new samples, "
                     "but updates will wait until at least one batch is available."
                 )
+
+    def _sync_env_training_counters(self):
+        sync_env_training_counters(
+            (self._env, self._test_env),
+            steps=self._steps,
+            episodes=self._episodes,
+        )
 
     def run(self):
         try:
@@ -910,7 +981,7 @@ class Agent:
         ep_stats['episode'] = self._episodes
         ep_stats['ep_reward'] = episode_return
         ep_stats['ep_steps'] = episode_steps
-        ep_stats.update(env_ep_stats if isinstance(env_ep_stats, dict) else {})
+        ep_stats = merge_env_episode_stats(ep_stats, env_ep_stats)
 
         best_lap = float(env_ep_stats.get("BestLap", np.inf)) if isinstance(env_ep_stats, dict) else np.inf
         if best_lap > 0.0 and best_lap < self.best_lap_time:
