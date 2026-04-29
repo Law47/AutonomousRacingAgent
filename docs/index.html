@@ -1,96 +1,523 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Autonomous Racing Agent | Experiment Log</title>
-  <meta name="description" content="A running log of experiments, models, and tools used in the Autonomous Racing Agent project.">
+  <title>Autonomous Racing Agent</title>
+  <meta name="description" content="A SAC-based autonomous racing agent for Assetto Corsa. Full training log, findings, and lessons learned.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&family=Space+Grotesk:wght@600;700;800&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <header class="hero">
-    <div class="hero__content">
-      <p class="eyebrow">Autonomous Racing Agent</p>
-      <h1>Project Experiment Log</h1>
-      <p class="hero__text">
-        A public notebook of what we built, what we tested, and what we learned while training
-        an autonomous driver for Assetto Corsa.
-      </p>
-      <a class="hero__button" href="https://github.com" target="_blank" rel="noopener noreferrer">View Repository</a>
+
+  <nav class="nav" id="nav">
+    <div class="nav__inner">
+      <ul class="nav__links">
+        <li><a href="#overview">Overview</a></li>
+        <li><a href="#models">Model Log</a></li>
+        <li><a href="#findings">Findings</a></li>
+        <li><a href="#links">Links</a></li>
+        <li><a href="#timeline">Timeline</a></li>
+      </ul>
+      <a class="nav__cta" href="https://github.com/Law47/AutonomousRacingAgent" target="_blank" rel="noopener noreferrer">GitHub</a>
     </div>
-    <div class="hero__shape" aria-hidden="true"></div>
+  </nav>
+
+  <header class="hero">
+    <div class="hero__accent-bar">
+      <span class="bar bar--blue"></span>
+      <span class="bar bar--red"></span>
+      <span class="bar bar--white"></span>
+    </div>
+    <div class="hero__inner">
+      <p class="hero__eyebrow">
+        <span class="dot dot--red"></span>
+        BMW Z4 GT3 &nbsp;&middot;&nbsp; Monza &nbsp;&middot;&nbsp; Assetto Corsa
+      </p>
+      <h1>Autonomous<br>Racing Agent</h1>
+      <p class="hero__sub">
+        A reinforcement learning agent trained to hot lap Monza in the BMW Z4 GT3 using Assetto Corsa as the simulation environment. This page documents the full training process, covering configurations tested, results, and lessons learned.
+      </p>
+      <div class="hero__actions">
+        <a class="btn btn--primary" href="https://github.com/Law47/AutonomousRacingAgent" target="_blank" rel="noopener noreferrer">View Repository</a>
+        <a class="btn btn--ghost" href="#models">Model Training Log</a>
+      </div>
+    </div>
+    <div class="hero__glow" aria-hidden="true"></div>
   </header>
 
-  <main class="layout">
-    <section class="panel">
-      <h2>What This Project Tries To Do</h2>
-      <ul class="checklist">
-        <li>Train an autonomous racing agent from simulator data.</li>
-        <li>Run low-latency control loops for steering, throttle, and brake.</li>
-        <li>Combine imitation learning and reinforcement learning workflows.</li>
-        <li>Continuously evaluate racing behavior and line quality.</li>
-      </ul>
-    </section>
+  <main>
 
-    <section class="panel">
-      <h2>Current Structure</h2>
-      <div class="tag-group">
-        <span class="tag">Environment + Control</span>
-        <span class="tag">Replay + Buffers</span>
-        <span class="tag">DisCor / SAC Models</span>
-        <span class="tag">Racing Line Generation</span>
-        <span class="tag">Reset + Simulator Hooks</span>
+    <!-- OVERVIEW -->
+    <section id="overview" class="section">
+      <div class="section__inner">
+        <h2 class="section__title"><span class="section__num">01</span> System Overview</h2>
+
+        <div class="overview-grid">
+
+          <div class="panel span-2">
+            <h3 class="panel__title">Project Goal</h3>
+            <p>
+              Build an autonomous driving agent capable of consistently hot-lapping within the
+              <strong>top 95% of human lap times</strong> at Monza in the BMW Z4 GT3.
+              The agent observes raw simulator telemetry and outputs control signals injected into the game
+              via a virtual gamepad at 30 Hz, with no vision, no map, just physics state.
+            </p>
+            <p>
+              Beyond raw performance, the model could serve as a vehicle setup testing tool where you change suspension settings
+              and measure the lap time response, or as a reference overlay showing human drivers where time is left on track.
+            </p>
+          </div>
+
+          <div class="panel span-2">
+            <h3 class="panel__title">Model Inputs <span class="panel__note">54 signals &mdash; evolved across runs</span></h3>
+            <p class="panel__desc">The observation space was refined throughout the project. Early runs used a smaller feature set; the full list below reflects the final configuration. All signals are read from Assetto Corsa's shared memory at 30&nbsp;Hz and normalized before being passed to the network.</p>
+            <div class="input-groups">
+              <div class="input-group">
+                <span class="input-group__label">Driver context (fed back)</span>
+                <span class="input-group__vals">Gas &middot; Brake &middot; Gear &middot; RPMs &middot; Steering angle</span>
+              </div>
+              <div class="input-group">
+                <span class="input-group__label">Vehicle dynamics</span>
+                <span class="input-group__vals">Speed &middot; Velocity (x/y/z) &middot; G-Force (x/y/z) &middot; Angular velocity (x/y/z)</span>
+              </div>
+              <div class="input-group">
+                <span class="input-group__label">Orientation &amp; ride</span>
+                <span class="input-group__vals">Heading &middot; Pitch &middot; Roll &middot; CG height &middot; Ride height (front/rear)</span>
+              </div>
+              <div class="input-group">
+                <span class="input-group__label">Per-wheel &times; 4 (FL / FR / RL / RR) &mdash; 28 values</span>
+                <span class="input-group__vals">Slip ratio &middot; Load &middot; Pressure &middot; Angular speed &middot; Core temperature &middot; Camber &middot; Suspension travel</span>
+              </div>
+              <div class="input-group">
+                <span class="input-group__label">Track position</span>
+                <span class="input-group__vals">Normalized position along track &middot; Coordinates (x/y/z) &middot; Tyres out of bounds</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <h3 class="panel__title">Model Outputs</h3>
+            <ul class="spec-list">
+              <li><span class="spec-key">Steering</span><span class="spec-val">&minus;360&deg; &rarr; +360&deg;</span></li>
+              <li><span class="spec-key">Throttle</span><span class="spec-val">0 &rarr; 1</span></li>
+              <li><span class="spec-key">Brake</span><span class="spec-val">0 &rarr; 1</span></li>
+              <li><span class="spec-key">Gear Shift</span><span class="spec-val">up / neutral / down (manual runs)</span></li>
+            </ul>
+          </div>
+
+          <div class="panel">
+            <h3 class="panel__title">Algorithm</h3>
+            <ul class="spec-list">
+              <li><span class="spec-key">Base</span><span class="spec-val">SAC (Soft Actor-Critic)</span></li>
+              <li><span class="spec-key">Correction</span><span class="spec-val">DisCor</span></li>
+              <li><span class="spec-key">Demos</span><span class="spec-val">SAC-fD / behavior cloning (tested)</span></li>
+              <li><span class="spec-key">Curriculum</span><span class="spec-val">Racing line adherence &rarr; lap time</span></li>
+            </ul>
+            <p class="panel__curriculum-note">The curriculum starts with the racing line reward at full weight, rewarding the model for staying close to the optimal racing line. This gets the model moving around the track without needing to worry about pace. Over the first ~100k steps the weight decays to near zero, shifting the primary signal to a speed-based lap time reward. The idea is to first establish track navigation, then optimize for outright pace.</p>
+          </div>
+
+          <div class="panel">
+            <h3 class="panel__title">Infrastructure</h3>
+            <ul class="spec-list">
+              <li><span class="spec-key">Simulator</span><span class="spec-val">Assetto Corsa (Windows)</span></li>
+              <li><span class="spec-key">Physics rate</span><span class="spec-val">30 Hz shared memory</span></li>
+              <li><span class="spec-key">Input method</span><span class="spec-val">ViGEmBus virtual Xbox 360</span></li>
+              <li><span class="spec-key">Framework</span><span class="spec-val">PyTorch + CUDA 12.6</span></li>
+            </ul>
+          </div>
+
+        </div>
       </div>
     </section>
 
-    <section class="panel">
-      <div class="heading-row">
-        <h2>Things We Tried</h2>
-        <span class="hint">Update this as you run new experiments</span>
-      </div>
-      <div class="cards">
-        <article class="card card--good">
-          <h3>Imitation Learning Baseline</h3>
-          <p>Initial training and inference path for real-time control integration.</p>
-          <p class="meta">Status: Works and forms the base loop</p>
-        </article>
+    <!-- MODEL LOG -->
+    <section id="models" class="section section--carbon">
+      <div class="section__inner">
+        <h2 class="section__title"><span class="section__num">02</span> Model Training Log</h2>
+        <p class="section__lead">Every training run in chronological order. All runs are on Monza with the BMW Z4 GT3. ACGym reference lap: <strong>1:51:64</strong>. Our best valid lap: <strong>1:55:35</strong> (Apr&nbsp;26).</p>
+        <div class="callout callout--warn">
+          <strong>Why so few valid laps?</strong> Monza's turn 1 is an extremely heavy braking zone immediately after the start/finish straight. Most models learned to navigate the rest of the circuit but could not modulate braking sharply enough to scrub speed in time. The car would go off-track at turn 1 on every single lap, triggering a reset, which made it impossible to post a clean lap time. A "valid" lap here means the car completed the full circuit without any resets.
+        </div>
 
-        <article class="card card--maybe">
-          <h3>DisCor + SAC Pipeline</h3>
-          <p>Explored value correction and off-policy reinforcement learning behavior.</p>
-          <p class="meta">Status: In progress and being tuned</p>
-        </article>
+        <div class="run-table-wrap">
+          <table class="run-table">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Duration</th>
+                <th>Configuration</th>
+                <th>Best Lap</th>
+                <th>Outcome</th>
+              </tr>
+            </thead>
+            <tbody>
 
-        <article class="card card--maybe">
-          <h3>Racing Line Generation</h3>
-          <p>Generated and tested line artifacts for track-guided driving.</p>
-          <p class="meta">Status: Active experimentation</p>
-        </article>
+              <tr class="row--ref">
+                <td class="td-date">Reference</td>
+                <td>&mdash;</td>
+                <td>ACGym &mdash; SAC fD, TC 3 / ABS 5 (factory defaults)</td>
+                <td class="td-lap">1:51:64</td>
+                <td><span class="badge badge--ref">Benchmark</span></td>
+              </tr>
 
-        <article class="card card--note">
-          <h3>Legacy Experiments</h3>
-          <p>Older scripts and prototypes kept under deprecated modules for reference.</p>
-          <p class="meta">Status: Archived for lessons learned</p>
-        </article>
+              <tr class="row--partial">
+                <td class="td-date">Apr 9</td>
+                <td>11 h &nbsp;/&nbsp; 278 laps</td>
+                <td>Curriculum with gradually decaying racing line reward. TC 3 / ABS 5.</td>
+                <td class="td-lap">1:53:976 *</td>
+                <td><span class="badge badge--warn">Invalid: insufficient braking at turn 1</span></td>
+              </tr>
+
+              <tr class="row--fail">
+                <td class="td-date">Apr 10 &mdash; A</td>
+                <td>8 h</td>
+                <td>Manual shifting. TC / ABS off. Penalty for neutral and reverse gear.</td>
+                <td class="td-lap">&mdash;</td>
+                <td><span class="badge badge--fail">Learned shifts; corner entry quality declined</span></td>
+              </tr>
+
+              <tr class="row--fail">
+                <td class="td-date">Apr 10 &mdash; B</td>
+                <td>9 h</td>
+                <td>Exclusive brake-or-gas output (no simultaneous inputs). TC / ABS off.</td>
+                <td class="td-lap">&mdash;</td>
+                <td><span class="badge badge--fail">Off-track at every heavy braking zone; tires locked without ABS</span></td>
+              </tr>
+
+              <tr class="row--fail">
+                <td class="td-date">Apr 10 &mdash; C</td>
+                <td>9 h (533 min)</td>
+                <td>Manual shifting. TC 3 / ABS 5.</td>
+                <td class="td-lap">&mdash;</td>
+                <td><span class="badge badge--fail">Stood still; random gear shifts throughout</span></td>
+              </tr>
+
+              <tr class="row--partial">
+                <td class="td-date">Apr 11</td>
+                <td>24 h &nbsp;/&nbsp; 1.35 M steps</td>
+                <td>Manual shifting. TC 3 / ABS 5.</td>
+                <td class="td-lap">&mdash;</td>
+                <td><span class="badge badge--warn">Decent on easy corners; hardsends and goes into reverse elsewhere</span></td>
+              </tr>
+
+              <tr class="row--fail">
+                <td class="td-date">Apr 15</td>
+                <td>8 h</td>
+                <td>Demo pretraining first, then RL. Manual shifting. TC 3 / ABS 5.</td>
+                <td class="td-lap">&mdash;</td>
+                <td><span class="badge badge--fail">Bug: demo data shift-up/down encoding was incorrect</span></td>
+              </tr>
+
+              <tr class="row--fail">
+                <td class="td-date">Apr 16 &mdash; A</td>
+                <td>3 h</td>
+                <td>10-epoch behavior cloning pretraining, then SAC. Manual shifting. TC 3 / ABS 5.</td>
+                <td class="td-lap">&mdash;</td>
+                <td><span class="badge badge--fail">Terminated early; model incapable of basic driving</span></td>
+              </tr>
+
+              <tr class="row--fail">
+                <td class="td-date">Apr 17 &mdash; A</td>
+                <td>8 h</td>
+                <td>Vanilla SAC updates on demo replay buffer. Manual shifting. TC / ABS off.</td>
+                <td class="td-lap">&mdash;</td>
+                <td><span class="badge badge--fail">Completed sections of track; reset at every hard braking zone. Knew to downshift entering corners but didn't know braking was required first.</span></td>
+              </tr>
+
+              <tr class="row--fail">
+                <td class="td-date">Apr 17 &mdash; B</td>
+                <td>8 h</td>
+                <td>Behavior cloning from demos. Manual shifting. TC 3 / ABS 5.</td>
+                <td class="td-lap">&mdash;</td>
+                <td><span class="badge badge--fail">Erratic steering; inconsistent shifting</span></td>
+              </tr>
+
+              <tr class="row--fail">
+                <td class="td-date">Apr 20 &mdash; A</td>
+                <td>8 h</td>
+                <td>2-epoch demo pretraining. Manual shifting. TC / ABS off.</td>
+                <td class="td-lap">&mdash;</td>
+                <td><span class="badge badge--fail">Full throttle, turning right; cycled through gears 1&ndash;3 only</span></td>
+              </tr>
+
+              <tr class="row--partial">
+                <td class="td-date">Apr 20 &mdash; B</td>
+                <td>24 h &nbsp;/&nbsp; 2.8 M steps</td>
+                <td>5-epoch demo pretraining. Offline + online buffer split. Manual shifting. TC / ABS on.</td>
+                <td class="td-lap">&mdash;</td>
+                <td><span class="badge badge--warn">Best shifting seen yet; found reward exploit of dive-bombing two corners to maintain speed</span></td>
+              </tr>
+
+              <tr class="row--fail">
+                <td class="td-date">Apr 22</td>
+                <td>8 h &nbsp;/&nbsp; 750 K steps</td>
+                <td>2-epoch demo. 50% offline / 50% online buffer. Manual shifting. TC / ABS off. (Note: AC timer showed only 100 min, suggesting a possible setup issue.)</td>
+                <td class="td-lap">&mdash;</td>
+                <td><span class="badge badge--fail">Held brake and turned wheel; car didn't move</span></td>
+              </tr>
+
+              <tr class="row--good">
+                <td class="td-date">Apr 26</td>
+                <td>24 h &nbsp;/&nbsp; 2 M+ steps</td>
+                <td>No demo pretraining. Auto-shifting for first 1.5 M steps &rarr; manual shifting for remainder. Separate shifter and driver models.</td>
+                <td class="td-lap td-lap--best">1:55:35 &#10003;</td>
+                <td><span class="badge badge--good">Best valid lap. Manual shift phase caused immediate collapse.</span></td>
+              </tr>
+
+              <tr class="row--fail">
+                <td class="td-date">Apr 28</td>
+                <td>11 h &nbsp;/&nbsp; 1.4 M steps</td>
+                <td>Demos on. Offline sampling 15% &rarr; 0.02% over 4 M steps. 1 pretrain epoch. Auto &rarr; manual shifting curriculum.</td>
+                <td class="td-lap">&mdash;</td>
+                <td><span class="badge badge--fail">Brake-heavy; car would not drive</span></td>
+              </tr>
+
+            </tbody>
+          </table>
+        </div>
+
+        <p class="table-note">* Invalid lap time. The car left the track during the lap, so the time does not count toward the benchmark.</p>
       </div>
     </section>
 
-    <section class="panel">
-      <h2>Next Updates To Add</h2>
-      <ol class="todo">
-        <li>Lap time comparisons with date and model checkpoint.</li>
-        <li>Track-specific results and failure cases.</li>
-        <li>Training config snapshots for reproducibility.</li>
-        <li>Short videos or GIFs of representative runs.</li>
-      </ol>
+    <!-- FINDINGS -->
+    <section id="findings" class="section">
+      <div class="section__inner">
+        <h2 class="section__title"><span class="section__num">03</span> Key Findings</h2>
+        <p class="section__lead">What we learned across three months and 14+ training runs.</p>
+
+        <div class="findings-grid">
+
+          <div class="findings-col">
+            <h3 class="findings-heading findings-heading--good">What Worked</h3>
+            <ul class="findings-list">
+              <li>
+                <span class="finding-title">Sync inference to physics packets</span>
+                The single most impactful change in the project. Blocking model inference until each 30 Hz physics packet arrived, rather than running inference on a 30 Hz timer, was the difference between a non-functional and a functional training loop. Before this fix, inputs were at the right frequency but misaligned to the simulator's update window.
+              </li>
+              <li>
+                <span class="finding-title">ABS and TC on during early training</span>
+                Factory defaults (TC 3, ABS 5) produced significantly cleaner control outputs. The model learned to hold full throttle on straights and trail brake cleanly at corner entry. Without driver aids, front tires locked under braking and the model learned to avoid braking altogether rather than modulate it.
+              </li>
+              <li>
+                <span class="finding-title">Auto-shifting before manual shifting</span>
+                Building solid driving fundamentals under auto-shifting for ~1.5 M steps before introducing manual gear selection produced our best result (1:55:35). Every run that introduced manual shifting before the model could drive consistently caused the driving behavior to collapse entirely.
+              </li>
+              <li>
+                <span class="finding-title">Separate shifter and driver models</span>
+                Decoupling the gear-selection network from the driving control network showed promise and is the most promising direction for getting manual shifting to work without degrading driving behavior.
+              </li>
+              <li>
+                <span class="finding-title">Curriculum on racing line adherence</span>
+                Gradually reducing the reward weight on staying near the racing line kept early training stable and directed exploration. A reset penalty in the curriculum helped discourage the model from exploiting short track segments.
+              </li>
+            </ul>
+          </div>
+
+          <div class="findings-col">
+            <h3 class="findings-heading findings-heading--fail">What Didn't Work</h3>
+            <ul class="findings-list">
+              <li>
+                <span class="finding-title">Linux server training</span>
+                ViGEmBus is Windows-only with no Linux equivalent. Assetto Corsa's shared memory interface also differs between OSes. Additionally, training speed gains from the server were marginal since the AC physics simulation runs at real-time and cannot be accelerated without full parallelization across multiple game instances.
+              </li>
+              <li>
+                <span class="finding-title">Behavior cloning pretraining</span>
+                Multiple BC approaches were tried, including 10-epoch pretraining, vanilla SAC updates on a demo buffer, and 2 to 5 epoch BC. All produced erratic steering or a frozen car in the subsequent RL phase. The BC signal didn't transfer well to online learning. One run was also corrupted by a bug in the shift-up/shift-down encoding in the demo data.
+              </li>
+              <li>
+                <span class="finding-title">Training without ABS from the start</span>
+                Without ABS, the model consistently learned to <em>avoid</em> heavy braking to prevent tire lockup rather than learning to modulate braking pressure. The result was a model that couldn't slow down for tight corners and went off-track at every significant braking zone.
+              </li>
+              <li>
+                <span class="finding-title">Reward exploitation</span>
+                In the Apr 20 long run, the model discovered it could maximize the speed-based reward by dive-bombing two corners. The high-speed reward outweighed the off-track penalty enough that the behavior was stable. Proper reward shaping to close this loophole is still an open problem.
+              </li>
+              <li>
+                <span class="finding-title">Manual shifting introduced cold</span>
+                The expanded action space (gear shifts on top of steering/throttle/brake) was too large to explore effectively without a strong driving prior already in place. Every attempt to train manual shifting before the driving fundamentals were solid caused the policy to collapse.
+              </li>
+            </ul>
+          </div>
+
+        </div>
+      </div>
     </section>
+
+    <!-- TIMELINE (collapsible) -->
+    <section id="timeline" class="section">
+      <div class="section__inner">
+        <h2 class="section__title"><span class="section__num">04</span> Project Timeline</h2>
+        <p class="section__lead">Condensed from weekly meeting notes and progress reports.</p>
+
+        <details class="timeline-details">
+          <summary class="timeline-summary">Show full timeline</summary>
+
+          <div class="timeline">
+
+            <div class="tl-item">
+              <div class="tl-date">Jan 16, 2026</div>
+              <div class="tl-body">
+                <h3>Kickoff</h3>
+                <p>Researched existing projects (ACGym, ACRL, NVIDIA presentations). Decided on Monza and the BMW Z4 GT3 as the first test configuration. Used ACTI as a first-pass telemetry tool. The team divided up initial work: one member began building a proprietary data collection pipeline while the other researched imitation learning approaches.</p>
+              </div>
+            </div>
+
+            <div class="tl-item">
+              <div class="tl-date">Week of Jan 19</div>
+              <div class="tl-body">
+                <h3>Data Pipeline + Input Method</h3>
+                <p>Built a custom telemetry collection application. Recorded <strong>15 laps</strong> of Monza at 30 Hz in CSV format, including steering, tire state, actuators, and more. There is no direct steering injection API in Assetto Corsa, so we settled on <strong>ViGEmBus</strong>, a Windows driver that emulates a physical Xbox 360 controller with extremely low latency.</p>
+              </div>
+            </div>
+
+            <div class="tl-item">
+              <div class="tl-date">Jan 23, 2026</div>
+              <div class="tl-body">
+                <h3>First Advisor Meeting</h3>
+                <p>Presented the data pipeline. Confirmed the virtual gamepad approach was the right call. Next milestone: replay recorded telemetry through the virtual controller and compare resulting telemetry to the original to validate the round-trip.</p>
+              </div>
+            </div>
+
+            <div class="tl-item">
+              <div class="tl-date">Weeks 4&ndash;5</div>
+              <div class="tl-body">
+                <h3>ACGym Baseline Replication</h3>
+                <p>Successfully replicated ACGym's training results end-to-end as a sanity check and performance baseline. Learned how to run Assetto Corsa in "headless" mode (reduced resolution, minimized window). Key observation: <strong>the automatic gearbox loses a significant amount of lap time</strong>, and manual shifting is required to compete with human lap times.</p>
+              </div>
+            </div>
+
+            <div class="tl-item">
+              <div class="tl-date">Week 7</div>
+              <div class="tl-body">
+                <h3>Porting to Custom Environment</h3>
+                <p>Goal: move the SAC training loop out of ACGym and into our own codebase. Began designing manual gear-shifting as an additional model output. Started pursuing server access for longer overnight training runs.</p>
+              </div>
+            </div>
+
+            <div class="tl-item tl-item--warn">
+              <div class="tl-date">Mar 20</div>
+              <div class="tl-body">
+                <h3>Linux Server: Dead End</h3>
+                <p>Custom environment running, but after 8 hours the model sat in place and braked. Root cause unknown (curriculum was the main suspect). Linux server training hit multiple hard walls:</p>
+                <ul>
+                  <li><strong>ViGEmBus is Windows-only</strong> and no equivalent driver exists for Linux.</li>
+                  <li>Assetto Corsa's shared memory interface works differently on Linux.</li>
+                  <li>Training speed gains were also limited since the AC physics clock runs at real-time and can't be accelerated without full parallelization.</li>
+                </ul>
+                <p>Decision: establish a working baseline on Windows first.</p>
+              </div>
+            </div>
+
+            <div class="tl-item tl-item--good">
+              <div class="tl-date">Mar 27</div>
+              <div class="tl-body">
+                <h3>Critical Breakthrough: Physics Packet Sync</h3>
+                <p>Built a distilled version of the AC control loop. Identified the core issue blocking progress: <strong>model inference must be explicitly synced to each physics packet arrival.</strong> Previously we ran inference at 30 Hz on a timer, which was the same frequency as physics but not aligned to it. After blocking on packet arrival before each inference call, the model matched or exceeded ACGym performance.</p>
+                <p>Second discovery: training <strong>with ABS and TC enabled</strong> (factory defaults: TC 3, ABS 5) produces dramatically cleaner outputs, including full throttle on straights and clean trail braking at corner entry.</p>
+              </div>
+            </div>
+
+            <div class="tl-item">
+              <div class="tl-date">Apr 10</div>
+              <div class="tl-body">
+                <h3>First Batch of Simultaneous Training Runs</h3>
+                <p>Ran three different configurations overnight in parallel. Empirically confirmed the ABS/TC finding. One run showed the model beginning to learn gear shifts, which was not yet optimal but demonstrated the behavior was learnable.</p>
+              </div>
+            </div>
+
+            <div class="tl-item">
+              <div class="tl-date">Apr 15&ndash;24</div>
+              <div class="tl-body">
+                <h3>Demonstration Pretraining Sprint</h3>
+                <p>Multiple runs exploring behavior cloning and demo-guided SAC. Investigated offline/online buffer ratios. Manual shifting consistently caused trained behavior to collapse. Decoupling a dedicated shifter model from the driving model began to look like the right path forward.</p>
+              </div>
+            </div>
+
+            <div class="tl-item tl-item--good">
+              <div class="tl-date">Apr 26</div>
+              <div class="tl-body">
+                <h3>Best Result: 1:55:35 Valid Lap</h3>
+                <p>Trained with <strong>auto-shifting for ~1.5 million steps</strong> to build driving fundamentals, then transitioned to manual. The auto-shift phase produced the cleanest driving behavior observed and a valid lap of <strong>1:55:35</strong>. The manual shift transition caused immediate collapse.</p>
+              </div>
+            </div>
+
+            <div class="tl-item">
+              <div class="tl-date">Apr 28 (Current)</div>
+              <div class="tl-body">
+                <h3>Latest Run</h3>
+                <p>Demo-assisted run with an automated auto-shifting &rarr; manual-shifting curriculum and decayed offline sampling. The model developed a strong brake preference and the car would not drive. Investigation continues.</p>
+              </div>
+            </div>
+
+          </div><!-- /.timeline -->
+        </details>
+      </div>
+    </section>
+
+    <!-- LINKS -->
+    <section id="links" class="section section--carbon">
+      <div class="section__inner">
+        <h2 class="section__title"><span class="section__num">05</span> Related Links</h2>
+
+        <div class="links-grid">
+
+          <a class="link-card link-card--primary" href="https://github.com/Law47/AutonomousRacingAgent" target="_blank" rel="noopener noreferrer">
+            <span class="link-card__type">Our Repository</span>
+            <span class="link-card__title">AutonomousRacingAgent</span>
+            <span class="link-card__url">github.com/Law47/AutonomousRacingAgent</span>
+          </a>
+
+          <a class="link-card" href="https://assetto-corsa-gym.github.io/" target="_blank" rel="noopener noreferrer">
+            <span class="link-card__type">Competitor / Benchmark</span>
+            <span class="link-card__title">Assetto Corsa Gym (ACGym)</span>
+            <span class="link-card__url">assetto-corsa-gym.github.io</span>
+          </a>
+
+          <a class="link-card" href="https://github.com/dasGringuen/assetto_corsa_gym" target="_blank" rel="noopener noreferrer">
+            <span class="link-card__type">Source</span>
+            <span class="link-card__title">ACGym GitHub</span>
+            <span class="link-card__url">github.com/dasGringuen/assetto_corsa_gym</span>
+          </a>
+
+          <a class="link-card" href="https://arxiv.org/abs/1801.01290" target="_blank" rel="noopener noreferrer">
+            <span class="link-card__type">Paper &mdash; Algorithm</span>
+            <span class="link-card__title">Soft Actor-Critic (SAC)</span>
+            <span class="link-card__url">arxiv.org/abs/1801.01290</span>
+          </a>
+
+          <a class="link-card" href="https://www.youtube.com/watch?v=2oYJQqepRSM" target="_blank" rel="noopener noreferrer">
+            <span class="link-card__type">Talk</span>
+            <span class="link-card__title">NVIDIA &mdash; Autonomous Racing AI</span>
+            <span class="link-card__url">youtube.com/watch?v=2oYJQqepRSM</span>
+          </a>
+
+          <a class="link-card" href="https://github.com/Jurredr/ACRL" target="_blank" rel="noopener noreferrer">
+            <span class="link-card__type">Reference &mdash; Similar Student Project</span>
+            <span class="link-card__title">ACRL (Jurredr)</span>
+            <span class="link-card__url">github.com/Jurredr/ACRL</span>
+          </a>
+
+        </div>
+      </div>
+    </section>
+
   </main>
 
   <footer class="footer">
-    <p>Built for GitHub Pages. Edit <code>docs/index.html</code> to keep this log current.</p>
+    <div class="footer__stripe">
+      <span class="bar bar--blue"></span>
+      <span class="bar bar--red"></span>
+      <span class="bar bar--white"></span>
+    </div>
+    <div class="footer__inner">
+      <span class="footer__name">Autonomous Racing Agent &copy; 2026</span>
+      <span class="footer__sub">BMW Z4 GT3 &nbsp;&middot;&nbsp; Monza &nbsp;&middot;&nbsp; Assetto Corsa</span>
+    </div>
   </footer>
+
 </body>
 </html>
