@@ -116,17 +116,36 @@ def maybe_load_demonstrations(agent: Agent, env, config) -> dict:
 
     total_transitions = 0
     log_steer_ratios = getattr(demo_config, "log_steer_ratios", False)
+    demo_filter_config = getattr(demo_config, "filter", {})
+    if OmegaConf.is_config(demo_filter_config):
+        demo_filter_config = OmegaConf.to_container(demo_filter_config, resolve=True)
     for data_path in data_paths:
         abs_data_path = os.path.abspath(data_path)
-        total_transitions += agent.load_pre_train_data(abs_data_path, env, log_steer_ratios=log_steer_ratios)
+        total_transitions += agent.load_pre_train_data(
+            abs_data_path,
+            env,
+            log_steer_ratios=log_steer_ratios,
+            demo_filter_config=demo_filter_config,
+        )
 
     if total_transitions <= 0:
         raise ValueError("No demonstration transitions were loaded from the configured paths")
 
     pretrain_epochs = int(getattr(demo_config, "pretrain_epochs", 0))
+    shift_pretrain_epochs = int(getattr(demo_config, "shift_pretrain_epochs", 0))
     if pretrain_epochs > 0:
         agent.pre_train_epochs(pretrain_epochs, num_samples=total_transitions)
-        return {"loaded": True, "pretrained": True, "transitions": total_transitions}
+        if shift_pretrain_epochs > 0:
+            agent.pre_train_shift_behavior_clone_epochs(
+                shift_pretrain_epochs,
+                num_samples=total_transitions,
+            )
+        return {
+            "loaded": True,
+            "pretrained": True,
+            "shift_pretrained": True,
+            "transitions": total_transitions,
+        }
 
     legacy_pretrain_steps = int(getattr(demo_config, "pretrain_steps", 0))
     if legacy_pretrain_steps > 0:
@@ -135,10 +154,37 @@ def maybe_load_demonstrations(agent: Agent, env, config) -> dict:
             "Use Demonstrations.pretrain_epochs so each epoch covers the demonstration dataset once."
         )
         agent.pre_train(legacy_pretrain_steps)
-        return {"loaded": True, "pretrained": True, "transitions": total_transitions}
+        if shift_pretrain_epochs > 0:
+            agent.pre_train_shift_behavior_clone_epochs(
+                shift_pretrain_epochs,
+                num_samples=total_transitions,
+            )
+        return {
+            "loaded": True,
+            "pretrained": True,
+            "shift_pretrained": True,
+            "transitions": total_transitions,
+        }
+
+    if shift_pretrain_epochs > 0:
+        agent.pre_train_shift_behavior_clone_epochs(
+            shift_pretrain_epochs,
+            num_samples=total_transitions,
+        )
+        return {
+            "loaded": True,
+            "pretrained": False,
+            "shift_pretrained": True,
+            "transitions": total_transitions,
+        }
 
     logger.info("Demonstrations were loaded, but pretrain_epochs=0 so demo pretraining was skipped.")
-    return {"loaded": True, "pretrained": False, "transitions": total_transitions}
+    return {
+        "loaded": True,
+        "pretrained": False,
+        "shift_pretrained": False,
+        "transitions": total_transitions,
+    }
 
 
 def build_sac_kwargs(config):
@@ -152,6 +198,9 @@ def build_sac_kwargs(config):
             "entropy_lr": "shift_entropy_lr",
             "hidden_units": "shift_hidden_units",
             "loss_weight": "shift_loss_weight",
+            "bc_loss_weight": "shift_bc_loss_weight",
+            "bc_class_weights": "shift_bc_class_weights",
+            "bc_focal_gamma": "shift_bc_focal_gamma",
             "pos_weight": "shift_pos_weight",
             "threshold": "shift_threshold",
             "target_entropy": "shift_target_entropy",
@@ -160,6 +209,22 @@ def build_sac_kwargs(config):
         for source_key, target_key in shift_key_map.items():
             if source_key in shift_config:
                 sac_kwargs[target_key] = shift_config[source_key]
+    demo_learning_config = getattr(config, "DemonstrationLearning", None)
+    if demo_learning_config is not None:
+        demo_learning_config = OmegaConf.to_container(demo_learning_config, resolve=True)
+        demo_key_map = {
+            "actor_bc_loss_weight": "demo_actor_loss_weight",
+            "actor_bc_min_loss_weight": "demo_actor_min_loss_weight",
+            "actor_bc_decay_steps": "demo_actor_decay_steps",
+            "actor_bc_mode": "demo_actor_bc_mode",
+            "actor_bc_temperature": "demo_actor_temperature",
+            "actor_bc_max_weight": "demo_actor_max_weight",
+            "actor_bc_q_filter_margin": "demo_actor_q_filter_margin",
+            "actor_bc_q_filter_warmup_steps": "demo_actor_q_filter_warmup_steps",
+        }
+        for source_key, target_key in demo_key_map.items():
+            if source_key in demo_learning_config:
+                sac_kwargs[target_key] = demo_learning_config[source_key]
     return sac_kwargs
 
 
@@ -204,6 +269,7 @@ def main() -> None:
         seed=config.seed,
         offline_sampling_config=OmegaConf.to_container(getattr(config, "OfflineSampling", {}), resolve=True),
         shift_curriculum_config=OmegaConf.to_container(getattr(config, "ShiftCurriculum", {}), resolve=True),
+        shift_exploration_config=OmegaConf.to_container(getattr(config, "ShiftExploration", {}), resolve=True),
         wandb_logger=None,
         **agent_kwargs,
     )
@@ -224,7 +290,15 @@ def main() -> None:
         else:
             demo_result = maybe_load_demonstrations(agent, env, config)
 
-        wait_for_start(expect_assetto_auto=agent.shift_ac_auto_phase_active())
+        agent.start_online_replay_collection()
+
+        if demo_result.get("loaded", False):
+            logger.info(
+                "Skipping start prompt because demonstration data was loaded; "
+                "training will begin immediately after pretraining."
+            )
+        else:
+            wait_for_start(expect_assetto_auto=agent.shift_ac_auto_phase_active())
 
     if args.test:
         env.set_eval_mode()

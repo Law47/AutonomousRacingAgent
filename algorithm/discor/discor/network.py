@@ -159,10 +159,40 @@ class DiscreteShiftPolicy(BaseNetwork):
             output_dim=self.action_count,
             hidden_units=hidden_units)
 
-    def forward(self, states):
+    def _normalize_action_mask(self, action_mask, batch_size, device):
+        if action_mask is None:
+            return None
+
+        mask = torch.as_tensor(action_mask, dtype=torch.bool, device=device)
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0).expand(batch_size, -1)
+        elif mask.shape[0] != batch_size:
+            mask = mask.expand(batch_size, -1)
+
+        if mask.shape[1] == self.shift_dim:
+            noop_mask = torch.ones((batch_size, 1), dtype=torch.bool, device=device)
+            mask = torch.cat([noop_mask, mask], dim=1)
+        if mask.shape[1] != self.action_count:
+            raise ValueError(
+                f"shift action mask must have {self.action_count} actions "
+                f"or {self.shift_dim} shift pulses, got {mask.shape[1]}"
+            )
+
+        mask = mask.clone()
+        mask[:, 0] = True
+        return mask
+
+    def forward(self, states, action_mask=None):
         assert states.dim() == 2
 
         logits = self.net(states)
+        action_mask = self._normalize_action_mask(
+            action_mask,
+            batch_size=states.shape[0],
+            device=states.device,
+        )
+        if action_mask is not None:
+            logits = logits.masked_fill(~action_mask, -1e9)
         probs = torch.softmax(logits, dim=-1)
         return logits, probs
 
@@ -191,10 +221,23 @@ class DiscreteShiftPolicy(BaseNetwork):
             torch.zeros_like(best_shift_indices),
         )
 
-    def sample(self, states, deterministic=False, threshold=0.5):
-        logits, probs = self.forward(states)
+    def sample(self, states, deterministic=False, threshold=0.5, action_mask=None, epsilon=0.0):
+        logits, probs = self.forward(states, action_mask=action_mask)
         distribution = Categorical(probs=probs)
         sampled_indices = distribution.sample()
         deterministic_indices = self.deterministic_indices(probs, threshold=threshold)
         action_indices = deterministic_indices if deterministic else sampled_indices
+        if epsilon and epsilon > 0.0:
+            action_mask = self._normalize_action_mask(
+                action_mask,
+                batch_size=states.shape[0],
+                device=states.device,
+            )
+            if action_mask is None:
+                action_mask = torch.ones_like(probs, dtype=torch.bool)
+            valid_probs = action_mask.float()
+            valid_probs = valid_probs / valid_probs.sum(dim=-1, keepdim=True).clamp_min(1.0)
+            exploratory_indices = Categorical(probs=valid_probs).sample()
+            explore_mask = torch.rand(states.shape[0], device=states.device) < float(epsilon)
+            action_indices = torch.where(explore_mask, exploratory_indices, action_indices)
         return action_indices, self.action_vectors(action_indices), probs, deterministic_indices

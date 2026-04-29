@@ -15,10 +15,12 @@ class NStepBuffer:
         self._nstep = nstep
         self.reset()
 
-    def append(self, state, action, reward, shift_label):
+    def append(self, state, action, reward, shift_label, shift_weight, demo_weight):
         self._states.append(state)
         self._actions.append(action)
         self._shift_labels.append(shift_label)
+        self._shift_weights.append(shift_weight)
+        self._demo_weights.append(demo_weight)
         self._rewards.append(reward)
 
     def get(self):
@@ -27,8 +29,10 @@ class NStepBuffer:
         state = self._states.popleft()
         action = self._actions.popleft()
         shift_label = self._shift_labels.popleft()
+        shift_weight = self._shift_weights.popleft()
+        demo_weight = self._demo_weights.popleft()
         reward = self._nstep_reward()
-        return state, action, shift_label, reward
+        return state, action, shift_label, shift_weight, demo_weight, reward
 
     def _nstep_reward(self):
         reward = np.sum([
@@ -40,6 +44,8 @@ class NStepBuffer:
         self._states = deque(maxlen=self._nstep)
         self._actions = deque(maxlen=self._nstep)
         self._shift_labels = deque(maxlen=self._nstep)
+        self._shift_weights = deque(maxlen=self._nstep)
+        self._demo_weights = deque(maxlen=self._nstep)
         self._rewards = deque(maxlen=self._nstep)
 
     def is_empty(self):
@@ -81,6 +87,8 @@ class ReplayBuffer:
             (self._memory_size, ) + self._action_shape, dtype=np.float32)
         self._shift_labels = np.empty(
             (self._memory_size, ) + self._shift_shape, dtype=np.float32)
+        self._shift_weights = np.empty((self._memory_size, 1), dtype=np.float32)
+        self._demo_weights = np.empty((self._memory_size, 1), dtype=np.float32)
 
         self._rewards = np.empty((self._memory_size, 1), dtype=np.float32)
         self._dones = np.empty((self._memory_size, 1), dtype=np.float32)
@@ -92,18 +100,22 @@ class ReplayBuffer:
     def __getstate__(self):
         state = self.__dict__.copy()
         serialized_n = int(self._n)
-        for key in ("_states", "_next_states", "_actions", "_shift_labels", "_rewards", "_dones"):
+        for key in ("_states", "_next_states", "_actions", "_shift_labels", "_shift_weights", "_demo_weights", "_rewards", "_dones"):
             state[key] = state[key][:serialized_n].copy()
         state["_serialized_n"] = serialized_n
         return state
 
     def __setstate__(self, state):
         serialized_n = int(state.pop("_serialized_n", state.get("_n", 0)))
-        saved_arrays = {
-            key: state.pop(key)
-            for key in ("_states", "_next_states", "_actions", "_shift_labels", "_rewards", "_dones")
-        }
+        array_keys = ("_states", "_next_states", "_actions", "_shift_labels", "_shift_weights", "_demo_weights", "_rewards", "_dones")
+        saved_arrays = {key: state.pop(key) for key in array_keys if key in state}
         self.__dict__.update(state)
+        if self._nstep != 1 and (
+            not hasattr(self, "_nstep_buffer")
+            or not hasattr(self._nstep_buffer, "_shift_weights")
+            or not hasattr(self._nstep_buffer, "_demo_weights")
+        ):
+            self._nstep_buffer = NStepBuffer(self._gamma, self._nstep)
 
         self._states = np.empty(
             (self._memory_size, ) + self._state_shape, dtype=np.float32)
@@ -113,6 +125,8 @@ class ReplayBuffer:
             (self._memory_size, ) + self._action_shape, dtype=np.float32)
         self._shift_labels = np.empty(
             (self._memory_size, ) + self._shift_shape, dtype=np.float32)
+        self._shift_weights = np.empty((self._memory_size, 1), dtype=np.float32)
+        self._demo_weights = np.empty((self._memory_size, 1), dtype=np.float32)
         self._rewards = np.empty((self._memory_size, 1), dtype=np.float32)
         self._dones = np.empty((self._memory_size, 1), dtype=np.float32)
 
@@ -122,6 +136,14 @@ class ReplayBuffer:
             self._next_states[:copy_n] = saved_arrays["_next_states"][:copy_n]
             self._actions[:copy_n] = saved_arrays["_actions"][:copy_n]
             self._shift_labels[:copy_n] = saved_arrays["_shift_labels"][:copy_n]
+            if "_shift_weights" in saved_arrays:
+                self._shift_weights[:copy_n] = saved_arrays["_shift_weights"][:copy_n]
+            else:
+                self._shift_weights[:copy_n] = 1.0
+            if "_demo_weights" in saved_arrays:
+                self._demo_weights[:copy_n] = saved_arrays["_demo_weights"][:copy_n]
+            else:
+                self._demo_weights[:copy_n] = 0.0
             self._rewards[:copy_n] = saved_arrays["_rewards"][:copy_n]
             self._dones[:copy_n] = saved_arrays["_dones"][:copy_n]
 
@@ -131,34 +153,44 @@ class ReplayBuffer:
         else:
             self._p = self._n
 
-    def append(self, state, action, reward, next_state, terminated, episode_done=None, shift_label=None):
+    def append(self, state, action, reward, next_state, terminated, episode_done=None, shift_label=None, shift_weight=None, demo_weight=None):
         """
         done (masked_done): False if the agent reach time horizons. Else = done
         """
         if shift_label is None:
             shift_label = np.zeros(self._shift_shape, dtype=np.float32)
+            if shift_weight is None:
+                shift_weight = 0.0
         else:
             shift_label = np.asarray(shift_label, dtype=np.float32).reshape(self._shift_shape)
+            if shift_weight is None:
+                shift_weight = 1.0
+        shift_weight = np.asarray(shift_weight, dtype=np.float32).reshape(1)
+        if demo_weight is None:
+            demo_weight = 0.0
+        demo_weight = np.asarray(demo_weight, dtype=np.float32).reshape(1)
 
         if self._nstep != 1:
-            self._nstep_buffer.append(state, action, reward, shift_label)
+            self._nstep_buffer.append(state, action, reward, shift_label, shift_weight, demo_weight)
 
             if self._nstep_buffer.is_full():
-                state, action, shift_label, reward = self._nstep_buffer.get()
-                self._append(state, action, shift_label, reward, next_state, terminated)
+                state, action, shift_label, shift_weight, demo_weight, reward = self._nstep_buffer.get()
+                self._append(state, action, shift_label, shift_weight, demo_weight, reward, next_state, terminated)
 
             if terminated or episode_done:
                 while not self._nstep_buffer.is_empty():
-                    state, action, shift_label, reward = self._nstep_buffer.get()
-                    self._append(state, action, shift_label, reward, next_state, terminated)
+                    state, action, shift_label, shift_weight, demo_weight, reward = self._nstep_buffer.get()
+                    self._append(state, action, shift_label, shift_weight, demo_weight, reward, next_state, terminated)
 
         else:
-            self._append(state, action, shift_label, reward, next_state, terminated)
+            self._append(state, action, shift_label, shift_weight, demo_weight, reward, next_state, terminated)
 
-    def _append(self, state, action, shift_label, reward, next_state, done):
+    def _append(self, state, action, shift_label, shift_weight, demo_weight, reward, next_state, done):
         self._states[self._p, ...] = state
         self._actions[self._p, ...] = action
         self._shift_labels[self._p, ...] = shift_label
+        self._shift_weights[self._p, ...] = shift_weight
+        self._demo_weights[self._p, ...] = demo_weight
         self._rewards[self._p, ...] = reward
         self._next_states[self._p, ...] = next_state
         self._dones[self._p, ...] = done
@@ -197,6 +229,10 @@ class ReplayBuffer:
             self._actions[idxes], dtype=torch.float, device=device)
         shift_labels = torch.tensor(
             self._shift_labels[idxes], dtype=torch.float, device=device)
+        shift_weights = torch.tensor(
+            self._shift_weights[idxes], dtype=torch.float, device=device)
+        demo_weights = torch.tensor(
+            self._demo_weights[idxes], dtype=torch.float, device=device)
         rewards = torch.tensor(
             self._rewards[idxes], dtype=torch.float, device=device)
         dones = torch.tensor(
@@ -204,7 +240,7 @@ class ReplayBuffer:
         next_states = torch.tensor(
             self._next_states[idxes], dtype=torch.float, device=device)
 
-        return states, actions, shift_labels, rewards, next_states, dones
+        return states, actions, shift_labels, shift_weights, demo_weights, rewards, next_states, dones
 
     def __len__(self):
         return self._n
@@ -228,11 +264,11 @@ class EnsembleBuffer(ReplayBuffer):
         if enable:
             logger.info("Switching to Online buffer.")
 
-    def append(self, state, action, reward, next_state, terminated, episode_done=None, shift_label=None):
+    def append(self, state, action, reward, next_state, terminated, episode_done=None, shift_label=None, shift_weight=None, demo_weight=None):
         if self._online:
-            super().append(state, action, reward, next_state, terminated, episode_done, shift_label)
+            super().append(state, action, reward, next_state, terminated, episode_done, shift_label, shift_weight, demo_weight)
         else:
-            self._offline.append(state, action, reward, next_state, terminated, episode_done, shift_label)
+            self._offline.append(state, action, reward, next_state, terminated, episode_done, shift_label, shift_weight, demo_weight)
 
     def __len__(self):
         offline_len = len(self._offline)

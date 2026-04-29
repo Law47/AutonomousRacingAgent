@@ -30,13 +30,80 @@ def cfg_get(config, key, default):
     return getattr(config, key, default)
 
 
+def demo_lap_sample_counts(trajectory):
+    counts = {}
+    for state in trajectory:
+        lap = state.get("LapCount", None)
+        counts[lap] = counts.get(lap, 0) + 1
+    return counts
+
+
+def demo_progress_delta(previous_state, current_state, track_length):
+    if previous_state is None or current_state is None:
+        return 0.0, False
+
+    current_dist = float(
+        current_state.get(
+            "LapDist",
+            track_length * float(current_state.get("NormalizedSplinePosition", 0.0)),
+        )
+    )
+    previous_dist = float(
+        previous_state.get(
+            "LapDist",
+            track_length * float(previous_state.get("NormalizedSplinePosition", 0.0)),
+        )
+    )
+    raw_delta = current_dist - previous_dist
+    wrapped_forward = False
+    if raw_delta < -0.5 * track_length:
+        raw_delta += track_length
+        wrapped_forward = True
+    elif raw_delta > 0.5 * track_length:
+        raw_delta -= track_length
+    return raw_delta, wrapped_forward
+
+
+def should_keep_demo_transition(previous_state, current_state, lap_counts, filter_config, track_length):
+    if not cfg_get(filter_config, "enabled", False):
+        return True, "kept"
+
+    max_lap_samples = cfg_get(filter_config, "max_lap_samples", None)
+    if max_lap_samples is not None:
+        max_lap_samples = int(max_lap_samples)
+        previous_lap = previous_state.get("LapCount", None) if previous_state else None
+        current_lap = current_state.get("LapCount", None) if current_state else None
+        if lap_counts.get(previous_lap, 0) > max_lap_samples or lap_counts.get(current_lap, 0) > max_lap_samples:
+            return False, "long_lap"
+
+    min_speed_ms = cfg_get(filter_config, "min_speed_ms", None)
+    if min_speed_ms is not None:
+        previous_speed = float(previous_state.get("speed", 0.0)) if previous_state else 0.0
+        current_speed = float(current_state.get("speed", 0.0)) if current_state else 0.0
+        if previous_speed < float(min_speed_ms) and current_speed < float(min_speed_ms):
+            return False, "low_speed"
+
+    max_abs_progress_delta_m = cfg_get(filter_config, "max_abs_progress_delta_m", None)
+    if max_abs_progress_delta_m is not None and previous_state is not None:
+        progress_delta, _wrapped_forward = demo_progress_delta(
+            previous_state,
+            current_state,
+            track_length,
+        )
+        if abs(progress_delta) > float(max_abs_progress_delta_m):
+            return False, "progress_jump"
+
+    return True, "kept"
+
+
 class Agent:
     def __init__(self, env, test_env, algo, log_dir, device, num_steps=3000000,
                  batch_size=256, memory_size=1_000_000,
                  update_interval=1, start_steps=10000, log_interval=10, checkpoint_freq=0,
                  eval_interval=5000, num_eval_episodes=5, seed=0, use_offline_buffer=False, offline_buffer_size=1_000_000,
                  start_steps_count="online_steps", offline_sampling_config=None,
-                 shift_curriculum_config=None, wandb_logger=None, save_final_buffer=False,
+                 shift_curriculum_config=None, shift_exploration_config=None,
+                 wandb_logger=None, save_final_buffer=False,
                  save_checkpoint_buffer=False):
 
         # Environment.
@@ -117,10 +184,38 @@ class Agent:
                 "Turn off Assetto Corsa automatic shifting, then press SPACE to continue training.",
             )
         )
+        self._shift_handoff_bc_updates = max(
+            int(cfg_get(shift_curriculum_config, "handoff_bc_updates", 0)),
+            0,
+        )
+        self._shift_execute_deterministic = bool(
+            cfg_get(shift_exploration_config, "execute_deterministic", True)
+        )
+        self._shift_initial_epsilon = max(
+            float(cfg_get(shift_exploration_config, "initial_epsilon", 0.0)),
+            0.0,
+        )
+        self._shift_final_epsilon = max(
+            float(cfg_get(shift_exploration_config, "final_epsilon", 0.0)),
+            0.0,
+        )
+        self._shift_epsilon_decay_steps = max(
+            int(cfg_get(shift_exploration_config, "epsilon_decay_steps", 1)),
+            1,
+        )
+        self._shift_prevent_low_gear_downshift = bool(
+            cfg_get(shift_exploration_config, "prevent_low_gear_downshift", True)
+        )
+        self._shift_min_downshift_gear = int(
+            cfg_get(shift_exploration_config, "min_downshift_gear", 2)
+        )
+        max_shift_gear = cfg_get(shift_exploration_config, "max_gear", 6)
+        self._shift_max_gear = int(max_shift_gear) if max_shift_gear is not None else None
         self._shift_handoff_completed = (not self._shift_curriculum_enabled) or self._shift_auto_only_steps <= 0
         self._paused = False
         self._loaded_model = False
         self._assetto_auto_shift_source_gear = None
+        self._collect_online_experience = False
         self._configure_replay_source_for_shift_phase()
 
         self.best_lap_time = np.inf
@@ -435,6 +530,27 @@ class Agent:
         batch = self.sample_replay_batch()
         return self._algo.update_shift_behavior_clone_from_batch(batch, self._writer)
 
+    def train_shift_behavior_clone_updates(self, num_updates, desc="Shift behavior clone"):
+        num_updates = int(num_updates)
+        if num_updates <= 0:
+            return 0
+        if not self.can_update_shift_model():
+            logger.warning(
+                "Skipping shift behavior cloning because replay buffer has %s samples, "
+                "but batch_size is %s.",
+                len(self._replay_buffer),
+                self._batch_size,
+            )
+            return 0
+
+        updates = 0
+        for _ in tqdm(range(num_updates), desc=desc):
+            batch = self.sample_replay_batch()
+            self._algo.update_shift_behavior_clone_from_batch(batch, self._writer)
+            updates += 1
+        self._writer.flush()
+        return updates
+
     def offline_sample_ratio(self):
         if not self._use_offline_buffer or not self._offline_sampling_enabled:
             return 0.0
@@ -455,9 +571,47 @@ class Agent:
     def shift_rl_training_enabled(self):
         return not self.shift_ac_auto_phase_active(eval_mode=False)
 
+    def shift_exploration_epsilon(self):
+        if self.shift_ac_auto_phase_active(eval_mode=False):
+            return 0.0
+        manual_steps = max(self._steps - self._shift_auto_only_steps, 0)
+        progress = min(manual_steps / self._shift_epsilon_decay_steps, 1.0)
+        epsilon = self._shift_initial_epsilon + (
+            (self._shift_final_epsilon - self._shift_initial_epsilon) * progress
+        )
+        return float(np.clip(epsilon, 0.0, 1.0))
+
+    def shift_action_mask(self, env=None):
+        active_env = env if env is not None else self._env
+        shift_dim = getattr(active_env, "shift_action_dim", 2)
+        mask = np.ones(shift_dim + 1, dtype=bool)
+        state = getattr(active_env, "state", None) or {}
+        gear = state.get("actualGear", None)
+        if gear is None:
+            return mask
+
+        try:
+            gear = int(gear)
+        except (TypeError, ValueError):
+            return mask
+
+        if shift_dim >= 1 and self._shift_max_gear is not None and gear >= self._shift_max_gear:
+            mask[1] = False
+        if shift_dim >= 2 and self._shift_prevent_low_gear_downshift and gear <= self._shift_min_downshift_gear:
+            mask[2] = False
+        mask[0] = True
+        return mask
+
     def _configure_replay_source_for_shift_phase(self):
         if isinstance(self._replay_buffer, EnsembleBuffer):
-            self._replay_buffer.online(self.shift_rl_training_enabled())
+            self._replay_buffer.online(
+                getattr(self, "_collect_online_experience", False)
+                or self.shift_rl_training_enabled()
+            )
+
+    def start_online_replay_collection(self):
+        self._collect_online_experience = True
+        self._configure_replay_source_for_shift_phase()
 
     def _read_key(self):
         if os.name != "nt":
@@ -523,6 +677,16 @@ class Agent:
         ):
             return
 
+        if self._shift_handoff_bc_updates > 0:
+            logger.info(
+                "Running %s shift behavior-clone updates before manual handoff.",
+                self._shift_handoff_bc_updates,
+            )
+            self.train_shift_behavior_clone_updates(
+                self._shift_handoff_bc_updates,
+                desc="Shift handoff BC",
+            )
+
         self._wait_for_space(self._shift_handoff_prompt)
         self._shift_handoff_completed = True
         self._configure_replay_source_for_shift_phase()
@@ -569,6 +733,7 @@ class Agent:
 
     def select_action_and_shift(self, state, eval_mode=False, env=None):
         active_env = env if env is not None else self._env
+        shift_action_mask = self.shift_action_mask(active_env)
         if (not eval_mode) and (not self.has_min_experience()):
             action = active_env.action_space.sample()
             policy_info = {
@@ -578,9 +743,17 @@ class Agent:
             }
         else:
             if eval_mode:
-                action, policy_info = self._algo.exploit(state)
+                action, policy_info = self._algo.exploit(
+                    state,
+                    shift_action_mask=shift_action_mask,
+                )
             else:
-                action, policy_info = self._algo.explore(state)
+                action, policy_info = self._algo.explore(
+                    state,
+                    shift_deterministic=self._shift_execute_deterministic,
+                    shift_epsilon=self.shift_exploration_epsilon(),
+                    shift_action_mask=shift_action_mask,
+                )
 
         zero_shift = np.zeros(getattr(active_env, "shift_action_dim", 2), dtype=np.float32)
         manual_shift = np.asarray(policy_info.get("shift_action", zero_shift), dtype=np.float32)
@@ -664,8 +837,10 @@ class Agent:
                         getattr(self._env, "state", {}),
                     )
                     self.record_shift_teacher_for_latest_state(replay_shift_action)
+                    replay_shift_weight = 1.0
                 else:
                     replay_shift_action = shift_action
+                    replay_shift_weight = 0.0
                 step_perf.append(time.perf_counter() - step_start_time)
                 step_start_time = time.perf_counter()
 
@@ -684,7 +859,9 @@ class Agent:
                 self._replay_buffer.append(
                     state, action, reward, next_state, masked_done,
                     episode_done=rb_done,
-                    shift_label=replay_shift_action)
+                    shift_label=replay_shift_action,
+                    shift_weight=replay_shift_weight,
+                    demo_weight=0.0)
 
                 self._steps += 1
                 episode_steps += 1
@@ -698,6 +875,11 @@ class Agent:
                 self._writer.add_scalar(
                     'curriculum/shift_rl_training_enabled',
                     float(self.shift_rl_training_enabled()),
+                    self._steps,
+                )
+                self._writer.add_scalar(
+                    'curriculum/shift_exploration_epsilon',
+                    self.shift_exploration_epsilon(),
                     self._steps,
                 )
 
@@ -841,15 +1023,24 @@ class Agent:
                 self._writer.add_scalar(f'episodes/{tag}', float(value), self._steps)
         self._writer.flush()
 
-    def load_pre_train_data(self, trajs_path, env, log_steer_ratios=False):
+    def load_pre_train_data(self, trajs_path, env, log_steer_ratios=False, demo_filter_config=None):
         total_added_episodes = 0
         total_added_transitions = 0
+        total_skipped_transitions = 0
         load_start_time = time.time()
 
         buffer_size_before = len(self._replay_buffer)
         env_data = DataLoader(env, trajs_path, log_steer_ratios=log_steer_ratios)
         for ep in tqdm(range(env_data.trajectories_count)[:], desc="Loading demo trajectories"):
             state = env_data.reset()
+            lap_counts = demo_lap_sample_counts(env_data.trajectory)
+            filter_stats = {}
+            track_length = float(
+                env_data.static_info.get(
+                    "TrackLength",
+                    getattr(env, "track_length", 1.0),
+                )
+            )
 
             total_added_episodes += 1
             trajectory_steps = max(len(env_data.trajectory) - 1, 0)
@@ -867,6 +1058,18 @@ class Agent:
             for i in step_progress:
                 action = env_data.act()
                 next_state, reward, done, info = env_data.step(action)
+                current_index = max(env_data.current_step - 1, 0)
+                previous_index = max(current_index - 1, 0)
+                previous_raw_state = env_data.trajectory[previous_index] if previous_index < len(env_data.trajectory) else None
+                current_raw_state = env_data.trajectory[current_index] if current_index < len(env_data.trajectory) else None
+                keep_transition, filter_reason = should_keep_demo_transition(
+                    previous_raw_state,
+                    current_raw_state,
+                    lap_counts,
+                    demo_filter_config,
+                    track_length,
+                )
+                filter_stats[filter_reason] = filter_stats.get(filter_reason, 0) + 1
 
                 if info['terminated']:
                     terminated = True
@@ -879,6 +1082,13 @@ class Agent:
                 else:
                     episode_done = False # use the termination signal from the environment
 
+                if not keep_transition:
+                    total_skipped_transitions += 1
+                    state = next_state
+                    if episode_done:
+                        break
+                    continue
+
                 shift_label = info.get("shift_label", getattr(env_data, "shift_label", None))
                 self._replay_buffer.append(
                     state,
@@ -888,20 +1098,33 @@ class Agent:
                     terminated=terminated,
                     episode_done=episode_done,
                     shift_label=shift_label,
+                    shift_weight=1.0 if shift_label is not None else 0.0,
+                    demo_weight=1.0,
                 )
                 total_added_transitions += 1
                 state = next_state
                 if episode_done:
                     break
             step_progress.close()
+            skipped = sum(count for reason, count in filter_stats.items() if reason != "kept")
+            if skipped:
+                logger.info(
+                    "Demo trajectory filter skipped %s/%s transitions from %s: %s",
+                    skipped,
+                    trajectory_steps,
+                    env_data.trajectories_paths[ep],
+                    filter_stats,
+                )
         added_transitions = len(self._replay_buffer) - buffer_size_before
         self._demo_transition_count += added_transitions
         load_elapsed = time.time() - load_start_time
         logger.info(
-            "Loaded %s demonstration episodes from %s. Added %s transitions. Buffer size: %s. Took %.1fs",
+            "Loaded %s demonstration episodes from %s. Added %s transitions, "
+            "skipped %s transitions. Buffer size: %s. Took %.1fs",
             total_added_episodes,
             trajs_path,
             added_transitions,
+            total_skipped_transitions,
             len(self._replay_buffer),
             load_elapsed,
         )
@@ -958,6 +1181,54 @@ class Agent:
             self._algo.update_entropy = True
 
         logger.info("Finished demonstration pre-training with %s total updates", total_updates)
+        return total_updates
+
+    def pre_train_shift_behavior_clone_epochs(self, num_epochs, num_samples=None):
+        if len(self._replay_buffer) == 0:
+            raise ValueError("Cannot pre-train shifter without demonstration data in the replay buffer")
+
+        num_epochs = int(num_epochs)
+        if num_epochs <= 0:
+            logger.info("Skipping shifter demonstration pre-training because num_epochs=%s", num_epochs)
+            return 0
+
+        if num_samples is None:
+            num_samples = self._demo_transition_count or len(self._replay_buffer)
+        num_samples = min(int(num_samples), len(self._replay_buffer))
+        if num_samples <= 0:
+            raise ValueError("Cannot pre-train shifter without demonstration transitions")
+
+        total_updates = 0
+        logger.info(
+            "Pre-training shifter behavior clone from demonstrations for %s epochs "
+            "over %s samples (batch_size=%s)",
+            num_epochs,
+            num_samples,
+            self._batch_size,
+        )
+        for epoch in range(num_epochs):
+            epoch_updates = 0
+            progress = tqdm(
+                self._replay_buffer.iter_batches(
+                    self._batch_size,
+                    self._device,
+                    num_samples=num_samples,
+                    shuffle=True,
+                ),
+                desc=f"Shift demo epoch {epoch + 1}/{num_epochs}",
+            )
+            for batch in progress:
+                self._algo.update_shift_behavior_clone_from_batch(batch, self._writer)
+                epoch_updates += 1
+                total_updates += 1
+            logger.info(
+                "Finished shifter demonstration epoch %s/%s with %s updates",
+                epoch + 1,
+                num_epochs,
+                epoch_updates,
+            )
+
+        logger.info("Finished shifter demonstration pre-training with %s total updates", total_updates)
         return total_updates
 
     def pre_train(self, num_updates=None):

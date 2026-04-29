@@ -5,11 +5,11 @@ Agent:
   num_steps: 12_000_000
   batch_size: 256
   memory_size: 5_000_000
-  offline_buffer_size: 750_000
+  offline_buffer_size: 1_250_000
   use_offline_buffer: True
   update_interval: 1
+  start_steps_count: "online_steps"
   start_steps: 5000
-  start_steps_count: "replay_buffer"
   log_interval: 10
   eval_interval: 0
   num_eval_episodes: 1
@@ -19,15 +19,25 @@ Agent:
 
 OfflineSampling:
   enabled: True
-  initial_offline_ratio: 0.35
+  initial_offline_ratio: 0.6
   final_offline_ratio: 0.05
-  transition_steps: 4_000_000
+  transition_steps: 3_000_000
 
 ShiftCurriculum:
   enabled: True
   auto_only_steps: 1_500_000
   eval_use_manual: False
+  handoff_bc_updates: 5000
   handoff_prompt: "Turn off Assetto Corsa automatic shifting, then press SPACE to continue training."
+
+ShiftExploration:
+  execute_deterministic: True
+  initial_epsilon: 0.02
+  final_epsilon: 0.0
+  epsilon_decay_steps: 1_000_000
+  prevent_low_gear_downshift: True
+  min_downshift_gear: 2
+  max_gear: 6
 
 SAC:
   gamma: 0.997
@@ -44,19 +54,38 @@ SAC:
 ShiftModel:
   enabled: True
   lr: 0.0003
-  entropy_lr: 0.0003
+  entropy_lr: 0.0001
   hidden_units: [256, 256, 256]
-  threshold: 0.5
-  target_entropy: 0.2
+  threshold: 0.65
+  target_entropy: 0.05
   reward_scale: 1.0
+  bc_loss_weight: 0.5
+  bc_class_weights: [0.15, 6.0, 6.0]
+  bc_focal_gamma: 1.5
 
 Demonstrations:
   enabled: True
   data_path: null
   data_paths:
-    - "C:\\Users\\Leo\\Documents\\Github\\AutonomousRacingAgent\\demonstrations\\session_01"
-  pretrain_epochs: 3
+    - "C:\\Users\\Leo\\Documents\\Github\\AutonomousRacingAgent\\demonstrations\\session_02"
+  pretrain_epochs: 0
+  shift_pretrain_epochs: 1
   log_steer_ratios: False
+  filter:
+    enabled: True
+    max_lap_samples: 4000
+    max_abs_progress_delta_m: 20.0
+    min_speed_ms: 1.0
+
+DemonstrationLearning:
+  actor_bc_loss_weight: 0.05
+  actor_bc_min_loss_weight: 0.0
+  actor_bc_decay_steps: 2_000_000
+  actor_bc_mode: "awac_q_filter"
+  actor_bc_temperature: 2.0
+  actor_bc_max_weight: 20.0
+  actor_bc_q_filter_margin: 0.0
+  actor_bc_q_filter_warmup_steps: 2000
 
 AssettoCorsa:
   ego_sampling_freq: 25
@@ -90,8 +119,8 @@ AssettoCorsa:
   use_obs_extra: False
 
   ShiftExecution:
-    threshold: 0.5
-    cooldown_s: 0.12
+    threshold: 0.65
+    cooldown_s: 0.20
     prevent_reverse_downshift: True
 
   Curriculum:

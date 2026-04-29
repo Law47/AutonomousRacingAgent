@@ -27,9 +27,17 @@ class SAC(Algorithm):
                   target_update_coef=0.005, log_interval=10, seed=0,
                   target_entropy=None, shift_enabled=True, shift_lr=0.0003,
                   shift_hidden_units=[256, 256], shift_dim=2,
-                  shift_loss_weight=1.0, shift_pos_weight=None,
-                  shift_threshold=0.5, shift_entropy_lr=None,
-                  shift_target_entropy=0.2, shift_reward_scale=1.0):
+                  shift_loss_weight=0.0, shift_pos_weight=None,
+                  shift_bc_loss_weight=None, shift_bc_class_weights=None,
+                  shift_bc_focal_gamma=0.0, shift_threshold=0.5,
+                  shift_entropy_lr=None, shift_target_entropy=0.2,
+                  shift_reward_scale=1.0, demo_actor_loss_weight=0.0,
+                  demo_actor_min_loss_weight=0.0, demo_actor_decay_steps=0,
+                  demo_actor_bc_mode="q_filter",
+                  demo_actor_temperature=2.0,
+                  demo_actor_max_weight=20.0,
+                  demo_actor_q_filter_margin=0.0,
+                  demo_actor_q_filter_warmup_steps=1000):
         super().__init__(
             state_dim, action_dim, device, gamma, nstep, log_interval, seed)
 
@@ -71,6 +79,20 @@ class SAC(Algorithm):
 
         self._target_update_coef = target_update_coef
         self.update_entropy = True
+        self._demo_actor_loss_weight = max(float(demo_actor_loss_weight or 0.0), 0.0)
+        self._demo_actor_min_loss_weight = min(
+            max(float(demo_actor_min_loss_weight or 0.0), 0.0),
+            self._demo_actor_loss_weight,
+        )
+        self._demo_actor_decay_steps = max(int(demo_actor_decay_steps or 0), 0)
+        self._demo_actor_bc_mode = str(demo_actor_bc_mode or "bc").lower()
+        self._demo_actor_temperature = max(float(demo_actor_temperature or 1.0), 1e-6)
+        self._demo_actor_max_weight = max(float(demo_actor_max_weight or 1.0), 1.0)
+        self._demo_actor_q_filter_margin = float(demo_actor_q_filter_margin or 0.0)
+        self._demo_actor_q_filter_warmup_steps = max(
+            int(demo_actor_q_filter_warmup_steps or 0),
+            0,
+        )
 
         self._shift_enabled = bool(shift_enabled)
         self._shift_dim = int(shift_dim)
@@ -83,12 +105,33 @@ class SAC(Algorithm):
             if shift_target_entropy is not None
             else 0.2
         )
-        if self._shift_enabled:
-            if shift_loss_weight != 1.0 or shift_pos_weight is not None:
-                logger.warning(
-                    "ShiftModel loss_weight/pos_weight are ignored because the shifter "
-                    "now trains with discrete SAC instead of supervised BCE."
+        if shift_bc_loss_weight is None:
+            shift_bc_loss_weight = shift_loss_weight
+        self._shift_bc_loss_weight = max(float(shift_bc_loss_weight or 0.0), 0.0)
+        self._shift_bc_focal_gamma = max(float(shift_bc_focal_gamma or 0.0), 0.0)
+        if shift_bc_class_weights is None and shift_pos_weight is not None:
+            shift_bc_class_weights = [1.0] + [float(shift_pos_weight)] * self._shift_dim
+
+        self._shift_bc_class_weights = None
+        if shift_bc_class_weights is not None:
+            class_weights = torch.as_tensor(
+                shift_bc_class_weights,
+                dtype=torch.float,
+                device=self._device,
+            ).view(-1)
+            if class_weights.numel() == self._shift_dim:
+                class_weights = torch.cat([
+                    torch.ones(1, dtype=torch.float, device=self._device),
+                    class_weights,
+                ])
+            if class_weights.numel() != self._shift_action_count:
+                raise ValueError(
+                    "shift_bc_class_weights must contain either "
+                    f"{self._shift_dim} shift weights or "
+                    f"{self._shift_action_count} action weights"
                 )
+            self._shift_bc_class_weights = class_weights
+        if self._shift_enabled:
             self._shift_policy_net = DiscreteShiftPolicy(
                 state_dim=self._state_dim,
                 hidden_units=shift_hidden_units,
@@ -129,22 +172,71 @@ class SAC(Algorithm):
             self._shift_alpha_optim = None
 
     def unpack_batch(self, batch):
-        if len(batch) == 6:
+        states, actions, shift_actions, _shift_weights, _demo_weights, rewards, next_states, dones = (
+            self.unpack_batch_with_metadata(batch)
+        )
+        return states, actions, shift_actions, rewards, next_states, dones
+
+    def unpack_batch_with_shift_weights(self, batch):
+        states, actions, shift_actions, shift_weights, _demo_weights, rewards, next_states, dones = (
+            self.unpack_batch_with_metadata(batch)
+        )
+        return states, actions, shift_actions, shift_weights, rewards, next_states, dones
+
+    def unpack_batch_with_metadata(self, batch):
+        if len(batch) == 8:
             return batch
+        if len(batch) == 7:
+            states, actions, shift_actions, shift_weights, rewards, next_states, dones = batch
+            demo_weights = torch.zeros(
+                (states.shape[0], 1),
+                dtype=states.dtype,
+                device=states.device,
+            )
+            return states, actions, shift_actions, shift_weights, demo_weights, rewards, next_states, dones
+        if len(batch) == 6:
+            states, actions, shift_actions, rewards, next_states, dones = batch
+            shift_weights = torch.ones(
+                (states.shape[0], 1),
+                dtype=states.dtype,
+                device=states.device,
+            )
+            demo_weights = torch.zeros(
+                (states.shape[0], 1),
+                dtype=states.dtype,
+                device=states.device,
+            )
+            return states, actions, shift_actions, shift_weights, demo_weights, rewards, next_states, dones
+
         states, actions, rewards, next_states, dones = batch
         shift_actions = torch.zeros(
             (states.shape[0], self._shift_dim),
             dtype=states.dtype,
             device=states.device,
         )
-        return states, actions, shift_actions, rewards, next_states, dones
+        shift_weights = torch.zeros(
+            (states.shape[0], 1),
+            dtype=states.dtype,
+            device=states.device,
+        )
+        demo_weights = torch.zeros(
+            (states.shape[0], 1),
+            dtype=states.dtype,
+            device=states.device,
+        )
+        return states, actions, shift_actions, shift_weights, demo_weights, rewards, next_states, dones
 
-    def explore(self, state):
+    def explore(self, state, shift_deterministic=False, shift_epsilon=0.0, shift_action_mask=None):
         state = torch.tensor(
             state[None, ...].copy(), dtype=torch.float, device=self._device)
         with torch.no_grad():
             action, entropies, _ = self._policy_net(state)
-            shift_action, shift_probs = self._sample_shift_from_tensor(state, deterministic=False)
+            shift_action, shift_probs = self._sample_shift_from_tensor(
+                state,
+                deterministic=shift_deterministic,
+                action_mask=shift_action_mask,
+                epsilon=shift_epsilon,
+            )
         action = action.cpu().numpy()[0]
         assert_action(action)
         return action, {
@@ -153,12 +245,16 @@ class SAC(Algorithm):
             "shift_probs": shift_probs,
         }
 
-    def exploit(self, state):
+    def exploit(self, state, shift_action_mask=None):
         state = torch.tensor(
             state[None, ...].copy(), dtype=torch.float, device=self._device)
         with torch.no_grad():
             _, entropies, action = self._policy_net(state)
-            shift_action, shift_probs = self._sample_shift_from_tensor(state, deterministic=True)
+            shift_action, shift_probs = self._sample_shift_from_tensor(
+                state,
+                deterministic=True,
+                action_mask=shift_action_mask,
+            )
         action = action.cpu().numpy()[0]
         assert_action(action)
         return action, {
@@ -167,7 +263,7 @@ class SAC(Algorithm):
             "shift_probs": shift_probs,
         }
 
-    def _sample_shift_from_tensor(self, states, deterministic=False):
+    def _sample_shift_from_tensor(self, states, deterministic=False, action_mask=None, epsilon=0.0):
         if not self._shift_enabled:
             zeros = torch.zeros((states.shape[0], self._shift_dim), device=states.device)
             return zeros.cpu().numpy()[0], zeros.cpu().numpy()[0]
@@ -176,6 +272,8 @@ class SAC(Algorithm):
             states,
             deterministic=deterministic,
             threshold=self._shift_threshold,
+            action_mask=action_mask,
+            epsilon=epsilon,
         )
         shift_probs = probs[:, 1:]
         return actions.cpu().numpy()[0], shift_probs.cpu().numpy()[0]
@@ -202,10 +300,16 @@ class SAC(Algorithm):
         return stats
 
     def update_policy_and_entropy(self, batch, writer):
-        states, actions, _shift_actions, rewards, next_states, dones = self.unpack_batch(batch)
+        states, actions, _shift_actions, _shift_weights, demo_weights, _rewards, _next_states, _dones = (
+            self.unpack_batch_with_metadata(batch)
+        )
 
         # Update policy.
-        policy_loss, entropies = self.calc_policy_loss(states)
+        policy_loss, entropies, demo_actor_stats = self.calc_policy_loss(
+            states,
+            demo_actions=actions,
+            demo_weights=demo_weights,
+        )
         update_params(self._policy_optim, policy_loss)
 
         # Update the entropy coefficient.
@@ -229,14 +333,40 @@ class SAC(Algorithm):
             writer.add_scalar(
                 'stats/entropy', entropies.detach().mean().item(),
                 self._learning_steps)
+            writer.add_scalar(
+                'loss/demo_actor_bc',
+                demo_actor_stats["loss"],
+                self._learning_steps)
+            writer.add_scalar(
+                'stats/demo_actor_loss_weight',
+                demo_actor_stats["loss_weight"],
+                self._learning_steps)
+            writer.add_scalar(
+                'stats/demo_actor_sample_fraction',
+                demo_actor_stats["sample_fraction"],
+                self._learning_steps)
+            writer.add_scalar(
+                'stats/demo_actor_effective_fraction',
+                demo_actor_stats["effective_fraction"],
+                self._learning_steps)
+            writer.add_scalar(
+                'stats/demo_actor_mean_advantage',
+                demo_actor_stats["mean_advantage"],
+                self._learning_steps)
 
             return {"policy_loss": policy_loss.detach().item(),
                     "entropy_loss": entropy_loss,
-                    "alpha": self._alpha.item(), "entropy": entropies.detach().mean().item()}
+                    "alpha": self._alpha.item(),
+                    "entropy": entropies.detach().mean().item(),
+                    "demo_actor_bc_loss": demo_actor_stats["loss"],
+                    "demo_actor_loss_weight": demo_actor_stats["loss_weight"],
+                    "demo_actor_sample_fraction": demo_actor_stats["sample_fraction"],
+                    "demo_actor_effective_fraction": demo_actor_stats["effective_fraction"],
+                    "demo_actor_mean_advantage": demo_actor_stats["mean_advantage"]}
 
-    def calc_policy_loss(self, states):
+    def calc_policy_loss(self, states, demo_actions=None, demo_weights=None):
         # Resample actions to calculate expectations of Q.
-        sampled_actions, entropies, _ = self._policy_net(states)
+        sampled_actions, entropies, deterministic_actions = self._policy_net(states)
 
         # Expectations of Q with clipped double Q technique.
         qs1, qs2 = self._online_q_net(states, sampled_actions)
@@ -246,7 +376,108 @@ class SAC(Algorithm):
         assert qs.shape == entropies.shape
         policy_loss = torch.mean((- qs - self._alpha * entropies))
 
-        return policy_loss, entropies.detach_()
+        demo_actor_stats = self.empty_demo_actor_stats()
+        demo_loss_weight = self.demo_actor_loss_weight()
+        if demo_loss_weight > 0.0 and demo_actions is not None and demo_weights is not None:
+            demo_bc_loss, demo_actor_stats = self.calc_demo_actor_bc_loss(
+                states,
+                demo_actions,
+                demo_weights,
+                policy_actions=deterministic_actions,
+            )
+            demo_actor_stats["loss_weight"] = demo_loss_weight
+            if demo_bc_loss is not None:
+                policy_loss = policy_loss + demo_loss_weight * demo_bc_loss
+
+        return policy_loss, entropies.detach(), demo_actor_stats
+
+    def demo_actor_loss_weight(self):
+        if self._demo_actor_loss_weight <= 0.0:
+            return 0.0
+        if self._demo_actor_decay_steps <= 0:
+            return self._demo_actor_loss_weight
+        progress = min(self._learning_steps / self._demo_actor_decay_steps, 1.0)
+        return float(
+            self._demo_actor_loss_weight
+            + (self._demo_actor_min_loss_weight - self._demo_actor_loss_weight) * progress
+        )
+
+    def empty_demo_actor_stats(self):
+        return {
+            "loss": 0.0,
+            "loss_weight": self.demo_actor_loss_weight(),
+            "sample_fraction": 0.0,
+            "effective_fraction": 0.0,
+            "mean_advantage": 0.0,
+            "mean_weight": 0.0,
+        }
+
+    def calc_demo_actor_bc_loss(self, states, demo_actions, demo_weights, policy_actions=None):
+        if self._demo_actor_bc_mode in ("off", "none"):
+            return None, self.empty_demo_actor_stats()
+
+        demo_weights = demo_weights.reshape(-1, 1).clamp_min(0.0)
+        demo_mask = demo_weights > 0.0
+        if not torch.any(demo_mask):
+            return None, self.empty_demo_actor_stats()
+
+        if policy_actions is None:
+            _sampled_actions, _entropies, policy_actions = self._policy_net(states)
+
+        per_sample_loss = (policy_actions - demo_actions).pow(2).mean(dim=1, keepdim=True)
+        value_weights = demo_weights
+        mean_advantage = 0.0
+
+        mode = self._demo_actor_bc_mode
+        use_value_weights = (
+            mode in ("q_filter", "awac", "awac_q_filter")
+            and self._learning_steps >= self._demo_actor_q_filter_warmup_steps
+        )
+        if use_value_weights:
+            with torch.no_grad():
+                demo_qs1, demo_qs2 = self._online_q_net(states, demo_actions)
+                policy_qs1, policy_qs2 = self._online_q_net(states, policy_actions.detach())
+                demo_qs = torch.min(demo_qs1, demo_qs2)
+                policy_qs = torch.min(policy_qs1, policy_qs2)
+                advantages = demo_qs - policy_qs
+                mean_advantage = advantages[demo_mask].mean().item()
+
+                if mode == "q_filter":
+                    value_weights = demo_weights * (
+                        advantages > self._demo_actor_q_filter_margin
+                    ).float()
+                elif mode == "awac":
+                    value_weights = demo_weights * torch.exp(
+                        advantages / self._demo_actor_temperature
+                    ).clamp(max=self._demo_actor_max_weight)
+                elif mode == "awac_q_filter":
+                    awac_weights = torch.exp(
+                        advantages / self._demo_actor_temperature
+                    ).clamp(max=self._demo_actor_max_weight)
+                    q_filter = (advantages > self._demo_actor_q_filter_margin).float()
+                    value_weights = demo_weights * awac_weights * q_filter
+
+        weight_sum = value_weights.sum()
+        if weight_sum.item() <= 0.0:
+            stats = self.empty_demo_actor_stats()
+            stats["sample_fraction"] = demo_mask.float().mean().item()
+            stats["mean_advantage"] = mean_advantage
+            return None, stats
+
+        bc_loss = (per_sample_loss * value_weights).sum() / weight_sum.clamp_min(1e-6)
+        with torch.no_grad():
+            effective_mask = value_weights > 0.0
+            stats = {
+                "loss": bc_loss.detach().item(),
+                "loss_weight": self.demo_actor_loss_weight(),
+                "sample_fraction": demo_mask.float().mean().item(),
+                "effective_fraction": effective_mask.float().mean().item(),
+                "mean_advantage": mean_advantage,
+                "mean_weight": value_weights[effective_mask].mean().item()
+                if torch.any(effective_mask)
+                else 0.0,
+            }
+        return bc_loss, stats
 
     def calc_entropy_loss(self, entropies):
         assert not entropies.requires_grad
@@ -323,7 +554,9 @@ class SAC(Algorithm):
         if not self._shift_enabled:
             return None
 
-        states, actions, shift_actions, rewards, next_states, dones = self.unpack_batch(batch)
+        states, actions, shift_actions, shift_weights, rewards, next_states, dones = (
+            self.unpack_batch_with_shift_weights(batch)
+        )
         self._shift_learning_steps += 1
         shift_q_loss, shift_mean_q1, shift_mean_q2, shift_td_abs = self.update_shift_q_functions(
             states,
@@ -338,7 +571,8 @@ class SAC(Algorithm):
             shift_entropy,
             shift_action_rates,
             shift_policy_rates,
-        ) = self.update_shift_policy_and_entropy(states, shift_actions)
+            shift_aux_bc_loss,
+        ) = self.update_shift_policy_and_entropy(states, shift_actions, shift_weights)
 
         if self._shift_learning_steps % self._log_interval == 0:
             q_loss_value = shift_q_loss.detach().item()
@@ -347,6 +581,7 @@ class SAC(Algorithm):
             writer.add_scalar('loss/shift_Q', q_loss_value, self._shift_learning_steps)
             writer.add_scalar('loss/shift_policy', policy_loss_value, self._shift_learning_steps)
             writer.add_scalar('loss/shift_entropy', entropy_loss_value, self._shift_learning_steps)
+            writer.add_scalar('loss/shift_aux_bc', shift_aux_bc_loss, self._shift_learning_steps)
             writer.add_scalar('stats/shift_alpha', self._shift_alpha.item(), self._shift_learning_steps)
             writer.add_scalar('stats/shift_entropy', shift_entropy, self._shift_learning_steps)
             writer.add_scalar('stats/shift_mean_Q1', shift_mean_q1, self._shift_learning_steps)
@@ -362,6 +597,7 @@ class SAC(Algorithm):
                 "shift_q_loss": q_loss_value,
                 "shift_policy_loss": policy_loss_value,
                 "shift_entropy_loss": entropy_loss_value,
+                "shift_aux_bc_loss": shift_aux_bc_loss,
                 "shift_alpha": self._shift_alpha.item(),
                 "shift_entropy": shift_entropy,
                 "shift_mean_q1": shift_mean_q1,
@@ -380,26 +616,26 @@ class SAC(Algorithm):
         if not self._shift_enabled:
             return None
 
-        states, _actions, shift_actions, _rewards, _next_states, _dones = self.unpack_batch(batch)
-        self._shift_learning_steps += 1
+        states, _actions, shift_actions, shift_weights, _rewards, _next_states, _dones = (
+            self.unpack_batch_with_shift_weights(batch)
+        )
         action_indices = self.shift_action_indices(shift_actions)
         logits, probs = self._shift_policy_net(states)
-        bc_loss = F.cross_entropy(logits, action_indices)
+        bc_loss, bc_stats = self.calc_shift_bc_loss(logits, action_indices, shift_weights)
+        if bc_loss is None:
+            return None
+
+        self._shift_learning_steps += 1
         update_params(self._shift_policy_optim, bc_loss)
 
         if self._shift_learning_steps % self._log_interval == 0:
-            with torch.no_grad():
-                predictions = torch.argmax(probs, dim=-1)
-                accuracy = (predictions == action_indices).float().mean().item()
-                action_rates = [
-                    (action_indices == index).float().mean().item()
-                    for index in range(self._shift_action_count)
-                ]
-                policy_rates = probs.mean(dim=0).detach().cpu().tolist()
-
             loss_value = bc_loss.detach().item()
+            accuracy = bc_stats["accuracy"]
+            action_rates = bc_stats["action_rates"]
+            policy_rates = bc_stats["policy_rates"]
             writer.add_scalar('loss/shift_bc', loss_value, self._shift_learning_steps)
             writer.add_scalar('stats/shift_bc_accuracy', accuracy, self._shift_learning_steps)
+            writer.add_scalar('stats/shift_bc_teacher_fraction', bc_stats["teacher_fraction"], self._shift_learning_steps)
             writer.add_scalar('stats/shift_bc_noop_action_rate', action_rates[0], self._shift_learning_steps)
             writer.add_scalar('stats/shift_bc_up_action_rate', action_rates[1], self._shift_learning_steps)
             writer.add_scalar('stats/shift_bc_down_action_rate', action_rates[2], self._shift_learning_steps)
@@ -409,6 +645,7 @@ class SAC(Algorithm):
             return {
                 "shift_bc_loss": loss_value,
                 "shift_bc_accuracy": accuracy,
+                "shift_bc_teacher_fraction": bc_stats["teacher_fraction"],
                 "shift_bc_noop_action_rate": action_rates[0],
                 "shift_bc_up_action_rate": action_rates[1],
                 "shift_bc_down_action_rate": action_rates[2],
@@ -437,6 +674,55 @@ class SAC(Algorithm):
                 action_indices,
             )
         return action_indices
+
+    def calc_shift_bc_loss(self, logits, action_indices, shift_weights):
+        shift_weights = shift_weights.reshape(-1).clamp_min(0.0)
+        teacher_mask = shift_weights > 0.0
+        if not torch.any(teacher_mask):
+            return None, {}
+
+        log_probs = F.log_softmax(logits, dim=-1)
+        chosen_log_probs = log_probs.gather(1, action_indices.view(-1, 1)).squeeze(1)
+        sample_losses = -chosen_log_probs
+
+        if self._shift_bc_class_weights is not None:
+            sample_losses = sample_losses * self._shift_bc_class_weights[action_indices]
+        if self._shift_bc_focal_gamma > 0.0:
+            chosen_probs = chosen_log_probs.exp().clamp(0.0, 1.0)
+            focal_weights = (1.0 - chosen_probs).pow(self._shift_bc_focal_gamma)
+            sample_losses = sample_losses * focal_weights
+
+        weighted_losses = sample_losses * shift_weights
+        loss = weighted_losses.sum() / shift_weights.sum().clamp_min(1e-6)
+
+        with torch.no_grad():
+            probs = torch.softmax(logits, dim=-1)
+            predictions = torch.argmax(probs, dim=-1)
+            teacher_indices = action_indices[teacher_mask]
+            accuracy = (
+                (predictions[teacher_mask] == teacher_indices).float().mean().item()
+                if teacher_indices.numel() > 0
+                else 0.0
+            )
+            action_rates = [
+                (teacher_indices == index).float().mean().item()
+                if teacher_indices.numel() > 0
+                else 0.0
+                for index in range(self._shift_action_count)
+            ]
+            policy_rates = (
+                probs[teacher_mask].mean(dim=0).detach().cpu().tolist()
+                if teacher_indices.numel() > 0
+                else probs.mean(dim=0).detach().cpu().tolist()
+            )
+            teacher_fraction = teacher_mask.float().mean().item()
+
+        return loss, {
+            "accuracy": accuracy,
+            "action_rates": action_rates,
+            "policy_rates": policy_rates,
+            "teacher_fraction": teacher_fraction,
+        }
 
     def update_shift_q_functions(self, states, shift_actions, rewards, next_states, dones):
         curr_qs1, curr_qs2 = self.calc_shift_current_qs(states, shift_actions)
@@ -470,8 +756,12 @@ class SAC(Algorithm):
             target_qs = self._shift_reward_scale * rewards + (1.0 - dones) * self._discount * next_values
         return target_qs
 
-    def update_shift_policy_and_entropy(self, states, shift_actions):
-        policy_loss, entropy, probs = self.calc_shift_policy_loss(states)
+    def update_shift_policy_and_entropy(self, states, shift_actions, shift_weights=None):
+        policy_loss, entropy, probs, aux_bc_loss = self.calc_shift_policy_loss(
+            states,
+            shift_actions=shift_actions,
+            shift_weights=shift_weights,
+        )
         update_params(self._shift_policy_optim, policy_loss)
 
         entropy_loss = self.calc_shift_entropy_loss(entropy.detach())
@@ -487,16 +777,27 @@ class SAC(Algorithm):
             policy_rates = probs.mean(dim=0).detach().cpu().tolist()
             entropy_value = entropy.mean().item()
 
-        return policy_loss, entropy_loss, entropy_value, action_rates, policy_rates
+        return policy_loss, entropy_loss, entropy_value, action_rates, policy_rates, aux_bc_loss
 
-    def calc_shift_policy_loss(self, states):
-        _, probs = self._shift_policy_net(states)
+    def calc_shift_policy_loss(self, states, shift_actions=None, shift_weights=None):
+        logits, probs = self._shift_policy_net(states)
         log_probs = torch.log(probs.clamp_min(1e-8))
         qs1, qs2 = self._shift_online_q_net(states)
         qs = torch.min(qs1, qs2)
         policy_loss = (probs * (self._shift_alpha * log_probs - qs)).sum(dim=1).mean()
+        aux_bc_loss_value = 0.0
+        if (
+            self._shift_bc_loss_weight > 0.0
+            and shift_actions is not None
+            and shift_weights is not None
+        ):
+            action_indices = self.shift_action_indices(shift_actions)
+            bc_loss, _bc_stats = self.calc_shift_bc_loss(logits, action_indices, shift_weights)
+            if bc_loss is not None:
+                policy_loss = policy_loss + self._shift_bc_loss_weight * bc_loss
+                aux_bc_loss_value = bc_loss.detach().item()
         entropy = -(probs * log_probs).sum(dim=1, keepdim=True)
-        return policy_loss, entropy, probs.detach()
+        return policy_loss, entropy, probs.detach(), aux_bc_loss_value
 
     def calc_shift_entropy_loss(self, entropy):
         assert not entropy.requires_grad
