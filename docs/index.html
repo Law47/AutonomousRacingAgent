@@ -19,8 +19,9 @@
         <li><a href="#models">Model Log</a></li>
         <li><a href="#findings">Findings</a></li>
         <li><a href="#videos">Videos</a></li>
-        <li><a href="#links">Links</a></li>
+        <li><a href="#results">Results</a></li>
         <li><a href="#timeline">Timeline</a></li>
+        <li><a href="#links">Links</a></li>
       </ul>
       <a class="nav__cta" href="https://github.com/Law47/AutonomousRacingAgent" target="_blank" rel="noopener noreferrer">GitHub</a>
     </div>
@@ -139,7 +140,7 @@
     <section id="models" class="section section--carbon">
       <div class="section__inner">
         <h2 class="section__title"><span class="section__num">02</span> Model Training Log</h2>
-        <p class="section__lead">Every training run in chronological order. All runs are on Monza with the BMW Z4 GT3. ACGym reference lap: <strong>1:51:64</strong>. Our best valid lap: <strong>1:55:35</strong> (Apr&nbsp;26).</p>
+        <p class="section__lead">Every training run in chronological order. All runs are on Monza with the BMW Z4 GT3. ACGym reference lap: <strong>1:51:64</strong>. Our best valid lap: <strong>1:54.127</strong> after extending the Apr&nbsp;26 model.</p>
         <div class="callout callout--warn">
           <strong>Why so few valid laps?</strong> Monza's turn 1 is an extremely heavy braking zone immediately after the start/finish straight. Most models learned to navigate the rest of the circuit but could not modulate braking sharply enough to scrub speed in time. The car would go off-track at turn 1 on every single lap, triggering a reset, which made it impossible to post a clean lap time. A "valid" lap here means the car completed the full circuit without any resets.
         </div>
@@ -266,7 +267,7 @@
                 <td>24 h &nbsp;/&nbsp; 2 M+ steps</td>
                 <td>No demo pretraining. Auto-shifting for first 1.5 M steps &rarr; manual shifting for remainder. Separate shifter and driver models.</td>
                 <td class="td-lap td-lap--best">1:55:35 &#10003;</td>
-                <td><span class="badge badge--good">Best valid lap. Manual shift phase caused immediate collapse.</span></td>
+                <td><span class="badge badge--good">Cleanest driving behavior so far. Manual shift phase caused immediate collapse.</span></td>
               </tr>
 
               <tr class="row--fail">
@@ -275,6 +276,14 @@
                 <td>Demos on. Offline sampling 15% &rarr; 0.02% over 4 M steps. 1 pretrain epoch. Auto &rarr; manual shifting curriculum.</td>
                 <td class="td-lap">&mdash;</td>
                 <td><span class="badge badge--fail">Brake-heavy; car would not drive</span></td>
+              </tr>
+
+              <tr class="row--good">
+                <td class="td-date">Apr 26 continuation</td>
+                <td>+8 h</td>
+                <td>Continued training the exact same Apr 26 model with no architecture or configuration changes.</td>
+                <td class="td-lap td-lap--best">1:54.127 &#10003;</td>
+                <td><span class="badge badge--good">Best valid lap; theoretical optimal lap of 1:52.188</span></td>
               </tr>
 
             </tbody>
@@ -306,7 +315,7 @@
               </li>
               <li>
                 <span class="finding-title">Auto-shifting before manual shifting</span>
-                Building solid driving fundamentals under auto-shifting for ~1.5 M steps before introducing manual gear selection produced our best result (1:55:35). Every run that introduced manual shifting before the model could drive consistently caused the driving behavior to collapse entirely.
+                Building solid driving fundamentals under auto-shifting for ~1.5 M steps before introducing manual gear selection produced our best result, eventually reaching 1:54.127 after continued training. Every run that introduced manual shifting before the model could drive consistently caused the driving behavior to collapse entirely.
               </li>
               <li>
                 <span class="finding-title">Separate shifter and driver models</span>
@@ -361,13 +370,29 @@
 
         <div class="videos-grid">
 
-          <div class="video-placeholder" style="border: 1px solid #ccc; padding: 20px; margin: 10px; text-align: center;">Video 1 Placeholder</div>
+          <figure class="video-card">
+            <video class="video-card__media" controls preload="metadata">
+              <source src="50000steps.mp4" type="video/mp4">
+              Your browser does not support the video tag.
+            </video>
+            <figcaption class="video-card__caption">50,000 training steps</figcaption>
+          </figure>
 
-          <div class="video-placeholder" style="border: 1px solid #ccc; padding: 20px; margin: 10px; text-align: center;">Video 2 Placeholder</div>
+          <figure class="video-card">
+            <video class="video-card__media" controls preload="metadata">
+              <source src="700000steps.mp4" type="video/mp4">
+              Your browser does not support the video tag.
+            </video>
+            <figcaption class="video-card__caption">700,000 training steps</figcaption>
+          </figure>
 
-          <div class="video-placeholder" style="border: 1px solid #ccc; padding: 20px; margin: 10px; text-align: center;">Video 3 Placeholder</div>
-
-          <div class="video-placeholder" style="border: 1px solid #ccc; padding: 20px; margin: 10px; text-align: center;">Video 4 Placeholder</div>
+          <figure class="video-card">
+            <video class="video-card__media" controls preload="metadata">
+              <source src="1500000steps.mp4" type="video/mp4">
+              Your browser does not support the video tag.
+            </video>
+            <figcaption class="video-card__caption">1,500,000 training steps (~24 hours)</figcaption>
+          </figure>
 
         </div>
 
@@ -375,10 +400,44 @@
 
     </section>
 
+    <!-- RESULTS -->
+    <section id="results" class="section">
+      <div class="section__inner">
+        <h2 class="section__title"><span class="section__num">05</span> Results Overview</h2>
+        <p class="section__lead">How the final model compared against the original target.</p>
+
+        <div class="results-grid">
+          <div class="result-card">
+            <span class="result-card__label">Human world record</span>
+            <span class="result-card__value">1:46.17</span>
+            <p>The benchmark target was to build an agent that could consistently lap Monza within 95% of the human world-record pace.</p>
+          </div>
+
+          <div class="result-card">
+            <span class="result-card__label">5% slower target</span>
+            <span class="result-card__value">1:51.479</span>
+            <p>A 1:46.17 lap is 106.17 seconds. Multiplying by 1.05 gives a target cutoff of 111.4785 seconds, or 1:51.479.</p>
+          </div>
+
+          <div class="result-card result-card--best">
+            <span class="result-card__label">Best valid model lap</span>
+            <span class="result-card__value">1:54.127</span>
+            <p>The model improved substantially, but it was 2.648 seconds slower than the 95% target, so it did not meet the original goal.</p>
+          </div>
+
+          <div class="result-card">
+            <span class="result-card__label">Theoretical optimal</span>
+            <span class="result-card__value">1:52.188</span>
+            <p>Assetto Corsa also reports a theoretical optimal lap by splicing together the fastest sectors across multiple laps. The model's theoretical best was 0.710 seconds off the target.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- TIMELINE (collapsible) -->
     <section id="timeline" class="section">
       <div class="section__inner">
-        <h2 class="section__title"><span class="section__num">05</span> Project Timeline</h2>
+        <h2 class="section__title"><span class="section__num">06</span> Project Timeline</h2>
         <p class="section__lead">Condensed from weekly meeting notes and progress reports.</p>
 
         <details class="timeline-details">
@@ -468,8 +527,8 @@
             <div class="tl-item tl-item--good">
               <div class="tl-date">Apr 26</div>
               <div class="tl-body">
-                <h3>Best Result: 1:55:35 Valid Lap</h3>
-                <p>Trained with <strong>auto-shifting for ~1.5 million steps</strong> to build driving fundamentals, then transitioned to manual. The auto-shift phase produced the cleanest driving behavior observed and a valid lap of <strong>1:55:35</strong>. The manual shift transition caused immediate collapse.</p>
+                <h3>Best Result: 1:54.127 Valid Lap</h3>
+                <p>Trained with <strong>auto-shifting for ~1.5 million steps</strong> to build driving fundamentals, then transitioned to manual. The auto-shift phase produced the cleanest driving behavior observed. Continuing that same model for another 8 hours produced a valid lap of <strong>1:54.127</strong>, with Assetto Corsa reporting a theoretical optimal of <strong>1:52.188</strong>. The manual shift transition caused immediate collapse.</p>
               </div>
             </div>
 
@@ -489,7 +548,7 @@
     <!-- LINKS -->
     <section id="links" class="section section--carbon">
       <div class="section__inner">
-        <h2 class="section__title"><span class="section__num">06</span> Related Links</h2>
+        <h2 class="section__title"><span class="section__num">07</span> Related Links</h2>
 
         <div class="links-grid">
 
